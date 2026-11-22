@@ -26,8 +26,8 @@ In the desktop app: click + next to the prompt box, then Plugins, Add marketplac
 
 Type `/forge` in any repository. Each time, it shows the next step and Claude walks you through it:
 
-1. Install Dafny (the proof checker). The mod looks for `dafny` on PATH, then for the `FORGE_DAFNY`
-   environment variable.
+1. Install Dafny (the proof checker). The mod uses the `"dafny"` path in `.forge/forge.json` if set,
+   then `dafny` on PATH, then the `FORGE_DAFNY` environment variable.
 2. Pick one small, critical function (money, limits, permissions). Claude writes the spec, the
    implementation and `.forge/forge.json`.
 3. Read the spec. Claude explains it in plain words. Type `/forge approve` when it says what you want.
@@ -45,3 +45,7 @@ Files it keeps in your project: `.forge/forge.json` (checks), `.forge/approved.j
   approved specs and on `.forge/approved.json`, but a shell command can still change them.
 - A spec covers only what it says. Files without a spec are not checked.
 - Dafny runs can take seconds to minutes.
+
+## License
+
+MIT. See `LICENSE`.

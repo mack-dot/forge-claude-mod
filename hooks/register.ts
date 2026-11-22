@@ -15,7 +15,7 @@ import type { Register } from 'claude-code'
 type Api = any
 
 type Check = { name: string; spec: string; files: string[] }
-type Config = { version: 1; checks: Check[] }
+type Config = { version: 1; checks: Check[]; dafny?: string }
 type Verdict = 'VERIFIED' | 'FAILED' | 'NOT_APPROVED' | 'SPEC_CHANGED' | 'ERROR'
 type LastCheck = { at: string; verdicts: Record<string, Verdict>; detail: Record<string, string> }
 
@@ -47,8 +47,12 @@ async function sha256($: Api, path: string): Promise<string | undefined> {
   return r.exitCode === 0 ? r.stdout.split(/\s+/)[0] : undefined
 }
 
-async function findDafny($: Api): Promise<string | undefined> {
-  // Dafny on PATH, else the path in the FORGE_DAFNY environment variable.
+async function findDafny($: Api, root: string, configured?: string): Promise<string | undefined> {
+  // The "dafny" path in .forge/forge.json, else Dafny on PATH, else FORGE_DAFNY.
+  if (configured) {
+    const path = join(root, configured)
+    if (await $.fs.exists(path)) return path
+  }
   const r = await $.process.run(
     ['/bin/sh', '-c', 'command -v dafny || { [ -x "$FORGE_DAFNY" ] && echo "$FORGE_DAFNY"; }'],
     { timeoutMs: 5_000 },
@@ -80,7 +84,7 @@ async function runChecks($: Api): Promise<string> {
   const root: string = await $.session.root()
   const cfg = await readJson<Config>($, join(root, CONFIG))
   if (!cfg?.checks?.length) return 'No checks yet. Run /forge to set one up.'
-  const dafny = await findDafny($)
+  const dafny = await findDafny($, root, cfg.dafny)
   if (!dafny) return 'Dafny was not found. Run /forge and Claude will help you install it.'
   const approved = (await readJson<Record<string, string>>($, join(root, APPROVED))) ?? {}
 
@@ -147,15 +151,15 @@ Never write .forge/approved.json and never run /forge approve yourself: approval
 
 async function wizard($: Api): Promise<{ text: string; prompt?: string }> {
   const root: string = await $.session.root()
-  const dafny = await findDafny($)
   const cfg = await readJson<Config>($, join(root, CONFIG))
+  const dafny = await findDafny($, root, cfg?.dafny)
   const approved = (await readJson<Record<string, string>>($, join(root, APPROVED))) ?? {}
   const last = await readJson<LastCheck>($, join(root, LAST))
 
   if (!dafny)
     return {
       text: 'Forge · step 1 of 5: install Dafny (the proof checker). Claude will help.',
-      prompt: `${COACH}\nStep 1 of 5: Dafny is not on PATH. Explain in two lines what Dafny is. Offer to install it (macOS: brew install dafny), or setting FORGE_DAFNY to an existing Dafny binary, and ask before running the install. Then tell them to run /forge again.`,
+      prompt: `${COACH}\nStep 1 of 5: Dafny is not on PATH. Explain in two lines what Dafny is. Offer to install it (macOS: brew install dafny), or, if a Dafny binary already exists, putting its path as "dafny" in .forge/forge.json, and ask before running the install. Then tell them to run /forge again.`,
     }
   if (!cfg?.checks?.length)
     return {
