@@ -2,6 +2,17 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## 0.9.1 — 2026-11-22
+- Changed: `/forge:scan` instructions, from a blind evaluation (13 headless scans of chronicle and 4 public
+  repositories: golang/time, casl, node-rate-limiter-flexible, transitions). Top-5 hit rate was 96 % (24 of 25), but
+  blind recall of 8 known past bugs was 3 of 8 in the top 5. The scan now: includes error and fallback branches
+  that decide allow/deny (one missed bug was there, and the scan had called it glue); includes the code that
+  decides which rule applies (type, tenant or role detection; two missed bugs); keeps a large core
+  state-transition function instead of preferring small helpers (one missed bug); states the intended rule rather
+  than paraphrasing the code, and ranks a suspected bug in the top 3; states the precision requirement of unit
+  conversions; skips vendored and generated folders.
+- Not tested: whether recall improves; the evaluation should be re-run with these instructions.
+
 ## 0.9.0 — 2026-11-22
 - Added: Go and Rust evaluators for the differential fuzz (`"lang": "go"`, `"lang": "rs"`). The person writes a
   small adapter; Forge generates the protocol program (`cli/eval/go/forge_main.go`, `cli/eval/rust/forge_main.rs`),
