@@ -38,12 +38,12 @@ jobs:
         run: |
           cd examples/wallet-cap
           python3 - <<'PY'
-          import hashlib, json
+          import json
           cfg = json.load(open('.forge/forge.json'))
           cfg['checks'][0]['build']['targets'] = ['py', 'js', 'go', 'java', 'cs', 'rs']
           json.dump(cfg, open('.forge/forge.json', 'w'))
-          h = lambda p: hashlib.sha256(open(p, 'rb').read()).hexdigest()
-          json.dump({'.forge/forge.json': h('.forge/forge.json'), 'spec/WalletSpec.dfy': h('spec/WalletSpec.dfy')},
-                    open('.forge/approved.json', 'w'))
           PY
+          # Re-approve exactly what the checker shows (forge.json changed above).
+          hashes=$(python3 ../../cli/forge_check.py spec --json | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["hashes"]))')
+          python3 ../../cli/forge_check.py approve --hashes "$hashes"
           python3 ../../cli/forge_check.py build --no-write
