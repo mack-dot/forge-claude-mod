@@ -194,6 +194,10 @@ def static_checks():
         text = open(os.path.join(HERE, '..', 'commands', name), encoding='utf-8').read()
         if not text.startswith('---\ndescription:'):
             problems.append('commands/%s has no description front matter' % name)
+        # A Markdown command named like a /forge subcommand shadows it: "/forge approve" ran commands/approve.md
+        # instead of the approval (found in v0.7.1).
+        if name[:-3] in ('approve', 'check', 'build', 'status', 'spec', 'diff', 'mutate'):
+            problems.append('commands/%s shadows the fixed step "/forge %s"' % (name, name[:-3]))
     return problems
 
 

@@ -153,10 +153,12 @@ async function runBuild($: Api, isCheckOnly: boolean): Promise<string> {
 
 // What `/forge approve` showed, as hashes; `/forge approve yes` approves exactly these.
 // Both steps go through cli/forge_check.py, so the mod and CI agree on what an approval covers
-// (forge.json, each spec, and the person's answers and decision record).
-let shown: string | undefined
+// (forge.json, each spec, and the person's answers and decision record). The shown hashes are kept on disk
+// (.forge/pending-approval.json) so a plugin reload or restart between the two steps does not lose them.
+const PENDING = `${DIR}/pending-approval.json`
+const PENDING_MAX_AGE_MS = 24 * 3600 * 1000
 
-async function showSpecs($: Api): Promise<{ text: string; isOk: boolean }> {
+async function showSpecs($: Api): Promise<{ text: string; isOk: boolean; hashes?: Record<string, string> }> {
   const root: string = await $.session.root()
   const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'spec', '--root', root, '--json'], {
     cwd: root,
@@ -164,29 +166,37 @@ async function showSpecs($: Api): Promise<{ text: string; isOk: boolean }> {
   })
   try {
     const out = JSON.parse(r.stdout) as { text: string; hashes: Record<string, string> }
-    shown = JSON.stringify(out.hashes)
-    return { text: out.text, isOk: true }
+    return { text: out.text, isOk: true, hashes: out.hashes }
   } catch {
-    shown = undefined
     return { text: (r.stderr || r.stdout || `checker exit ${r.exitCode}`).trim(), isOk: false }
   }
 }
 
+async function showForApproval($: Api, lead: string): Promise<string> {
+  const root: string = await $.session.root()
+  const { text, isOk, hashes } = await showSpecs($)
+  if (!isOk || !hashes) return text
+  await writeJson($, root, PENDING, { shownAt: new Date().toISOString(), hashes })
+  return `${lead}\n\n${text}\n\nFor a plain-words explanation: /forge:explain\nTo approve exactly this: /forge approve yes`
+}
+
 async function approve($: Api, isConfirmed: boolean): Promise<string> {
   const root: string = await $.session.root()
-  if (!isConfirmed) {
-    const { text, isOk } = await showSpecs($)
-    if (!isOk) return text
-    return `You are about to approve this:\n\n${text}\n\nFor a plain-words explanation: /forge:explain\nIf this is what you want: /forge approve yes`
-  }
-  if (!shown) return 'Run /forge approve first to read everything, then /forge approve yes.'
+  if (!isConfirmed) return showForApproval($, 'You are about to approve this:')
+  const pending = await readJson<{ shownAt: string; hashes: Record<string, string> }>($, join(root, PENDING))
+  const isFresh = !!pending && Date.now() - Date.parse(pending.shownAt) < PENDING_MAX_AGE_MS
+  if (!pending || !isFresh)
+    // "yes" before anything was shown: show it now, approve nothing yet.
+    return showForApproval($, 'Nothing was shown for approval yet (or it was shown more than a day ago). This is what you would approve:')
   const r = await $.process.run(
-    ['python3', `${$.plugin.root}/cli/forge_check.py`, 'approve', '--root', root, '--hashes', shown],
+    ['python3', `${$.plugin.root}/cli/forge_check.py`, 'approve', '--root', root, '--hashes', JSON.stringify(pending.hashes)],
     { cwd: root, timeoutMs: 60_000 },
   )
-  shown = undefined
+  if (r.exitCode === 0) await $.process.run(['rm', '-f', join(root, PENDING)], { timeoutMs: 5_000 })
   await refreshStatus($)
-  return r.exitCode === 0 ? `${r.stdout.trim()}\nNext: /forge check` : (r.stdout || r.stderr).trim()
+  if (r.exitCode === 0) return `${r.stdout.trim()}\nNext: /forge check`
+  // Something changed since it was shown: show the new version, so the next "yes" approves that.
+  return showForApproval($, `${(r.stdout || r.stderr).trim()}\nHere is the current version:`)
 }
 
 // The steps where Claude talks with the person are Markdown commands in commands/ (/forge:scan,
@@ -271,7 +281,8 @@ async function guard($: Api, path: string | undefined): Promise<string | undefin
   if (!path) return undefined
   const root: string = await $.session.root()
   const abs = join(root, path.startsWith(root) ? path.slice(root.length + 1) : path)
-  if (abs === join(root, APPROVED)) return 'forge: only you approve specs (type /forge approve).'
+  if (abs === join(root, APPROVED) || abs === join(root, PENDING))
+    return 'forge: only you approve specs (type /forge approve).'
   const approved = (await readJson<Record<string, string>>($, join(root, APPROVED))) ?? {}
   for (const spec of Object.keys(approved))
     if (abs === join(root, spec))
@@ -327,7 +338,6 @@ export const register: Register = on => {
     if (arg === 'approve') return { text: await approve($, /^approve\s+yes\b/.test(e.args.trim())) }
     if (arg === 'spec') {
       const { text } = await showSpecs($)
-      shown = undefined
       return { text: `${text}\n\nFor a plain-words explanation: /forge:explain` }
     }
     if (arg === 'status') {

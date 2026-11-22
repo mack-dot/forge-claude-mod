@@ -1,2 +1,3 @@
 __pycache__/
 .forge/last-check.json
+.forge/pending-approval.json

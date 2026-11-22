@@ -18,6 +18,16 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
   the automatic run (0.6 s); a turn with no change does not.
 - Not tested: a real project (chronicle is next, after its rule is approved); TypeScript that uses syntax Node
   cannot strip (enums, namespaces); Windows.
+## 0.7.2 — 2026-11-22
+- Fixed (regression in 0.7.1): the hint commands `commands/approve.md`, `check.md`, `build.md`, `status.md`
+  shadowed the fixed steps: in a headless session `/forge approve yes` printed the hint instead of approving.
+  Removed. A static test now fails if a Markdown command takes the name of a `/forge` step.
+- Fixed (found by a tester): `/forge approve yes` failed when it was typed before `/forge approve`, or after the
+  plugin reloaded between the two steps. What `/forge approve` shows is now kept in
+  `.forge/pending-approval.json` (24 hours; Claude's edit tools cannot write it). "yes" with nothing shown shows
+  it and approves nothing; "yes" after a file changed shows the new version and approves nothing.
+- Tested: each step in a separate headless session: yes first, yes again, check, change in between, yes again;
+  28 cases.
 
 ## 0.7.1 — 2026-11-22
 - Fixed (usability): `/forge:approve` (with a colon) answered "Unknown command"; a tester typed it. Now
