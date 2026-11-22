@@ -16,6 +16,10 @@ inputs:
     description: "Also run `build --check`: fuzz the compiled code in every target and require the committed emitted code to equal a fresh build. The job must have each target's toolchain."
     required: false
     default: "false"
+  invariants:
+    description: "Also require INVARIANTS.md (every approved rule in plain words) to equal a fresh generation"
+    required: false
+    default: "false"
   dafny-version:
     description: "Dafny version to install"
     required: false
@@ -32,6 +36,7 @@ runs:
         FORGE_ROOT: ${{ inputs.root }}
         FORGE_BASE: ${{ inputs.base }}
         FORGE_BUILD: ${{ inputs.build }}
+        FORGE_INVARIANTS: ${{ inputs.invariants }}
         PR_BASE: ${{ github.base_ref }}
       run: |
         base="$FORGE_BASE"
@@ -48,4 +53,7 @@ runs:
         fi
         if [ "$FORGE_BUILD" = "true" ]; then
           python3 "$GITHUB_ACTION_PATH/cli/forge_check.py" build --check --root "$FORGE_ROOT" --no-write
+        fi
+        if [ "$FORGE_INVARIANTS" = "true" ]; then
+          python3 "$GITHUB_ACTION_PATH/cli/forge_check.py" invariants --check --root "$FORGE_ROOT"
         fi

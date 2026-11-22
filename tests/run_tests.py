@@ -422,6 +422,32 @@ def main():
             if not ok:
                 print('      ' + json.dumps({k: {kk: v.get(kk) for kk in ('verdict', 'per_candidate', 'ms', 'error')} if isinstance(v, dict) else v
                                              for k, v in res.items()})[:500])
+    # INVARIANTS.md: generated from the approved rules; CI catches a stale copy
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, 'p')
+        shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
+        inv = lambda *a: subprocess.run([sys.executable, CLI, 'invariants', '--root', root] + list(a),
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        r1 = inv('--check')
+        text = open(os.path.join(root, 'INVARIANTS.md')).read()
+        edit(root, DECISIONS, '| Reject; never a partial spend |', '| Allow a partial spend |')
+        r2 = inv('--check')
+        inv()
+        new = open(os.path.join(root, 'INVARIANTS.md')).read()
+        cases_inv = [
+            ('invariants: the committed file equals a fresh generation', r1.returncode == 0),
+            ('invariants: plain-words guarantees, decisions and owner\'s words included',
+             '**W1** the total spent never goes over the cap.' in text and '| D2 |' in text
+             and 'A wallet must never spend more than its cap.' in text),
+            ('invariants: a changed decision makes the committed file stale (CI fails)',
+             r2.returncode == 1 and 'INVARIANTS_STALE' in r2.stdout),
+            ('invariants: after regeneration the change is a readable diff and approval shows as not approved',
+             'Allow a partial spend' in new and 'NOT approved as written' in new),
+        ]
+        for name, ok in cases_inv:
+            failed += not ok
+            extra += 1
+            print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
     print('%d cases, %d failed' % (len(CASES) + len(BUILD_CASES) + extra, failed))
     return 1 if failed else 0
 

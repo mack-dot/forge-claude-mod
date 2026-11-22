@@ -37,6 +37,7 @@ jobs:
         with:
           root: examples/wallet-cap
           build: "true"
+          invariants: "true"
           # The example's approvals change in this repository's own pull requests; the APPROVAL_CHANGED gate
           # has its own test cases in checker-tests.
           base: none

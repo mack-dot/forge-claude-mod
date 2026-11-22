@@ -152,6 +152,16 @@ Rust evaluators takes about 7 s.
 Labels: the inputs, the evaluators and the core are test code (not proved); a run is a FINITE TEST. It compares
 returned values only; side effects of the code under test are not checked.
 
+## INVARIANTS.md: every approved rule in one place
+
+`/forge invariants` (and every `/forge approve yes`) writes `INVARIANTS.md`: one table of all approved rules, then
+one section per rule with the owner's own words, the guarantees in plain words (the spec's numbered clause
+comments), the decisions, what the rule does not guarantee, the code it covers, the languages it is compiled to
+and the shipped code it is fuzzed against, plus the trust base every rule rests on. It is generated only from the
+approved files, so it cannot drift from them. With `invariants: "true"` in the Action, a pull request fails when
+the file is out of date, so any change to a rule shows up in review as a readable diff. See
+`examples/wallet-cap/INVARIANTS.md`.
+
 ## Use it in CI (GitHub Action)
 
 The same checker runs in CI. Commit `.forge/forge.json` and `.forge/approved.json`, then add:
@@ -167,7 +177,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mack-dot/forge-claude-mod@v0.10.2   # better: pin the commit hash, tags can move
+      - uses: mack-dot/forge-claude-mod@v0.11.0   # better: pin the commit hash, tags can move
 ```
 
 The job fails unless every check is `VERIFIED`. On a pull request, any change to `forge.json`,

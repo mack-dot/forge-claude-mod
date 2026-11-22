@@ -194,7 +194,14 @@ async function approve($: Api, isConfirmed: boolean): Promise<string> {
   )
   if (r.exitCode === 0) await $.process.run(['rm', '-f', join(root, PENDING)], { timeoutMs: 5_000 })
   await refreshStatus($)
-  if (r.exitCode === 0) return `${r.stdout.trim()}\nNext: /forge check`
+  if (r.exitCode === 0) {
+    // Approval is when rules change: keep INVARIANTS.md (every approved rule in plain words) in step.
+    const inv = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'invariants', '--root', root], {
+      cwd: root,
+      timeoutMs: 60_000,
+    })
+    return `${r.stdout.trim()}\n${inv.exitCode === 0 ? inv.stdout.trim() + ' (commit it with the approval)' : 'INVARIANTS.md was not updated: ' + (inv.stderr || inv.stdout).trim()}\nNext: /forge check`
+  }
   // Something changed since it was shown: show the new version, so the next "yes" approves that.
   return showForApproval($, `${(r.stdout || r.stderr).trim()}\nHere is the current version:`)
 }
@@ -309,7 +316,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'forge',
       description: 'Forge proof gate: next step, or check / approve / build / spec / status (conversations: /forge:scan, /forge:add)',
-      argumentHint: '[check|approve|approve yes|build|diff|mutate|spec|status]',
+      argumentHint: '[check|approve|approve yes|build|diff|invariants|mutate|spec|status]',
     })
     const r = await next(e)
     void refreshStatus($).catch(() => undefined)
@@ -333,6 +340,11 @@ export const register: Register = on => {
       return { text: await runBuild($, /^build\s+check\b/.test(e.args.trim())) }
     }
     if (arg === 'diff') return { text: await runDiff($) }
+    if (arg === 'invariants') {
+      const root: string = await $.session.root()
+      const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'invariants', '--root', root], { cwd: root, timeoutMs: 60_000 })
+      return { text: (r.stdout || r.stderr).trim() + (r.exitCode === 0 ? '\nEvery approved rule in plain words, in one file: review it in pull requests.' : '') }
+    }
     if (arg === 'mutate') {
       const root: string = await $.session.root()
       const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'mutate', '--root', root, '--max', '30'], {
