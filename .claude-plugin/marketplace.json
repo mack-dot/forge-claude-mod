@@ -1,0 +1,5 @@
+{
+  "name": "forge-claude-mod",
+  "owner": { "name": "mack-dot" },
+  "plugins": [{ "name": "forge", "source": "./" }]
+}
