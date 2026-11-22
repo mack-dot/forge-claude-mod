@@ -34,7 +34,9 @@ In the desktop app: click + next to the prompt box, then Plugins, Add marketplac
 
 ## Use
 
-Type `/forge` in any repository: it tells you the next step. The steps:
+Type `/forge` in any repository: it tells you the next step. Commands with a **colon** (`/forge:scan`) start a
+conversation with Claude; commands with a **space** (`/forge approve`) run a fixed step. Typing a fixed step
+with a colon (`/forge:approve`) prints the right command. The steps:
 
 | Step | You type | What happens |
 | --- | --- | --- |
@@ -118,7 +120,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mack-dot/forge-claude-mod@v0.7.0   # better: pin the commit hash, tags can move
+      - uses: mack-dot/forge-claude-mod@v0.7.1   # better: pin the commit hash, tags can move
 ```
 
 The job fails unless every check is `VERIFIED`. On a pull request, any change to `forge.json`,

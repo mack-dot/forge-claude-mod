@@ -134,6 +134,10 @@ def edit_emitted(root):  # hand edit of emitted code
     open(path, 'w').write(text.replace('<=', '<', 1))
 
 
+def run_built_python(root):  # importing the built module creates __pycache__ inside verified/
+    subprocess.run([sys.executable, os.path.join(root, 'app.py')], stdout=subprocess.DEVNULL, check=True)
+
+
 def wrong_expect(root):  # the harness expects something the code does not do
     edit(root, 'fuzz/WalletFuzz.dfy', 'expect next.cap == cap, "W2";', 'expect next.cap == cap + 1, "W2";')
 
@@ -168,6 +172,7 @@ CASES = [
 # `build --check` cases: name, change, expected build verdict, expected exit code
 BUILD_CASES = [
     ('emitted code equals a fresh build', no_change, 'BUILT', 0),
+    ('app ran the built code (__pycache__ appears)', run_built_python, 'BUILT', 0),
     ('emitted code edited by hand', edit_emitted, 'STALE_BUILD', 1),
     ('fuzz harness expects a wrong result', wrong_expect, 'FUZZ_FAILED', 1),
     ('app no longer imports the built code', unwire, 'NOT_WIRED', 1),
