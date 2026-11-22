@@ -194,6 +194,7 @@ async function wizard($: Api): Promise<string> {
     'Forge · step 5 of 5: done. Every check is VERIFIED.\n' +
     'Now let Claude (or any agent) change that code freely. After each turn that touches a covered file, the status line says "code changed"; run /forge check.\n' +
     'If a spec file changes, the check says SPEC_CHANGED until you approve again.\n' +
+    'To see how many planted bugs the proof catches: /forge mutate.\n' +
     'To use the proved code in your app: /forge:build-setup, then /forge build.\n' +
     'Add another rule: /forge:add <the rule in your own words>.'
   )
@@ -229,7 +230,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'forge',
       description: 'Forge proof gate: next step, or check / approve / build / spec / status (conversations: /forge:scan, /forge:add)',
-      argumentHint: '[check|approve|approve yes|build|spec|status]',
+      argumentHint: '[check|approve|approve yes|build|mutate|spec|status]',
     })
     const r = await next(e)
     void refreshStatus($).catch(() => undefined)
@@ -245,6 +246,14 @@ export const register: Register = on => {
       if (cfg?.checks?.length && !cfg.checks.some(c => c.build))
         return { text: 'Forge · no build is set up yet. Type /forge:build-setup (optionally with languages, e.g. /forge:build-setup py js).' }
       return { text: await runBuild($, /^build\s+check\b/.test(e.args.trim())) }
+    }
+    if (arg === 'mutate') {
+      const root: string = await $.session.root()
+      const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'mutate', '--root', root, '--max', '30'], {
+        cwd: root,
+        timeoutMs: 600_000,
+      })
+      return { text: (r.stdout || r.stderr).trim().slice(0, 6000) || `The checker did not run (exit ${r.exitCode}).` }
     }
     if (arg === 'approve') return { text: await approve($, /^approve\s+yes\b/.test(e.args.trim())) }
     if (arg === 'spec') {

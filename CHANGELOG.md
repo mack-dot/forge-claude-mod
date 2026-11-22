@@ -2,6 +2,16 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## 0.7.0 — 2026-11-22
+- Added: `mutate` (CLI) and `/forge mutate`. Plants small bugs (14 kinds: comparison, arithmetic, logic,
+  constants) in the implementation files, one at a time in a temporary copy, and counts how many the proof
+  catches. A survivor is a change the spec allows. On the example: 6 of 6 caught; with clause W4 removed from
+  the spec, 1 survives (`0 < amount` to `0 <= amount`), which is exactly the gap the removal opens.
+- Added: success targets to `TRIAL.md` (set before a trial, reported with every target missed), and rows for
+  mutation results, real bugs found and false alarms.
+- Fixed: the README linked to the private research repository.
+- Tested: 27 cases (2 new).
+
 ## 0.6.1 — 2026-11-22
 - Changed: typing `/forge scan` (with a space, as earlier versions said) now puts `/forge:scan` into the prompt
   box, so the person presses Enter. The same for `add`, `explain`, `fix`, `doctor`, `build-setup`.

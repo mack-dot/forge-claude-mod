@@ -1,6 +1,7 @@
 # Forge for Claude Code
 
-A Claude Code mod that brings the [Forge](https://github.com/mack-dot/forge) proof gate into your session.
+A Claude Code mod that brings the Forge proof gate into your session. (Forge's research record is a separate,
+private repository; this plugin needs nothing from it.)
 You approve a short spec once. After that, code may change only if Dafny proves it still meets the spec.
 
 ## Install
@@ -42,6 +43,7 @@ Type `/forge` in any repository: it tells you the next step. The steps:
 | Read it | `/forge:explain` | Claude explains every clause in plain words, checks that each of your answers is covered, and lists what is not guaranteed. |
 | Approve it | `/forge approve`, then `/forge approve yes` | Shows exactly what you approve (spec, your answers, decision record, `forge.json`); "yes" approves exactly that. Only you can do this. |
 | Prove it | `/forge check` | Your answers are checked against the spec (`EXAMPLES_FAILED` if the spec says otherwise or leaves one open), then the code against the spec. The status line shows `forge ✓ VERIFIED n/n` or what failed. |
+| Measure it | `/forge mutate` | Plants up to 30 small bugs in the proved code, one at a time in a temporary copy, and counts how many the proof catches. A survivor is a change your spec allows: harmless, or a gap in the spec. Changes nothing. |
 | Something failed | `/forge:fix` | Claude explains the verdict and proposes a fix to the code; it never weakens the spec without your word. |
 | Use it in your app | `/forge:build-setup`, then `/forge build` | Compiles the proved code to your languages (`py`, `js`, `go`, `java`, `cs`, `rs`), fuzzes the compiled code in every language (identical output required), and checks that your app imports it. |
 | It does not run | `/forge:doctor` | Claude checks Python, Dafny and the config, and explains the fix. |
@@ -116,7 +118,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mack-dot/forge-claude-mod@v0.6.1   # better: pin the commit hash, tags can move
+      - uses: mack-dot/forge-claude-mod@v0.7.0   # better: pin the commit hash, tags can move
 ```
 
 The job fails unless every check is `VERIFIED`. On a pull request, any change to `forge.json`,
@@ -132,6 +134,7 @@ python3 cli/forge_check.py check     # exit 0 only if every check is VERIFIED
 python3 cli/forge_check.py spec      # show what an approval covers
 python3 cli/forge_check.py approve   # a person approves, at a terminal
 python3 cli/forge_check.py build     # compile, fuzz in every target, emit (see below)
+python3 cli/forge_check.py mutate    # plant small bugs, count how many the proof catches
 ```
 
 `examples/wallet-cap` is a small complete project. `tests/run_tests.py` drives every verdict.

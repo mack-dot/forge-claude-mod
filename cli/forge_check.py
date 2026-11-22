@@ -8,6 +8,12 @@ Usage:
   forge_check.py spec    [--root DIR] [--json]
   forge_check.py build   [--root DIR] [--json] [--check]
   forge_check.py setup   [--root DIR] [--json]     (find Dafny, or download the pinned release)
+  forge_check.py mutate  [--root DIR] [--json] [--max N]
+
+`mutate` plants small bugs in the implementation files (one at a time, in a temporary copy) and runs the
+proof on each. A mutant is "caught" when the check is no longer VERIFIED. A mutant that survives means the
+spec does not forbid that change: either the change is harmless (an equivalent mutant) or the spec is too
+weak there. Read each survivor. Nothing in the project is changed.
 
 `build` first runs `check`. For each check with a "build" entry it then:
   1. verifies the fuzz harness with Dafny, compiles it to every listed target, runs it,
@@ -630,6 +636,89 @@ def build_report(result):
     return '\n'.join(lines)
 
 
+# ---------------------------------------------------------------------------- mutate
+
+# Small, typical bugs: (name, pattern, replacement). Applied to one occurrence at a time, outside comments
+# and outside the approved binding prefix.
+MUTATIONS = [
+    ('<= to <', r'<=', '<'),
+    ('< to <=', r'(?<![<=!])<(?![=:<])', '<='),
+    ('>= to >', r'>=', '>'),
+    ('> to >=', r'(?<![-=>])>(?![=>])', '>='),
+    ('== to !=', r'==(?!>)', '!='),
+    ('!= to ==', r'!=', '=='),
+    ('&& to ||', r'&&', '||'),
+    ('|| to &&', r'\|\|', '&&'),
+    ('+ to -', r'(?<=\s)\+(?=\s)', '-'),
+    ('- to +', r'(?<=\s)-(?=\s)', '+'),
+    ('+ 1 removed', r'\s\+\s1\b', ''),
+    ('0 to 1', r'(?<![\w.])0(?![\w.])', '1'),
+    ('true to false', r'\btrue\b', 'false'),
+    ('false to true', r'\bfalse\b', 'true'),
+]
+
+
+def mutation_sites(text, skip_until):
+    """(name, start, end, replacement) for every mutation site outside comments and the binding prefix."""
+    code = list(text)
+    for m in re.finditer(r'//[^\n]*|/\*.*?\*/', text, flags=re.S):
+        for i in range(m.start(), m.end()):
+            code[i] = ' '
+    masked = ''.join(code)
+    sites = []
+    for name, pattern, new in MUTATIONS:
+        for m in re.finditer(pattern, masked):
+            if m.start() >= skip_until:
+                sites.append((name, m.start(), m.end(), new))
+    return sorted(sites, key=lambda x: (x[1], x[0]))
+
+
+def run_mutate(root, limit):
+    base = run_checks(root)
+    if any(v != 'VERIFIED' for v in base['verdicts'].values()):
+        raise ConfigError('every check must be VERIFIED before mutation testing: ' + json.dumps(base['verdicts']))
+    cfg = load_config(root)
+    out = {'mutants': [], 'caught': 0, 'survived': 0, 'skipped': 0}
+    jobs = []
+    for c in cfg['checks']:
+        for f in c['files']:
+            text = read_text(inside(root, f))
+            b = c.get('binding')
+            skip = len(b['prefix']) if b and b['file'] == f and text.startswith(b['prefix']) else 0
+            for site in mutation_sites(text, skip):
+                jobs.append((c['name'], f, text, site))
+    if len(jobs) > limit:  # spread the sample over the whole file list instead of taking the first ones
+        step = len(jobs) / float(limit)
+        jobs = [jobs[int(i * step)] for i in range(limit)]
+    for name, f, text, (mname, start, end, new) in jobs:
+        mutated = text[:start] + new + text[end:]
+        line = text.count('\n', 0, start) + 1
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = os.path.join(tmp, 'p')
+            shutil.copytree(root, copy, ignore=shutil.ignore_patterns('.git', 'node_modules', 'verified'))
+            with open(os.path.join(copy, f), 'w', encoding='utf-8') as fh:
+                fh.write(mutated)
+            verdict = run_checks(copy)['verdicts'].get(name, 'ERROR')
+        status = 'survived' if verdict == 'VERIFIED' else 'caught'
+        out[status] += 1
+        out['mutants'].append({'check': name, 'file': f, 'line': line, 'mutation': mname,
+                               'verdict': verdict, 'status': status,
+                               'text': text.split('\n')[line - 1].strip()[:120]})
+    return out
+
+
+def mutate_report(out):
+    total = out['caught'] + out['survived']
+    lines = ['forge mutate: %d of %d planted bugs caught' % (out['caught'], total)]
+    for m in out['mutants']:
+        if m['status'] == 'survived':
+            lines.append('  SURVIVED %s:%d  %s  in: %s' % (m['file'], m['line'], m['mutation'], m['text']))
+    if out['survived']:
+        lines.append('A survivor is a change the spec allows. Either it is harmless (an equivalent mutant), or '
+                     'the spec is too weak there: read each one.')
+    return '\n'.join(lines)
+
+
 def contract_of(path):
     keep = []
     with open(path, encoding='utf-8', errors='replace') as f:
@@ -675,7 +764,7 @@ def write_json(root, rel, value):
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog='forge_check.py', description='Forge proof check')
-    p.add_argument('command', choices=['check', 'approve', 'spec', 'build', 'setup'])
+    p.add_argument('command', choices=['check', 'approve', 'spec', 'build', 'setup', 'mutate'])
     p.add_argument('--root', default='.', help='project folder (default: current folder)')
     p.add_argument('--json', action='store_true', help='print the result as JSON')
     p.add_argument('--base', help='git ref; any change to forge.json, approved.json or a spec '
@@ -683,11 +772,16 @@ def main(argv=None):
     p.add_argument('--no-write', action='store_true', help='do not write ' + LAST)
     p.add_argument('--hashes', help='approve: the hashes that `spec --json` printed; refused if any '
                                     'file changed since')
+    p.add_argument('--max', type=int, default=40, help='mutate: at most this many mutants')
     p.add_argument('--check', action='store_true', help='build: write nothing; the emitted code on '
                                                         'disk must equal a fresh build')
     a = p.parse_args(argv)
     root = os.path.abspath(a.root)
     try:
+        if a.command == 'mutate':
+            out = run_mutate(root, a.max)
+            print(json.dumps(out, indent=2) if a.json else mutate_report(out))
+            return 0
         if a.command == 'setup':
             cfg = read_json(os.path.join(root, CONFIG), {}) or {}
             path = find_dafny(root, cfg)

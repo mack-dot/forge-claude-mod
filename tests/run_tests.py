@@ -260,6 +260,37 @@ def main():
             extra += 1
             print('%s  %-52s want approve %d, %s  got %d, %s%s' % ('ok  ' if ok else 'FAIL', 'approval: ' + name,
                   want_exit, want_verdict, r.returncode, ','.join(got), '' if covered else ' (hashes miss a file)'))
+    # mutation testing: a strong spec catches every planted bug; a weakened one lets some survive
+    for name, weaken, want_survivors in [('strong spec: every planted bug caught', False, False),
+                                         ('weakened spec (W4 removed): survivors reported', True, True)]:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, 'p')
+            shutil.copytree(EXAMPLE, root)
+            if weaken:
+                import hashlib
+                edit(root, SPEC, '    ensures !(0 < amount && s.spent + amount <= s.cap) ==>\n      outcome == Rejected && next == s\n', '')
+                cfg = json.load(open(os.path.join(root, CONFIG)))
+                for key in ('examples', 'decisions'):
+                    cfg['checks'][0].pop(key)
+                json.dump(cfg, open(os.path.join(root, CONFIG), 'w'))
+                h = lambda q: hashlib.sha256(open(os.path.join(root, q), 'rb').read()).hexdigest()
+                json.dump({CONFIG: h(CONFIG), SPEC: h(SPEC)}, open(os.path.join(root, APPROVED), 'w'))
+            before = open(os.path.join(root, IMPL)).read()
+            r = subprocess.run([sys.executable, CLI, 'mutate', '--root', root, '--json'],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            try:
+                out = json.loads(r.stdout)
+                caught, survived = out['caught'], out['survived']
+            except (ValueError, KeyError):
+                caught, survived = -1, -1
+            unchanged = open(os.path.join(root, IMPL)).read() == before
+            ok = r.returncode == 0 and caught > 0 and (survived > 0) == want_survivors and unchanged
+            failed += not ok
+            extra += 1
+            print('%s  %-52s caught %d, survived %d%s' % ('ok  ' if ok else 'FAIL', 'mutate: ' + name, caught, survived,
+                  '' if unchanged else ' (PROJECT CHANGED)'))
+            if not ok:
+                print('      ' + (r.stderr or r.stdout)[-400:])
     print('%d cases, %d failed' % (len(CASES) + len(BUILD_CASES) + extra, failed))
     return 1 if failed else 0
 

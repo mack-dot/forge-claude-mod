@@ -1,5 +1,20 @@
 # Timed trial (Phase 0)
 
+## Success targets (write them down BEFORE the first tester starts; do not change them afterwards)
+
+Forge "works" for this trial only if all of these hold:
+
+| Claim | Target | Measured by |
+| --- | --- | --- |
+| People can use it | at least 4 of 5 testers reach VERIFIED on a real rule from their own app | the sheet below |
+| It is fast enough | median time to VERIFIED under 45 minutes | the sheet below |
+| People read what they approve | every tester can name one thing their spec does NOT guarantee | the sheet below |
+| The proof catches real bugs | `/forge mutate` catches at least 90 % of planted bugs across all testers; every survivor is read and classed as harmless or as a spec gap | `/forge mutate` output |
+| It finds bugs people did not know about | at least one real bug (code disagrees with the tester's own answer) per two rules | the sheet below |
+| It does not cry wolf | false alarms (a failure that was not a real problem) are counted and reported | the sheet below |
+
+Report the result against these targets, including every target missed. Never report only the best run.
+
 Goal: the first real numbers on how long one rule takes with Forge, and where people get stuck.
 One sheet per person. Do not help unless the person is stuck for 5 minutes; write down every help.
 
@@ -16,7 +31,9 @@ One sheet per person. Do not help unless the person is stuck for 5 minutes; writ
 
 Start a timer. Optionally type `/forge:scan`. Then type `/forge:add` and your rule in your own words, and
 follow the steps until `/forge check` shows VERIFIED.
-Optional second part: `/forge build` until it shows BUILT and your app calls the built code.
+Then run `/forge mutate` and keep its output.
+Optional second part: `/forge:build-setup`, then `/forge build` until it shows BUILT and your app calls the
+built code.
 
 ## Record
 
@@ -37,6 +54,10 @@ Optional second part: `/forge build` until it shows BUILT and your app calls the
 | Did the tester read the spec before approving? (observed) | |
 | Could the tester say, afterwards, one thing the spec does NOT guarantee? | |
 | Gave up? At which step, and why | |
+| `/forge mutate`: planted bugs caught / total | |
+| Survivors: harmless, or a spec gap (one line each) | |
+| Real bugs found: places where the code disagreed with the tester's own answers | |
+| False alarms: failures that were not real problems | |
 
 ## After
 
