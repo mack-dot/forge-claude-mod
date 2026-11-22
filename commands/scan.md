@@ -9,7 +9,7 @@ Work quickly: list the files, search for decision words (limit, cap, allow, deny
 
 1. Read the layout, then the code that decides money, limits, quotas, permissions and access, state changes (status fields, lifecycles), retries and idempotency, parsing of untrusted input, and scoring or ranking rules. Skip vendored and generated folders (node_modules, dist, build, vendor, .venv). Also include:
    - error and fallback branches that decide allow or deny when a dependency fails or a limit is hit (fail-open versus fail-closed). These are rules, not glue;
-   - the code that decides WHICH rule applies: subject, type, tenant or role detection from caller-supplied data.
+   - the code that decides WHICH rule applies: subject, type, tenant or role detection from caller-supplied data. It has the same stakes as the rule it selects: rank it next to that rule, not below it.
 2. Rank at most 7 candidates in one table: rank | file:line | function | the rule in one plain sentence | what goes wrong if it breaks | kind (pure rule: provable / rule mixed with I/O: split the rule out / judgment: not provable) | effort (small, medium, large).
    - State the INTENDED rule, from docs, names and tests, not a paraphrase of what the code does. If the code looks wrong against that intent, add "suspected bug: <one line>" to the row.
    - Rank by what goes wrong if the rule breaks (money, privacy, safety, access first). A suspected bug moves a row up only past rows of similar stakes; it never pushes a higher-stakes rule out of the top 5.

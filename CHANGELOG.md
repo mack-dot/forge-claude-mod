@@ -2,6 +2,15 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## 0.10.2 — 2026-11-22
+- Changed: `/forge:scan` ranks the code that decides which rule applies next to the rule it selects.
+- Evaluation of 0.10.1 (13 blind headless scans, same 8 known bugs, graded by one agent, not blind): top-5 hit rate
+  25 of 25; recall 5 of 8 in the top 5 and 8 of 8 in the top 7; 3 top-3 rows with a suspected-bug note (14 in
+  0.9.1); median scan 61 s (81 s in 0.9.1, 43 s in 0.9.0). The two missed top-5 bugs were in rule-selection code,
+  which this change addresses. Caution: these 8 bugs have now shaped three rounds of changes; the next evaluation
+  needs fresh bugs.
+- Not tested: this change.
+
 ## 0.10.1 — 2026-11-22
 - Changed: `/forge:scan` ranking, from a second blind evaluation of the v0.9.1 instructions: blind recall of 8
   known bugs rose from 3 to 6 in the top 5 (7 in the top 7), but the top-5 hit rate fell from 96 % to 92 %, scans
