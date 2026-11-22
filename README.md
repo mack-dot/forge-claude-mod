@@ -35,15 +35,14 @@ In the desktop app: click + next to the prompt box, then Plugins, Add marketplac
 ## Use
 
 Type `/forge` in any repository: it tells you the next step. Commands with a **colon** (`/forge:scan`) start a
-conversation with Claude; commands with a **space** (`/forge approve`) run a fixed step. Typing a fixed step
-with a colon (`/forge:approve`) prints the right command. The steps:
+conversation with Claude; commands with a **space** (`/forge approve`) run a fixed step. The steps:
 
 | Step | You type | What happens |
 | --- | --- | --- |
 | Find candidates (optional) | `/forge:scan` | Claude ranks up to 7 rules in your code worth proving, and names what should not be proved. Changes nothing. |
 | State a rule | `/forge:add <the rule in your own words>` | A conversation: Claude says whether the rule can be proved, confirms safe defaults, asks edge-case questions with concrete numbers (as many rounds as needed), probes the spec with Dafny for cases nobody asked about, then writes the spec, **your answers as Dafny checks**, a decision record and the implementation. |
 | Read it | `/forge:explain` | Claude explains every clause in plain words, checks that each of your answers is covered, and lists what is not guaranteed. |
-| Approve it | `/forge approve`, then `/forge approve yes` | Shows exactly what you approve (spec, your answers, decision record, `forge.json`); "yes" approves exactly that. Only you can do this. |
+| Approve it | `/forge approve`, then `/forge approve yes` | Shows exactly what you approve (spec, your answers, decision record, `forge.json`); "yes" approves exactly that, even after a restart. Typing "yes" first only shows it. If a file changed in between, it shows the new version instead. Only you can do this. |
 | Prove it | `/forge check` | Your answers are checked against the spec (`EXAMPLES_FAILED` if the spec says otherwise or leaves one open), then the code against the spec. The status line shows `forge ✓ VERIFIED n/n` or what failed. |
 | Measure it | `/forge mutate` | Plants up to 30 small bugs in the proved code, one at a time in a temporary copy, and counts how many the proof catches. A survivor is a change your spec allows: harmless, or a gap in the spec. Changes nothing. |
 | Something failed | `/forge:fix` | Claude explains the verdict and proposes a fix to the code; it never weakens the spec without your word. |
@@ -120,7 +119,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mack-dot/forge-claude-mod@v0.7.1   # better: pin the commit hash, tags can move
+      - uses: mack-dot/forge-claude-mod@v0.7.2   # better: pin the commit hash, tags can move
 ```
 
 The job fails unless every check is `VERIFIED`. On a pull request, any change to `forge.json`,
