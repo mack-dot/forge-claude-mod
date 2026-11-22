@@ -4,6 +4,8 @@ The adapter module (written once per check, usually by Claude with /forge:diff-s
   generate(rng)     -> one input (plain JSON value); rng helpers below; rng.weird() gives odd values
   reference(input)  -> the output of the compiled PROVED rule for that input (plain JSON value)
   candidates        -> {name: function(input) -> output}: the code under test
+  decisions         -> optional: [{'id': 'D1', 'input': ...}]: the person's recorded decisions, run first on
+                       every run as fixed inputs
   in_domain(input)  -> optional; False skips the input (compiled Dafny code does not check `requires`)
 Every candidate output is compared with the reference output (as JSON). A disagreement is shrunk to a
 small input that still disagrees and saved as a regression case; saved cases run first next time.
@@ -94,7 +96,8 @@ def shrinks(v):
 
 spec = importlib.util.spec_from_file_location('forge_diff_adapter', os.path.abspath(adapter_path))
 adapter = importlib.util.module_from_spec(spec)
-result = {'inputs': 0, 'out_of_domain': 0, 'replayed': 0, 'disagreements': [], 'seed': int(seed_arg)}
+result = {'inputs': 0, 'out_of_domain': 0, 'replayed': 0, 'decisions': {'total': 0, 'agree': 0, 'failing': []},
+          'disagreements': [], 'seed': int(seed_arg)}
 try:
     spec.loader.exec_module(adapter)
     in_domain = getattr(adapter, 'in_domain', lambda _: True)
@@ -166,6 +169,15 @@ try:
                     d = disagrees(case['candidate'], case['input'])
                     if d:
                         kinds.add(case['candidate'] + '|' + signature(*d))
+    for dec in getattr(adapter, 'decisions', []):  # the person's recorded decisions, as fixed inputs
+        result['decisions']['total'] += 1
+        bad = [n for n in names if disagrees(n, dec['input'])]
+        if bad:
+            result['decisions']['failing'].append({'id': dec['id'], 'candidates': bad})
+        else:
+            result['decisions']['agree'] += 1
+        for n in bad:  # reported in the decisions line, not saved again; the random search skips this kind
+            kinds.add(n + '|' + signature(*disagrees(n, dec['input'])))
     rng = Rng(int(seed_arg))
     max_inputs, budget = int(max_inputs_arg), int(budget_ms_arg) / 1000.0
     while result['inputs'] < max_inputs and time.time() - started < budget:

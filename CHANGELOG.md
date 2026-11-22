@@ -11,7 +11,10 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
 - Added: automatic run at the end of each Claude turn in which a watched file changed, found by modification time
   (so shell edits and the person's own edits count); a turn without a change runs nothing; result in the status
   line.
-- Tested: 35 cases (7 new). On the example: the three planted bugs in the shipped Python function (exact cap
+- Added: the person's recorded decisions run as fixed inputs on every run (`decisions` in the adapter), reported
+  as "your recorded decisions: N of M agree". Running totals per rule (`.forge/diff-stats.json`): inputs and runs
+  so far, and runs and inputs since the last NEW failure, as evidence of how thoroughly it has searched.
+- Tested: 37 cases (9 new). On the example: the three planted bugs in the shipped Python function (exact cap
   rejected, zero accepted, negative accepted) and the two in the shipped TypeScript function are found; the
   wrapper agrees; after the shipped code is fixed the saved cases pass. Runs take 50–250 ms per language for 1,500
   inputs. In headless Claude Code sessions: `/forge diff` works; an Edit-tool edit and a shell edit each trigger

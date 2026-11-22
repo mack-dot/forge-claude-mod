@@ -126,6 +126,10 @@ Each disagreement is a bug in that code, or a place where your spec says somethi
   takes well under two seconds (60–110 ms on the example) and shows the result in the status line,
   `fuzz ✓ 3,000 inputs` or `fuzz ✗ 2 disagreement(s)`. A turn that changed nothing runs nothing.
 - **On demand:** `/forge diff`. In CI: `python3 cli/forge_check.py diff --inputs 50000 --budget-ms 60000`.
+- **Your decisions, always:** every decision you recorded in `/forge:add` runs as a fixed input on every run:
+  `your recorded decisions: 9 of 9 agree`.
+- **How much it has searched:** `searched so far: 48,000 inputs in 32 runs; nothing new for 12 runs`. A long stretch
+  with nothing new is evidence, not proof, that the easy bugs are gone.
 - **Smallest cases, kept:** each disagreement is shrunk to a small input that fails the same way, saved under
   `.forge/regressions/`, and replayed first on every later run. Commit them: they are your new tests.
 

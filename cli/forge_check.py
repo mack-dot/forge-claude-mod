@@ -68,6 +68,7 @@ CONFIG = DIR + '/forge.json'
 APPROVED = DIR + '/approved.json'
 LAST = DIR + '/last-check.json'
 LAST_DIFF = DIR + '/last-diff.json'
+DIFF_STATS = DIR + '/diff-stats.json'
 REGRESSIONS = DIR + '/regressions'
 
 # Constructs that make Dafny accept a claim without proof. A text scan, not a parser.
@@ -808,11 +809,36 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None):
                                               universal_newlines=True).stdout.strip())
         elif data.get('error'):
             res['verdict'] = 'DIFF_ERROR'
-        elif data.get('disagreements'):
+        elif data.get('disagreements') or (data.get('decisions') or {}).get('failing'):
             res['verdict'] = 'DISAGREE'
         else:
             res['verdict'] = 'DIFF_OK'
     return out
+
+
+def update_diff_stats(root, out):
+    """Running totals per diff key: how much searching has happened, and how much since the last NEW failure.
+    A long stretch with nothing new is evidence (not proof) that the easy bugs are gone."""
+    path = os.path.join(root, DIFF_STATS)
+    stats = read_json(path, {}) or {}
+    for key, r in out['checks'].items():
+        if r['verdict'] not in ('DIFF_OK', 'DISAGREE'):
+            continue
+        st = stats.setdefault(key, {'runs': 0, 'inputs': 0, 'first_run': out['at'], 'last_new_failure': None,
+                                    'runs_since_new': 0, 'inputs_since_new': 0})
+        st['runs'] += 1
+        st['inputs'] += r.get('inputs', 0)
+        failing_now = sorted(f['id'] for f in (r.get('decisions') or {}).get('failing', []))
+        newly_failing = [f for f in failing_now if f not in st.get('failing_decisions', [])]
+        st['failing_decisions'] = failing_now
+        if any(d.get('new') for d in r.get('disagreements', [])) or newly_failing:
+            st['last_new_failure'], st['runs_since_new'], st['inputs_since_new'] = out['at'], 0, 0
+        else:
+            st['runs_since_new'] += 1
+            st['inputs_since_new'] += r.get('inputs', 0)
+        st['last_run'] = out['at']
+        r['stats'] = st
+    write_json(root, DIFF_STATS, stats)
 
 
 def diff_report(out):
@@ -821,19 +847,36 @@ def diff_report(out):
     lines = []
     for name, r in out['checks'].items():
         v = r['verdict']
+        dec = r.get('decisions') or {}
+        dec_line = ('  your recorded decisions: %d of %d agree%s' % (
+            dec['agree'], dec['total'], '; failing: ' + ', '.join('%s (%s)' % (f['id'], ', '.join(f['candidates']))
+                                                             for f in dec['failing']) if dec['failing'] else '')
+                    if dec.get('total') else '  your recorded decisions: none listed in the adapter (add "decisions")')
+        st = r.get('stats')
+        st_line = ('  searched so far: %s inputs in %d runs; nothing new for %d runs (%s inputs)%s' % (
+            format(st['inputs'], ','), st['runs'], st['runs_since_new'], format(st['inputs_since_new'], ','),
+            '' if st['last_new_failure'] is None else ', last new failure ' + st['last_new_failure'])
+                   if st else None)
         if v == 'DIFF_OK':
             lines.append('✓ %s: %d inputs (%d skipped, outside the rule), %d saved cases replayed, 0 disagreements '
                          'for %s, %d ms, seed %s' % (name, r['inputs'], r['out_of_domain'], r['replayed'],
                                                      ', '.join(r.get('candidates') or []), r['ms'], r['seed']))
+            lines.append(dec_line)
+            if st_line:
+                lines.append(st_line)
         elif v == 'DISAGREE':
-            lines.append('✗ %s: %d disagreement(s) in %d inputs (%d ms, seed %s); per candidate: %s'
-                         % (name, len(r['disagreements']), r['inputs'], r['ms'], r['seed'],
+            lines.append('✗ %s: %d failing decision(s), %d other disagreement(s) in %d random inputs (%d ms, seed %s); '
+                         'per candidate: %s'
+                         % (name, len(dec.get('failing', [])), len(r['disagreements']), r['inputs'], r['ms'], r['seed'],
                             ', '.join('%s %d' % kv for kv in (r.get('per_candidate') or {}).items())))
             for d in r['disagreements']:
                 lines.append('  %s%s: input %s → proved rule says %s, %s says %s  [%s]' % (
                     'NEW ' if d.get('new') else '', d['candidate'], json.dumps(d['input'], ensure_ascii=False)[:200],
                     json.dumps(d['reference'], ensure_ascii=False)[:120], d['candidate'],
                     json.dumps(d['got'], ensure_ascii=False)[:120], d['file']))
+            lines.append(dec_line)
+            if st_line:
+                lines.append(st_line)
             lines.append('  Each one is a bug in that code, or a place where the spec says something other than '
                          'what you meant. Saved cases under %s/%s/ run first next time.' % (REGRESSIONS, name.replace(':', '-')))
         else:
@@ -906,6 +949,7 @@ def main(argv=None):
         if a.command == 'diff':
             out = run_diff(root, a.inputs, a.budget_ms, a.seed)
             if not a.no_write:
+                update_diff_stats(root, out)
                 write_json(root, LAST_DIFF, out)
             print(json.dumps(out, indent=2, ensure_ascii=False) if a.json else diff_report(out))
             return 0 if all(r['verdict'] == 'DIFF_OK' for r in out['checks'].values()) else 1

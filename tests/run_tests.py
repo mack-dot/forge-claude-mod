@@ -302,7 +302,7 @@ def main():
                 print('      ' + (r.stderr or r.stdout)[-400:])
     # differential fuzz: shipped code and wrapper against the compiled proved rule
     def diff(root, *extra_args):
-        r = subprocess.run([sys.executable, CLI, 'diff', '--root', root, '--json', '--seed', '7'] + list(extra_args),
+        r = subprocess.run([sys.executable, CLI, 'diff', '--root', root, '--json', '--seed', '7'] + list(extra_args),  # writes stats
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         try:
             return r.returncode, json.loads(r.stdout)['checks']
@@ -324,22 +324,33 @@ def main():
         code, res = diff(root)
         py, js = res.get('wallet-cap:py', {}), res.get('wallet-cap:js', {})
         kinds_py = sorted({json.dumps(d['reference']['ok']) + '>' + json.dumps(d['got']['ok']) for d in py.get('disagreements', [])})
+        failing_py = sorted(f['id'][:2] for f in (py.get('decisions') or {}).get('failing', []))
+        failing_js = sorted(f['id'][:2] for f in (js.get('decisions') or {}).get('failing', []))
         cases = [
             ('diff: shipped Python bugs found (exact cap, zero, negative)', code == 1 and py.get('verdict') == 'DISAGREE'
-             and (py.get('per_candidate') or {}).get('legacy') == 3 and kinds_py == ['false>true', 'true>false']),
+             and failing_py == ['D1', 'D3', 'D4']),
             ('diff: the wrapper agrees with the proved rule', (py.get('per_candidate') or {}).get('app-wrapper') == 0),
             ('diff: shipped TypeScript bugs found (zero, negative)', js.get('verdict') == 'DISAGREE'
-             and (js.get('per_candidate') or {}).get('legacy-ts') == 2),
+             and failing_js == ['D3', 'D4']),
             ('diff: each run under 2 seconds', py.get('ms', 9999) < 2000 and js.get('ms', 9999) < 2000),
-            ('diff: cases saved for replay', len(os.listdir(os.path.join(root, '.forge/regressions/wallet-cap-py'))) == 3),
+            ('diff: random search adds no duplicate of a failing decision', len(py.get('disagreements', [])) == 0),
+            ('diff: recorded decisions run as fixed inputs (legacy fails D1, D3, D4; the wrapper agrees)',
+             (py.get('decisions') or {}).get('total') == 4
+             and sorted(f['id'][:2] for f in (py.get('decisions') or {}).get('failing', [])) == ['D1', 'D3', 'D4']
+             and all(f['candidates'] == ['legacy'] for f in (py.get('decisions') or {}).get('failing', []))),
         ]
         fix_legacy(root)
         code2, res2 = diff(root, '--inputs', '0')
-        cases.append(('diff: after the shipped code is fixed, the saved cases pass',
-                      code2 == 0 and all(r.get('verdict') == 'DIFF_OK' and r.get('replayed', 0) > 0 for r in res2.values())))
+        cases.append(('diff: after the shipped code is fixed, every decision agrees',
+                      code2 == 0 and all(r.get('verdict') == 'DIFF_OK' and r['decisions']['agree'] == 4 for r in res2.values())))
         edit(root, IMPL, 's.spent + amount <= s.cap {', 's.spent + amount <= s.cap && true {')
         code3, res3 = diff(root)
         cases.append(('diff: an outdated build is detected', code3 == 1 and all(r.get('verdict') == 'BUILD_STALE' for r in res3.values())))
+        stats = json.load(open(os.path.join(root, '.forge/diff-stats.json')))
+        cases.append(('diff: search totals kept across runs (saturation)',
+                      stats.get('wallet-cap:py', {}).get('runs') == 2 and stats['wallet-cap:py']['runs_since_new'] == 1
+                      and stats['wallet-cap:py']['failing_decisions'] == []
+                      and stats['wallet-cap:py']['inputs'] >= 1500))
         for name, ok in cases:
             failed += not ok
             extra += 1

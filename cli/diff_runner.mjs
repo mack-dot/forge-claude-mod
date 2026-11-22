@@ -6,6 +6,8 @@
 //   reference(input)     -> the output of the compiled PROVED rule for that input (plain JSON value).
 //   candidates           -> { name: input => output }: the code under test (the shipped app function,
 //                           the wrapper around the proved code, ...).
+//   decisions            -> optional: [{ id: 'D1', input }]: the person's recorded decisions, run first on every
+//                           run as fixed inputs, so their own edge cases are never left to chance.
 //   inDomain(input)      -> optional; false skips the input (outside the rule's precondition: compiled
 //                           Dafny code does not check `requires`).
 // Before the adapter loads, the runner sets globalThis.forge = { loadDafny, require }. Use
@@ -139,7 +141,7 @@ function shrink(name, input) {
   return best
 }
 
-const result = { inputs: 0, out_of_domain: 0, replayed: 0, disagreements: [], seed: Number(seedArg) }
+const result = { inputs: 0, out_of_domain: 0, replayed: 0, decisions: { total: 0, agree: 0, failing: [] }, disagreements: [], seed: Number(seedArg) }
 const seen = new Set()
 const kinds = new Set()
 function record(name, input, isNew) {
@@ -169,7 +171,20 @@ try {
         if (d) kinds.add(c.candidate + '|' + signature(d.ref, d.got))
       }
     }
-  // 2. Fresh random inputs within the input and time budget.
+  // 2. The person's recorded decisions, as fixed inputs.
+  for (const d of adapter.decisions || []) {
+    result.decisions.total++
+    const bad = names.filter(n => disagrees(n, d.input))
+    if (bad.length) result.decisions.failing.push({ id: d.id, candidates: bad })
+    else result.decisions.agree++
+    // Reported in the decisions line, not saved again (a decision runs every time anyway); the random search
+    // then skips this kind of failure instead of saving a duplicate of it.
+    for (const n of bad) {
+      const dd = disagrees(n, d.input)
+      kinds.add(n + '|' + signature(dd.ref, dd.got))
+    }
+  }
+  // 3. Fresh random inputs within the input and time budget.
   const rng = makeRng(Number(seedArg))
   const maxInputs = Number(maxInputsArg)
   const budget = Number(budgetMsArg)

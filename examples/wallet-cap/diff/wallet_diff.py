@@ -35,3 +35,12 @@ candidates = {
     'app-wrapper': lambda i: _pair(app.spend(i['cap'], i['spent'], i['amount'])),
     'legacy': lambda i: _pair(legacy_wallet.legacy_spend(i['cap'], i['spent'], i['amount'])),
 }
+
+
+# The person's recorded decisions (.forge/decisions/wallet-cap.md), run as fixed inputs on every run.
+decisions = [
+    {'id': 'D1 exact cap allowed', 'input': {'cap': 5000, 'spent': 2000, 'amount': 3000}},
+    {'id': 'D2 no partial spend', 'input': {'cap': 5000, 'spent': 4000, 'amount': 2000}},
+    {'id': 'D3 zero rejected', 'input': {'cap': 5000, 'spent': 0, 'amount': 0}},
+    {'id': 'D4 negative rejected', 'input': {'cap': 5000, 'spent': 3000, 'amount': -1000}},
+]
