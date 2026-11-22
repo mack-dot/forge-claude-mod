@@ -14,7 +14,11 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
   shell and editor edits count); `/forge add` sets the fuzz up when the rule already exists in code; `/forge fuzz`
   sets it up for other rules or does a deep run; `/forge diff` is the quick run; `/forge build` without a set-up
   puts the set-up command in the prompt box.
-- Tested: 39 cases (11 new). On the example: the planted bugs in the shipped Python function (exact cap rejected,
+- Added: integers above 2^53 cross the line protocol exactly (the JavaScript evaluator reads them as BigInt and
+  writes BigInt and bignumber.js values with all their digits; plain JSON.parse would round 2^63 - 1). The example
+  inputs now include values near 2^53 and 2^63; the fuzz found, unplanted, that the shipped TypeScript function
+  (plain numbers) computes a wrong balance above 2^53.
+- Tested: 41 cases (13 new). On the example: the planted bugs in the shipped Python function (exact cap rejected,
   zero accepted, negative accepted) and in the shipped TypeScript function are found through the decisions and the
   random search; the wrapper agrees; fixing the shipped code makes every decision agree; an outdated build is
   detected; a `"cmd"` evaluator works through the protocol alone; a hanging function is reported within seconds.

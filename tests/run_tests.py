@@ -342,12 +342,29 @@ def main():
         ]
         fix_legacy(root)
         code2, res2 = diff(root, '--inputs', '0')
+        js2 = res2.get('wallet-cap:js', {})
         cases.append(('diff: after the shipped code is fixed, every decision agrees',
-                      code2 == 0 and all(r.get('verdict') == 'DIFF_OK' and r['decisions']['agree'] == 4 for r in res2.values())))
+                      all(r['decisions']['agree'] == 4 for r in res2.values())
+                      and res2.get('wallet-cap:py', {}).get('verdict') == 'DIFF_OK'))
+        # The "fixed" TypeScript still uses plain numbers: above 2^53 it loses precision, and the fuzz keeps saying so.
+        code_big, res_big = diff(root, '--inputs', '3000')
+        jsb = res_big.get('wallet-cap:js', {})
+        cases.append(('diff: finds the precision loss above 2^53 in TypeScript number code',
+                      any(d['input']['cap'] > 2 ** 53 for d in jsb.get('disagreements', []))))
         edit(root, IMPL, 's.spent + amount <= s.cap {', 's.spent + amount <= s.cap && true {')
         code3, res3 = diff(root)
         cases.append(('diff: an outdated build is detected', code3 == 1 and all(r.get('verdict') == 'BUILD_STALE' for r in res3.values())))
         stats = json.load(open(os.path.join(root, '.forge/diff-stats.json')))
+        # big integers cross the line protocol exactly (JSON.parse alone would round 2^63 - 1)
+        modules = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'), 'forge-check', 'js', 'node_modules')
+        p = subprocess.Popen(['node', os.path.join(HERE, '..', 'cli', 'eval', 'node_eval.mjs'), os.path.join(root, 'diff/wallet_diff.mjs')],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                             env=dict(os.environ, NODE_PATH=modules), cwd=root)
+        out, err = p.communicate(json.dumps({'input': {'cap': 2 ** 63 - 1, 'spent': 2 ** 63 - 2, 'amount': 1}}) + '\n', timeout=60)
+        lines = [json.loads(l) for l in out.strip().split('\n')]
+        exact = lines[1]['reference'] == {'ok': True, 'spent': 2 ** 63 - 1}
+        rounded = lines[1]['candidates']['legacy-ts']['spent'] != 2 ** 63 - 1  # the shipped code uses plain numbers
+        cases.append(('diff: integers above 2^53 cross the protocol exactly', exact and rounded))
         # any language through "cmd": here the Python evaluator, named as a plain program
         cfg = json.load(open(os.path.join(root, CONFIG)))
         cfg['checks'][0]['diff'] = [{'name': 'any', 'lang': 'cmd', 'inputs': 'diff/wallet_inputs.py',
@@ -370,7 +387,7 @@ def main():
                       res5.get('wallet-cap', {}).get('verdict') == 'DIFF_ERROR'
                       and 'no answer within' in res5['wallet-cap'].get('error', '') and time.time() - t0 < 30))
         cases.append(('diff: search totals kept across runs (saturation)',
-                      stats.get('wallet-cap:py', {}).get('runs') == 2 and stats['wallet-cap:py']['runs_since_new'] == 1
+                      stats.get('wallet-cap:py', {}).get('runs') == 3 and stats['wallet-cap:py']['runs_since_new'] == 2
                       and stats['wallet-cap:py']['failing_decisions'] == []
                       and stats['wallet-cap:py']['inputs'] >= 1500))
         for name, ok in cases:

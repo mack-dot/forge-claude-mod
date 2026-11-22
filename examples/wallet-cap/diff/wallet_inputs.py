@@ -2,6 +2,10 @@
 
 
 def generate(rng):
+    if rng.float() < 0.1:  # now and then near the integer cliffs of JavaScript (2^53) and of 64-bit code (2^63)
+        cap = rng.pick([2 ** 53 + 1, 2 ** 63 - 1, 2 ** 63, 2 ** 64])
+        spent = cap - rng.pick([0, 1, 2, 10])
+        return {'cap': cap, 'spent': spent, 'amount': rng.pick([1, 2, cap - spent, cap - spent + 1])}
     cap = rng.num(0, 10000)
     spent = rng.num(0, cap)
     room = cap - spent

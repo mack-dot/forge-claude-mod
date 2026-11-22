@@ -130,6 +130,8 @@ Each disagreement is a bug in that code, or a place where your spec says somethi
 - **Smallest cases, kept:** each disagreement is shrunk to a small input that fails the same way, saved under
   `.forge/regressions/`, and replayed first next time. Commit them: they are your new tests.
 - **Hangs:** a function that does not answer within 2 seconds is reported, not waited on.
+- **Big integers:** values above 2^53 reach JavaScript and TypeScript code exactly (as BigInt); on the example the
+  fuzz found that the shipped TypeScript code, which uses plain numbers, gets the balance wrong above 2^53.
 
 **Any language.** One Python core does the search: seeds, your decisions, shrinking, saved cases. Each language
 only needs an evaluator: a process that reads one input per line (`{"input": …}`) and prints the proved rule's
