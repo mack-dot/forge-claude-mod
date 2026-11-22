@@ -14,7 +14,9 @@
       "build": {
         "targets": [
           "py",
-          "js"
+          "js",
+          "go",
+          "rs"
         ],
         "out": "verified",
         "fuzz": "fuzz/WalletFuzz.dfy",
@@ -43,6 +45,22 @@
           "adapter": "diff/wallet_diff.mjs",
           "watch": [
             "legacy_wallet.ts"
+          ]
+        },
+        {
+          "lang": "go",
+          "inputs": "diff/wallet_inputs.py",
+          "adapter": "diff/wallet_diff.go",
+          "watch": [
+            "legacygo/legacy.go"
+          ]
+        },
+        {
+          "lang": "rs",
+          "inputs": "diff/wallet_inputs.py",
+          "adapter": "diff/wallet_diff.rs",
+          "watch": [
+            "legacy_wallet.rs"
           ]
         }
       ]

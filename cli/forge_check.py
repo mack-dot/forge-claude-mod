@@ -164,11 +164,12 @@ def load_config(root):
                 inside(root, u['file'])
         for df in diff_entries(c):
             ok = isinstance(df, dict) and df.get('inputs') and (
-                (df.get('lang') in ('js', 'py') and df.get('adapter'))
+                (df.get('lang') in ('js', 'py', 'go', 'rs') and df.get('adapter'))
                 or (df.get('lang') == 'cmd' and isinstance(df.get('run'), list) and df['run']))
             if not ok:
-                raise ConfigError('check %s: each "diff" entry needs "inputs" (a Python file) and either "lang": "js" '
-                                  'or "py" with "adapter", or "lang": "cmd" with "run": [program, args...]' % c['name'])
+                raise ConfigError('check %s: each "diff" entry needs "inputs" (a Python file) and either "lang": "js", '
+                                  '"py", "go" or "rs" with "adapter", or "lang": "cmd" with "run": [program, args...]'
+                                  % c['name'])
             inside(root, df['inputs'])
             if df.get('adapter'):
                 inside(root, df['adapter'])
@@ -525,6 +526,12 @@ def emit_target(dafny, work, files, target, out_dir, name, log):
     code = run_to_file(cmd, work, log)
     if code != 0:
         return 'exit %s\n%s' % (code, read_text(log)[-600:])
+    if target == 'go':
+        # Dafny's Go output is GOPATH-style (packages named "dafny", "Wallet", ...). Inside the person's own Go
+        # module it would break their `go build ./...`; a go.mod of its own makes Go treat it as separate.
+        with open(os.path.join(out_dir, name + '-go', 'go.mod'), 'w', encoding='utf-8') as f:
+            f.write('// Written by forge: keeps this compiled proved code out of the surrounding Go module.\n'
+                    'module forgeverified\n\ngo 1.21\n')
     return None
 
 
@@ -801,6 +808,27 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None):
             cmd = ['node', os.path.join(here, 'eval', 'node_eval.mjs'), inside(root, df['adapter'])]
         elif df['lang'] == 'py':
             cmd = [sys.executable, os.path.join(here, 'eval', 'py_eval.py'), inside(root, df['adapter'])]
+        elif df['lang'] in ('go', 'rs'):
+            import eval_build
+            target = df['lang']
+            if target not in c['build'].get('targets', []):
+                res['verdict'] = 'NO_BUILD'
+                res['detail'] = 'add "%s" to the check\'s build targets, approve, and run build' % target
+                continue
+            name = c['name'].replace('-', '_')
+            emitted = os.path.join(inside(root, c['build']['out']), c['name'], target,
+                                   '%s-%s' % (name, 'go' if target == 'go' else 'rust'))
+            work = os.path.join(root, DIR, 'cache', 'diff-%s-%s' % (key.replace(':', '-'), target))
+            try:
+                if target == 'go':
+                    cmd = eval_build.build_go(root, emitted, inside(root, df['adapter']), work)
+                else:
+                    cmd = eval_build.build_rust(root, emitted, inside(root, df['adapter']), work, df.get('rust_deps'))
+            except eval_build.BuildError as e:
+                missing = 'is not on PATH' in str(e)
+                res['verdict'] = 'TOOLCHAIN_MISSING' if missing else 'DIFF_ERROR'
+                res['detail' if missing else 'error'] = str(e)
+                continue
         else:
             cmd = list(df['run'])
         data = forge_diff.run_entry(cmd, root, env, inside(root, df['inputs']), s, n, ms,

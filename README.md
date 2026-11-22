@@ -136,10 +136,16 @@ Each disagreement is a bug in that code, or a place where your spec says somethi
 **Any language.** One Python core does the search: seeds, your decisions, shrinking, saved cases. Each language
 only needs an evaluator: a process that reads one input per line (`{"input": …}`) and prints the proved rule's
 answer and the code's answer (`{"reference": …, "candidates": {"name": …}}`), after a first line naming the
-candidates. Forge ships evaluators for JavaScript/TypeScript (Node 22.18+ imports `.ts` directly) and Python.
-For Go, Rust, Java or C#, `/forge fuzz` has Claude write that small program; such an entry is
-`{"lang": "cmd", "run": [program, args…]}`. The inputs (`diff/<check>_inputs.py`) are shared by every language.
-Evaluators for Go, Rust, Java and C# are not tested yet.
+candidates. Forge ships evaluators for **JavaScript/TypeScript** (Node 22.18+ imports `.ts` directly),
+**Python**, **Go** and **Rust**. For Go and Rust you write only a small adapter; Forge generates the protocol
+program, links the compiled proved code and your code, and builds it in `.forge/cache/` (add that folder to your
+`.gitignore`), relying on `go build` and `cargo`'s own incremental caches. Any other language plugs in as
+`{"lang": "cmd", "run": [program, args…]}`: a small program that speaks the protocol. The inputs
+(`diff/<check>_inputs.py`) are shared by every language. Java and C# evaluators are next; they are not built yet.
+
+Measured on the example (one machine): all four languages in one run take 0.9–1.3 s once built (120–400 ms per
+language); after an edit to Rust code, cargo's rebuild makes it about 2 s; the first run that compiles the Go and
+Rust evaluators takes about 7 s.
 
 Labels: the inputs, the evaluators and the core are test code (not proved); a run is a FINITE TEST. It compares
 returned values only; side effects of the code under test are not checked.

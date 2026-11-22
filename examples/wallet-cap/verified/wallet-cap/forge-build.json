@@ -6,6 +6,21 @@
     "spec/WalletSpec.dfy": "2de38267d72f2f38a9e8c63c735daef11a10526f784bf8fe2dbdbba78c6a1928"
   },
   "targets": {
+    "go": {
+      "emit": "OK",
+      "files": {
+        "wallet_cap-go/go.mod": "18dc11a48a07be15e3791b123391ea93a85d294c8dc71597c5d3e7d500d53162",
+        "wallet_cap-go/src/System_/System_.go": "487d0cc3fa95752a0738c2b4eb47d1f8307c22937981beb500c8df4423c7d168",
+        "wallet_cap-go/src/Wallet/Wallet.go": "af5723a683c23e10ca72ac862922e69c8519a0f491e91ba1c0259952766d36e2",
+        "wallet_cap-go/src/dafny/dafny.go": "e0f0c53af8d0ee2b1fba1f462c9a2e715f8d5f4d95c88ffaa3a3d10a2447dd16",
+        "wallet_cap-go/src/dafny/dafnyFromDafny.go": "28f2b3eb32ae13b26e54214ec025d5a09008e48b6406ad8d47fc4a00dfb9e354",
+        "wallet_cap-go/src/wallet_cap-go.dtr": "33e4925279473fa9ea977fae65f26c421556864e3c646b177bf3492fce5b6103",
+        "wallet_cap-go/src/wallet_cap.go": "ff64fe8bc979b50ebd118d216a9265a1eca78959778cb84739f72b3f4603dd21"
+      },
+      "fuzz": "PASSED",
+      "fuzz_output_lines": 4585,
+      "fuzz_output_sha256": "bd6f2b48857c189d2482ecb4e1320f401d3ecbdae84d8216484da3e1f04ea56f"
+    },
     "js": {
       "emit": "OK",
       "files": {
@@ -25,6 +40,24 @@
         "wallet_cap-py/_dafny/__init__.py": "18d39decdedad0e188456e15d17f1dcd5113c4abc258ad6cb718e39534555e7a",
         "wallet_cap-py/module_.py": "669700ab5d6ac483b423dd73be5ddc654633d297604a0f3718257df4f5f692bd",
         "wallet_cap-py/wallet_cap-py.dtr": "33e4925279473fa9ea977fae65f26c421556864e3c646b177bf3492fce5b6103"
+      },
+      "fuzz": "PASSED",
+      "fuzz_output_lines": 4585,
+      "fuzz_output_sha256": "bd6f2b48857c189d2482ecb4e1320f401d3ecbdae84d8216484da3e1f04ea56f"
+    },
+    "rs": {
+      "emit": "OK",
+      "files": {
+        "wallet_cap-rust/runtime/Cargo.lock": "7b4a5da736e3973edbacac00e54f576ef1340cca1fb1c1a0003fac5911814bb8",
+        "wallet_cap-rust/runtime/Cargo.toml": "cd75caeef8efbf01f2c4255b8d84566a04f0d6cdf0b93e42680d6a0d23ed036d",
+        "wallet_cap-rust/runtime/Makefile": "0680868e12e802a9b2c6ab41c7476cd4253c0b7d7eb4dc032bd9a6fa22a8173c",
+        "wallet_cap-rust/runtime/src/big_int.rs": "ea44226723c8ba82a44a00e55bf781a244bc73f24b37573b241332a0edfd41a8",
+        "wallet_cap-rust/runtime/src/lib.rs": "ac3a673d4cc27cfa580f9141a9a27f4801b388c2202fd6e06b7b67dd81d1c083",
+        "wallet_cap-rust/runtime/src/small_int.rs": "4b852d23427fdf049d953a50ecc9d052c96dd55a539dcbac3d3b43ed527273c6",
+        "wallet_cap-rust/runtime/src/system/mod.rs": "e5b6dfe50205bb2f700374332b1cd4bc3c926a3683b9084dad6d3761501dee91",
+        "wallet_cap-rust/runtime/src/tests/mod.rs": "ff79a1c15f8936df933c3577b8004e89579d2a2ad2dd6b1073981d3d21bf46b7",
+        "wallet_cap-rust/src/wallet_cap-rs.dtr": "33e4925279473fa9ea977fae65f26c421556864e3c646b177bf3492fce5b6103",
+        "wallet_cap-rust/src/wallet_cap.rs": "7400fced8e446d0c974bc55297d8545f641fd56b8dbb52b76a1aa246327c8702"
       },
       "fuzz": "PASSED",
       "fuzz_output_lines": 4585,

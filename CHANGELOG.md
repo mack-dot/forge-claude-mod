@@ -2,6 +2,20 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## 0.9.0 — 2026-11-22
+- Added: Go and Rust evaluators for the differential fuzz (`"lang": "go"`, `"lang": "rs"`). The person writes a
+  small adapter; Forge generates the protocol program (`cli/eval/go/forge_main.go`, `cli/eval/rust/forge_main.rs`),
+  links the compiled proved code and the code under test, and builds it in `.forge/cache/` with go build or cargo
+  (their own incremental caches decide what to rebuild). Exact big integers in both (Go json.Number and big.Int;
+  Rust serde_json with arbitrary precision). A panic is reported as a disagreement.
+- Fixed: Dafny's Go output under `verified/` would break the person's own `go build ./...`; it now gets a go.mod
+  of its own. The Go adapter carries `//go:build forge` for the same reason.
+- Tested: 44 cases (3 new). On the example: the shipped Go function's planted bugs (exact cap, zero, negative)
+  fail decisions D1, D3, D4; the shipped Rust function fails D3 and its planted overflow is found as
+  `panic: attempt to add with overflow`; values that do not fit int64/u64 are reported as panics. Timing as in the
+  README. CI installs go and goimports.
+- Not tested: Windows; Go modules with dependencies that need a download; Rust crates used through "rust_deps".
+
 ## 0.8.0 — 2026-11-22
 Released on the owner's word before the first real-project test (chronicle). Treat the differential fuzz as
 early: report what it misses or gets wrong.

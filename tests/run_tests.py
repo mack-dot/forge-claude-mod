@@ -204,13 +204,15 @@ def static_checks():
 
 def main():
     failed = 0
+    # one shared Rust build folder for every test project (compiled dependencies are reused)
+    os.environ.setdefault('FORGE_CARGO_TARGET_DIR', os.path.join(tempfile.gettempdir(), 'forge-test-cargo-target'))
     for problem in static_checks():
         failed += 1
         print('FAIL  static: ' + problem)
     for name, change, want_verdict, want_exit, use_base in CASES:
         with tempfile.TemporaryDirectory() as tmp:
             root = os.path.join(tmp, 'p')
-            shutil.copytree(EXAMPLE, root)
+            shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
             cmd = [sys.executable, CLI, 'check', '--root', root, '--json']
             if use_base:
                 git(root, 'init', '-q')
@@ -232,7 +234,7 @@ def main():
     for name, change, want_verdict, want_exit in BUILD_CASES:
         with tempfile.TemporaryDirectory() as tmp:
             root = os.path.join(tmp, 'p')
-            shutil.copytree(EXAMPLE, root)
+            shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
             change(root)
             r = subprocess.run([sys.executable, CLI, 'build', '--check', '--root', root, '--json'],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
@@ -253,7 +255,7 @@ def main():
             ('answers changed between showing and approving', True, 1, 'CONFIG_CHANGED')]:
         with tempfile.TemporaryDirectory() as tmp:
             root = os.path.join(tmp, 'p')
-            shutil.copytree(EXAMPLE, root)
+            shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
             open(os.path.join(root, APPROVED), 'w').write('{}\n')
             shown = json.loads(subprocess.run([sys.executable, CLI, 'spec', '--root', root, '--json'],
                                               stdout=subprocess.PIPE, universal_newlines=True).stdout)['hashes']
@@ -275,7 +277,7 @@ def main():
                                          ('weakened spec (W4 removed): survivors reported', True, True)]:
         with tempfile.TemporaryDirectory() as tmp:
             root = os.path.join(tmp, 'p')
-            shutil.copytree(EXAMPLE, root)
+            shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
             if weaken:
                 import hashlib
                 edit(root, SPEC, '    ensures !(0 < amount && s.spent + amount <= s.cap) ==>\n      outcome == Rejected && next == s\n', '')
@@ -318,10 +320,16 @@ def main():
             'export function legacySpend(cap: number, spent: number, amount: number) {\n'
             '  if (0 < amount && spent + amount <= cap) return { ok: true, spent: spent + amount }\n'
             '  return { ok: false, spent }\n}\n')
+        open(os.path.join(root, 'legacygo', 'legacy.go'), 'w').write(
+            'package legacygo\n\nfunc Spend(cap, spent, amount int64) (bool, int64) {\n'
+            '\tif 0 < amount && amount <= cap-spent {\n\t\treturn true, spent + amount\n\t}\n\treturn false, spent\n}\n')
+        open(os.path.join(root, 'legacy_wallet.rs'), 'w').write(
+            'pub fn spend(cap: u64, spent: u64, amount: i64) -> (bool, u64) {\n'
+            '    if amount > 0 && (amount as u64) <= cap - spent { (true, spent + amount as u64) } else { (false, spent) }\n}\n')
 
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, 'p')
-        shutil.copytree(EXAMPLE, root)
+        shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
         code, res = diff(root)
         py, js = res.get('wallet-cap:py', {}), res.get('wallet-cap:js', {})
         kinds_py = sorted({json.dumps(d['reference']['ok']) + '>' + json.dumps(d['got']['ok']) for d in py.get('disagreements', [])})
@@ -355,6 +363,14 @@ def main():
         code3, res3 = diff(root)
         cases.append(('diff: an outdated build is detected', code3 == 1 and all(r.get('verdict') == 'BUILD_STALE' for r in res3.values())))
         stats = json.load(open(os.path.join(root, '.forge/diff-stats.json')))
+        # Go and Rust evaluators (built by forge in .forge/cache), from the first run above
+        go_res, rs_res = res.get('wallet-cap:go', {}), res.get('wallet-cap:rs', {})
+        cases.append(('diff: Go evaluator finds the shipped Go bugs (exact cap, zero, negative)',
+                      sorted(f['id'][:2] for f in (go_res.get('decisions') or {}).get('failing', [])) == ['D1', 'D3', 'D4']))
+        cases.append(('diff: Rust evaluator finds zero accepted and the overflow panic',
+                      [f['id'][:2] for f in (rs_res.get('decisions') or {}).get('failing', [])] == ['D3']
+                      and any('overflow' in json.dumps(d['got']) for d in rs_res.get('disagreements', []))))
+        cases.append(('diff: Go and Rust runs under 2 seconds once built', go_res.get('ms', 9999) < 2000 and rs_res.get('ms', 9999) < 2000))
         # big integers cross the line protocol exactly (JSON.parse alone would round 2^63 - 1)
         modules = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'), 'forge-check', 'js', 'node_modules')
         p = subprocess.Popen(['node', os.path.join(HERE, '..', 'cli', 'eval', 'node_eval.mjs'), os.path.join(root, 'diff/wallet_diff.mjs')],
