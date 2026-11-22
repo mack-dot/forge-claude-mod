@@ -3,24 +3,26 @@
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
 ## Unreleased (branch `wip/diff-fuzz`)
-- Added: `diff` (CLI), `/forge diff`, `/forge:diff-setup`: the person's real code (the shipped function, the
-  wrapper) against the compiled proved rule on fresh random inputs, JavaScript/TypeScript (node, `.ts` imported
-  directly) and Python. Shrinks each disagreement without letting it slide into a different bug (the failure
-  signature stays fixed), keeps one case per kind of failure, saves it under `.forge/regressions/`, replays saved
-  cases first. Checks by hashes only that the compiled code matches the Dafny files (`BUILD_STALE`).
-- Added: automatic run at the end of each Claude turn in which a watched file changed, found by modification time
-  (so shell edits and the person's own edits count); a turn without a change runs nothing; result in the status
-  line.
-- Added: the person's recorded decisions run as fixed inputs on every run (`decisions` in the adapter), reported
-  as "your recorded decisions: N of M agree". Running totals per rule (`.forge/diff-stats.json`): inputs and runs
-  so far, and runs and inputs since the last NEW failure, as evidence of how thoroughly it has searched.
-- Tested: 37 cases (9 new). On the example: the three planted bugs in the shipped Python function (exact cap
-  rejected, zero accepted, negative accepted) and the two in the shipped TypeScript function are found; the
-  wrapper agrees; after the shipped code is fixed the saved cases pass. Runs take 50–250 ms per language for 1,500
-  inputs. In headless Claude Code sessions: `/forge diff` works; an Edit-tool edit and a shell edit each trigger
-  the automatic run (0.6 s); a turn with no change does not.
-- Not tested: a real project (chronicle is next, after its rule is approved); TypeScript that uses syntax Node
-  cannot strip (enums, namespaces); Windows.
+- Added: the differential fuzz: the person's real code (the shipped function, the wrapper) against the compiled
+  proved rule on fresh inputs. One language-neutral core (`cli/forge_diff.py`): seeds, the person's recorded
+  decisions as fixed inputs, replay of saved cases, shrinking that keeps the failure signature fixed (no sliding
+  into another bug), one saved case per kind of failure under `.forge/regressions/`, a 2-second limit per call
+  (hangs are reported), running totals since the last new failure (`.forge/diff-stats.json`). Each language only
+  needs an evaluator that speaks a line protocol: shipped for JavaScript/TypeScript and Python; any other language
+  as a `"cmd"` entry. Inputs are one Python file per rule, shared by every language.
+- Added: automatic run at the end of each Claude turn in which a watched file changed (by modification time, so
+  shell and editor edits count); `/forge add` sets the fuzz up when the rule already exists in code; `/forge fuzz`
+  sets it up for other rules or does a deep run; `/forge diff` is the quick run; `/forge build` without a set-up
+  puts the set-up command in the prompt box.
+- Tested: 39 cases (11 new). On the example: the planted bugs in the shipped Python function (exact cap rejected,
+  zero accepted, negative accepted) and in the shipped TypeScript function are found through the decisions and the
+  random search; the wrapper agrees; fixing the shipped code makes every decision agree; an outdated build is
+  detected; a `"cmd"` evaluator works through the protocol alone; a hanging function is reported within seconds.
+  A run takes under a second for both languages. Headless Claude Code sessions (before the core refactor):
+  `/forge diff`, an Edit-tool edit and a shell edit each trigger the automatic run; a turn without change does not.
+- Not tested: a real project (chronicle is next); evaluators for Go, Rust, Java and C#; TypeScript syntax Node
+  cannot strip; Windows (the core uses `select` on pipes, which Windows does not support for pipes).
+
 ## 0.7.2 — 2026-11-22
 - Fixed (regression in 0.7.1): the hint commands `commands/approve.md`, `check.md`, `build.md`, `status.md`
   shadowed the fixed steps: in a headless session `/forge approve yes` printed the hint instead of approving.

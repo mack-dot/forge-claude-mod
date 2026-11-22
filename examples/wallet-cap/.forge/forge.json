@@ -30,6 +30,7 @@
       "diff": [
         {
           "lang": "py",
+          "inputs": "diff/wallet_inputs.py",
           "adapter": "diff/wallet_diff.py",
           "watch": [
             "legacy_wallet.py",
@@ -38,6 +39,7 @@
         },
         {
           "lang": "js",
+          "inputs": "diff/wallet_inputs.py",
           "adapter": "diff/wallet_diff.mjs",
           "watch": [
             "legacy_wallet.ts"

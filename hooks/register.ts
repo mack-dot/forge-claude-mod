@@ -230,6 +230,7 @@ async function wizard($: Api): Promise<string> {
     'Forge · step 5 of 5: done. Every check is VERIFIED.\n' +
     'Now let Claude (or any agent) change that code freely. After each turn that touches a covered file, the status line says "code changed"; run /forge check.\n' +
     'If a spec file changes, the check says SPEC_CHANGED until you approve again.\n' +
+    'To fuzz your real code against the proved rule: /forge fuzz (automatic after that).\n' +
     'To see how many planted bugs the proof catches: /forge mutate.\n' +
     'To use the proved code in your app: /forge:build-setup, then /forge build.\n' +
     'Add another rule: /forge:add <the rule in your own words>.'
@@ -322,8 +323,13 @@ export const register: Register = on => {
     if (arg === 'build') {
       const root: string = await $.session.root()
       const cfg = await readJson<Config>($, join(root, CONFIG))
-      if (cfg?.checks?.length && !cfg.checks.some(c => c.build))
-        return { text: 'Forge · no build is set up yet. Type /forge:build-setup (optionally with languages, e.g. /forge:build-setup py js).' }
+      if (cfg?.checks?.length && !cfg.checks.some(c => c.build)) {
+        // A command cannot start a Claude turn: put the set-up conversation in the prompt box instead.
+        const langs = e.args.trim().split(/\s+/).slice(1).join(' ')
+        const line = `/forge:build-setup ${langs}`.trimEnd() + ' '
+        const isFilled = await $.prompt.fill({ text: line }).then(() => true, () => false)
+        return { text: `Forge · no build is set up yet. ${isFilled ? 'Press Enter to set it up' : 'Type ' + line.trim()} (languages: py, js, go, java, cs, rs).` }
+      }
       return { text: await runBuild($, /^build\s+check\b/.test(e.args.trim())) }
     }
     if (arg === 'diff') return { text: await runDiff($) }
@@ -347,7 +353,7 @@ export const register: Register = on => {
     }
     // Steps where Claude talks with the person are Markdown commands (/forge:scan …). A command.run hook
     // cannot start a Claude turn, so put the right command in the prompt box: the person presses Enter.
-    const moved = ['scan', 'add', 'explain', 'fix', 'doctor', 'build-setup', 'diff-setup']
+    const moved = ['scan', 'add', 'explain', 'fix', 'doctor', 'build-setup', 'fuzz']
     if (moved.includes(arg)) {
       const rest = e.args.trim().slice(arg.length).trim()
       const line = `/forge:${arg}${rest ? ' ' + rest : ' '}`

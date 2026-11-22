@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLI = os.path.join(HERE, '..', 'cli', 'forge_check.py')
@@ -347,6 +348,27 @@ def main():
         code3, res3 = diff(root)
         cases.append(('diff: an outdated build is detected', code3 == 1 and all(r.get('verdict') == 'BUILD_STALE' for r in res3.values())))
         stats = json.load(open(os.path.join(root, '.forge/diff-stats.json')))
+        # any language through "cmd": here the Python evaluator, named as a plain program
+        cfg = json.load(open(os.path.join(root, CONFIG)))
+        cfg['checks'][0]['diff'] = [{'name': 'any', 'lang': 'cmd', 'inputs': 'diff/wallet_inputs.py',
+                                     'run': [sys.executable, os.path.join(HERE, '..', 'cli', 'eval', 'py_eval.py'),
+                                             'diff/wallet_diff.py']}]
+        json.dump(cfg, open(os.path.join(root, CONFIG), 'w'))
+        shutil.rmtree(os.path.join(root, 'verified'), ignore_errors=True)
+        shutil.copytree(os.path.join(EXAMPLE, 'verified'), os.path.join(root, 'verified'))
+        edit(root, IMPL, 's.spent + amount <= s.cap && true {', 's.spent + amount <= s.cap {')
+        code4, res4 = diff(root)
+        cmd_res = res4.get('wallet-cap', {})
+        cases.append(('diff: any language through a "cmd" evaluator (protocol only)',
+                      cmd_res.get('verdict') == 'DIFF_OK' and cmd_res.get('decisions', {}).get('agree') == 4))
+        # a hanging function is reported, not waited on
+        open(os.path.join(root, 'diff/wallet_diff.py'), 'a').write(
+            "\ndef _hang(i):\n    while True:\n        pass\n\ncandidates['hangs'] = _hang\n")
+        t0 = time.time()
+        code5, res5 = diff(root)
+        cases.append(('diff: a hanging function is reported within seconds',
+                      res5.get('wallet-cap', {}).get('verdict') == 'DIFF_ERROR'
+                      and 'no answer within' in res5['wallet-cap'].get('error', '') and time.time() - t0 < 30))
         cases.append(('diff: search totals kept across runs (saturation)',
                       stats.get('wallet-cap:py', {}).get('runs') == 2 and stats['wallet-cap:py']['runs_since_new'] == 1
                       and stats['wallet-cap:py']['failing_decisions'] == []

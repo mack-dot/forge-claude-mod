@@ -12,11 +12,11 @@ Usage:
   forge_check.py diff    [--root DIR] [--json] [--inputs N] [--budget-ms MS] [--seed S]
 
 `diff` compares code under test (the shipped app function, the wrapper around the proved code) with the
-compiled proved rule on fresh random inputs, in one process per check (JavaScript/TypeScript: node;
-Python: python3). A disagreement is shrunk to a small input, saved under .forge/regressions/<check>/, and
-replayed first on every later run. It needs a check with "build" (the compiled proved code) and "diff":
-{"lang": "js" | "py", "adapter": "<file>"}; the adapter is test code written once per check. It reads only
-hashes to see whether the compiled code still matches the Dafny files, so a run takes about a second.
+compiled proved rule on fresh random inputs (see forge_diff.py for the line protocol). A disagreement is
+shrunk to a small input, saved under .forge/regressions/<check>/, and replayed first on every later run. It
+needs a check with "build" (the compiled proved code) and "diff": {"inputs": "<inputs .py>", "lang": "js" |
+"py", "adapter": "<file>"} or {"inputs": ..., "lang": "cmd", "run": [program, args...]} for any other
+language. It reads only hashes to see whether the compiled code matches the Dafny files.
 
 `mutate` plants small bugs in the implementation files (one at a time, in a temporary copy) and runs the
 proof on each. A mutant is "caught" when the check is no longer VERIFIED. A mutant that survives means the
@@ -163,9 +163,15 @@ def load_config(root):
                     raise ConfigError('check %s: each "usedBy" needs "file" and "contains"' % c['name'])
                 inside(root, u['file'])
         for df in diff_entries(c):
-            if not isinstance(df, dict) or df.get('lang') not in ('js', 'py') or not df.get('adapter'):
-                raise ConfigError('check %s: each "diff" entry needs "lang" ("js" or "py") and "adapter"' % c['name'])
-            inside(root, df['adapter'])
+            ok = isinstance(df, dict) and df.get('inputs') and (
+                (df.get('lang') in ('js', 'py') and df.get('adapter'))
+                or (df.get('lang') == 'cmd' and isinstance(df.get('run'), list) and df['run']))
+            if not ok:
+                raise ConfigError('check %s: each "diff" entry needs "inputs" (a Python file) and either "lang": "js" '
+                                  'or "py" with "adapter", or "lang": "cmd" with "run": [program, args...]' % c['name'])
+            inside(root, df['inputs'])
+            if df.get('adapter'):
+                inside(root, df['adapter'])
     return cfg
 
 
@@ -758,6 +764,9 @@ def build_is_fresh(root, c):
 
 
 def run_diff(root, inputs=None, budget_ms=None, seed=None):
+    """Runs every diff entry through the language-neutral core (forge_diff.py)."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import forge_diff
     cfg = load_config(root)
     here = os.path.dirname(os.path.abspath(__file__))
     out = {'at': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'), 'checks': {}}
@@ -765,7 +774,7 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None):
     for c in cfg['checks']:
         entries = diff_entries(c)
         for df in entries:
-            jobs.append((c, df, c['name'] if len(entries) == 1 else '%s:%s' % (c['name'], df['lang'])))
+            jobs.append((c, df, c['name'] if len(entries) == 1 else '%s:%s' % (c['name'], df.get('name') or df['lang'])))
     for c, df, key in jobs:
         res = out['checks'][key] = {}
         if not c.get('build'):
@@ -776,10 +785,9 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None):
             res['verdict'] = 'BUILD_STALE'
             res['detail'] = 'the compiled proved code does not match the current Dafny files: run build'
             continue
-        n = inputs if inputs is not None else df.get('inputs', 1500)
+        n = inputs if inputs is not None else df.get('inputs_per_run', 1500)
         ms = budget_ms if budget_ms is not None else df.get('budget_ms', 1500)
         s = seed if seed is not None else int.from_bytes(os.urandom(4), 'little')
-        reg = os.path.join(root, REGRESSIONS, key.replace(':', '-'))
         env = dict(os.environ)
         if df['lang'] == 'js':
             if not shutil.which('node'):
@@ -790,17 +798,13 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None):
                 res['verdict'], res['detail'] = 'TOOLCHAIN_MISSING', 'npm could not install bignumber.js'
                 continue
             env['NODE_PATH'] = modules
-            cmd = ['node', os.path.join(here, 'diff_runner.mjs')]
+            cmd = ['node', os.path.join(here, 'eval', 'node_eval.mjs'), inside(root, df['adapter'])]
+        elif df['lang'] == 'py':
+            cmd = [sys.executable, os.path.join(here, 'eval', 'py_eval.py'), inside(root, df['adapter'])]
         else:
-            cmd = [sys.executable, os.path.join(here, 'diff_runner.py')]
-        cmd += [inside(root, df['adapter']), str(s), str(n), str(ms), reg]
-        try:
-            r = subprocess.run(cmd, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               stdin=subprocess.DEVNULL, timeout=max(60, ms // 1000 * 4 + 60), universal_newlines=True)
-            line = [l for l in r.stdout.strip().split('\n') if l.startswith('{')][-1:]
-            data = json.loads(line[0]) if line else {'error': (r.stderr or r.stdout)[-800:]}
-        except subprocess.TimeoutExpired:
-            data = {'error': 'the diff run timed out'}
+            cmd = list(df['run'])
+        data = forge_diff.run_entry(cmd, root, env, inside(root, df['inputs']), s, n, ms,
+                                    os.path.join(root, REGRESSIONS, key.replace(':', '-')))
         res.update(data)
         if data.get('error') and 'Unknown file extension ".ts"' in data['error']:
             res['verdict'] = 'TOOLCHAIN_MISSING'
@@ -843,7 +847,7 @@ def update_diff_stats(root, out):
 
 def diff_report(out):
     if not out['checks']:
-        return 'forge diff: no check has a "diff" entry (see /forge:diff-setup)'
+        return 'forge diff: no check has a "diff" entry yet (/forge fuzz sets one up; /forge add does it for code that already exists)'
     lines = []
     for name, r in out['checks'].items():
         v = r['verdict']
