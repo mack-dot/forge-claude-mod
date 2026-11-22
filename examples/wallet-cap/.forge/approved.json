@@ -1,5 +1,5 @@
 {
-  ".forge/forge.json": "f4f84fccf2af958a5ea92a35ad47a6656e6d91361043c143e58454bbdd18d470",
+  ".forge/forge.json": "7cdf0f09c9697c3f4a9cbcc6e612718889f83f7bac5a4ef3d2c7612f62c68998",
   "spec/WalletSpec.dfy": "2de38267d72f2f38a9e8c63c735daef11a10526f784bf8fe2dbdbba78c6a1928",
   "spec/WalletExamples.dfy": "31dc641b864b1e808033812c784db6edf1b45dec4072dc81785568c307872c10",
   ".forge/decisions/wallet-cap.md": "b3e9a59c3b8bf3cc4df1cdca43132a54a845b91b30b598523a4acbfc293363b0"

@@ -16,7 +16,18 @@ type Api = any
 
 // binding: the implementation file must start with exactly this text (its include and
 // `module X refines Spec {` line), so it cannot switch to a weaker spec.
-type Check = { name: string; spec: string; files: string[]; binding?: { file: string; prefix: string }; build?: unknown; examples?: string; decisions?: string }
+type DiffEntry = { lang: string; adapter: string; watch?: string[] }
+type Check = {
+  name: string
+  spec: string
+  files: string[]
+  binding?: { file: string; prefix: string }
+  build?: { usedBy?: Array<{ file: string }> }
+  examples?: string
+  decisions?: string
+  diff?: DiffEntry | DiffEntry[]
+}
+type LastDiff = { checks: Record<string, { verdict: string; inputs?: number; disagreements?: unknown[] }> }
 type Config = { version: 1; checks: Check[]; dafny?: string }
 type Verdict = string
 type LastCheck = { at: string; verdicts: Record<string, Verdict>; detail: Record<string, string> }
@@ -27,6 +38,8 @@ const APPROVED = `${DIR}/approved.json`
 const LAST = `${DIR}/last-check.json`
 
 let isStale = false
+let isDiffStale = false // an edit touched a file that the differential fuzz covers
+let isDiffing = false
 let isChecking = false
 
 function join(root: string, rel: string) { return rel.startsWith("/") ? rel : `${root}/${rel}` }
@@ -80,6 +93,19 @@ async function refreshStatus($: Api) {
   let text = summary(last, cfg?.checks.length ?? 0)
   if (cfg && isStale) text = `forge: code changed · ${text.replace(/^forge:? ?/, '')} · /forge check`
   if (isChecking) text = 'forge: checking…'
+  const diff = await readJson<LastDiff>($, join(root, '.forge/last-diff.json'))
+  if (isDiffing) text += ' · fuzzing…'
+  else if (diff && Object.keys(diff.checks).length) {
+    const rs = Object.values(diff.checks)
+    const bad = rs.reduce((n, r) => n + (r.disagreements?.length ?? 0), 0)
+    const inputs = rs.reduce((n, r) => n + (r.inputs ?? 0), 0)
+    const broken = rs.find(r => !['DIFF_OK', 'DISAGREE'].includes(r.verdict))
+    text += broken
+      ? ` · fuzz ${broken.verdict}`
+      : bad
+        ? ` · fuzz ✗ ${bad} disagreement(s), /forge diff`
+        : ` · fuzz ✓ ${inputs.toLocaleString('en-US')} inputs`
+  }
   $.ui.status(cfg || last ? text : undefined)
 }
 
@@ -200,6 +226,46 @@ async function wizard($: Api): Promise<string> {
   )
 }
 
+// Files whose change should trigger the differential fuzz: the proved code, the files that import it, the
+// adapters, and each diff entry's "watch" list (the shipped code under test).
+async function fuzzedFiles($: Api): Promise<string[]> {
+  const root: string = await $.session.root()
+  const cfg = await readJson<Config>($, join(root, CONFIG))
+  const diffs = (c: Check): DiffEntry[] => (c.diff ? (Array.isArray(c.diff) ? c.diff : [c.diff]) : [])
+  return (cfg?.checks ?? [])
+    .filter(c => diffs(c).length)
+    .flatMap(c => [...c.files, ...(c.build?.usedBy ?? []).map(u => u.file), ...diffs(c).flatMap(d => [d.adapter, ...(d.watch ?? [])])])
+    .map(f => join(root, f))
+}
+
+// Modification times seen at the last check, so an edit by any means (Claude's tools, a shell command, the
+// person's editor) is noticed at the end of the next turn.
+let seenTimes: Record<string, number> | undefined
+async function fuzzedFilesChanged($: Api): Promise<boolean> {
+  const now: Record<string, number> = {}
+  for (const f of await fuzzedFiles($)) now[f] = await $.fs.stat(f).then((st: { mtimeMs: number }) => st.mtimeMs, () => -1)
+  const before = seenTimes
+  seenTimes = now
+  if (!before) return false
+  return Object.keys(now).some(f => before[f] !== now[f])
+}
+
+// The differential fuzz: the code under test against the compiled proved rule (cli/forge_check.py diff).
+async function runDiff($: Api): Promise<string> {
+  const root: string = await $.session.root()
+  isDiffing = true
+  await refreshStatus($)
+  let r
+  try {
+    r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'diff', '--root', root], { cwd: root, timeoutMs: 120_000 })
+  } finally {
+    isDiffing = false
+  }
+  isDiffStale = false
+  await refreshStatus($)
+  return (r.stdout || r.stderr).trim().slice(0, 6000) || `The checker did not run (exit ${r.exitCode}).`
+}
+
 // Guard: Claude's own edit tools may not touch approved specs or the approval file.
 async function guard($: Api, path: string | undefined): Promise<string | undefined> {
   if (!path) return undefined
@@ -216,12 +282,13 @@ async function watch($: Api, path: string | undefined) {
   if (!path) return
   const root: string = await $.session.root()
   const cfg = await readJson<Config>($, join(root, CONFIG))
-  const files = new Set((cfg?.checks ?? []).flatMap(c => [c.spec, ...c.files]).map(f => join(root, f)))
+  const checks = cfg?.checks ?? []
+  const files = new Set(checks.flatMap(c => [c.spec, ...c.files]).map(f => join(root, f)))
+  const fuzzed = new Set(await fuzzedFiles($))
   const abs = path.startsWith('/') ? path : join(root, path)
-  if (files.has(abs)) {
-    isStale = true
-    await refreshStatus($)
-  }
+  if (files.has(abs)) isStale = true
+  if (fuzzed.has(abs)) isDiffStale = true
+  if (files.has(abs) || fuzzed.has(abs)) await refreshStatus($)
 }
 
 
@@ -230,10 +297,11 @@ export const register: Register = on => {
     await $.command.register({
       name: 'forge',
       description: 'Forge proof gate: next step, or check / approve / build / spec / status (conversations: /forge:scan, /forge:add)',
-      argumentHint: '[check|approve|approve yes|build|mutate|spec|status]',
+      argumentHint: '[check|approve|approve yes|build|diff|mutate|spec|status]',
     })
     const r = await next(e)
     void refreshStatus($).catch(() => undefined)
+    void fuzzedFilesChanged($).catch(() => undefined)
     return r
   })
 
@@ -247,6 +315,7 @@ export const register: Register = on => {
         return { text: 'Forge · no build is set up yet. Type /forge:build-setup (optionally with languages, e.g. /forge:build-setup py js).' }
       return { text: await runBuild($, /^build\s+check\b/.test(e.args.trim())) }
     }
+    if (arg === 'diff') return { text: await runDiff($) }
     if (arg === 'mutate') {
       const root: string = await $.session.root()
       const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'mutate', '--root', root, '--max', '30'], {
@@ -268,7 +337,7 @@ export const register: Register = on => {
     }
     // Steps where Claude talks with the person are Markdown commands (/forge:scan …). A command.run hook
     // cannot start a Claude turn, so put the right command in the prompt box: the person presses Enter.
-    const moved = ['scan', 'add', 'explain', 'fix', 'doctor', 'build-setup']
+    const moved = ['scan', 'add', 'explain', 'fix', 'doctor', 'build-setup', 'diff-setup']
     if (moved.includes(arg)) {
       const rest = e.args.trim().slice(arg.length).trim()
       const line = `/forge:${arg}${rest ? ' ' + rest : ' '}`
@@ -279,6 +348,15 @@ export const register: Register = on => {
       return { text: isFilled ? `Press Enter to run ${line.trim()}.` : `Type ${line.trim()} (Claude runs it as a conversation).` }
     }
     return { text: await wizard($) }
+  })
+
+  // End of a Claude turn: if an edit touched a file the differential fuzz covers, run it (well under two
+  // seconds by default; fresh random inputs each time). The result lands in the status line.
+  on('turn.complete', async ($, e, next) => {
+    const r = await next(e)
+    const isChanged = await fuzzedFilesChanged($).catch(() => false)
+    if ((isDiffStale || isChanged) && !isDiffing) await runDiff($).catch(() => undefined)
+    return r
   })
 
   // One registration per tool: the hook API types each tool's input by its literal name.

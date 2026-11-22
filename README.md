@@ -45,6 +45,7 @@ with a colon (`/forge:approve`) prints the right command. The steps:
 | Read it | `/forge:explain` | Claude explains every clause in plain words, checks that each of your answers is covered, and lists what is not guaranteed. |
 | Approve it | `/forge approve`, then `/forge approve yes` | Shows exactly what you approve (spec, your answers, decision record, `forge.json`); "yes" approves exactly that. Only you can do this. |
 | Prove it | `/forge check` | Your answers are checked against the spec (`EXAMPLES_FAILED` if the spec says otherwise or leaves one open), then the code against the spec. The status line shows `forge ✓ VERIFIED n/n` or what failed. |
+| Find bugs in your real code | `/forge:diff-setup`, then automatic | Runs your shipped code and the proved rule on fresh random inputs at the end of each turn that changed them (well under 2 s), saves each disagreement as a small repeatable case. See **Diff** below. |
 | Measure it | `/forge mutate` | Plants up to 30 small bugs in the proved code, one at a time in a temporary copy, and counts how many the proof catches. A survivor is a change your spec allows: harmless, or a gap in the spec. Changes nothing. |
 | Something failed | `/forge:fix` | Claude explains the verdict and proposes a fix to the code; it never weakens the spec without your word. |
 | Use it in your app | `/forge:build-setup`, then `/forge build` | Compiles the proved code to your languages (`py`, `js`, `go`, `java`, `cs`, `rs`), fuzzes the compiled code in every language (identical output required), and checks that your app imports it. |
@@ -104,6 +105,33 @@ Tools per target: `py` python3; `js` node and npm (bignumber.js is fetched once 
 Honest labels: the Dafny model is PROVED. The emitted code is a NATIVE CHECK, because Dafny's compilers are
 not verified. The fuzz run is a FINITE TEST. The wrapper that your app writes around the emitted code is
 ordinary unproved code, so keep it thin. `examples/wallet-cap` shows all of it, with `app.py` as the app.
+
+## Diff: your real code against the proved rule
+
+A proof shows that the Dafny model is right. Your app may still run its own, older version of the rule.
+`diff` runs your **real code** (the shipped function, and the wrapper around the proved code) and the compiled
+proved rule on the same fresh random inputs, and reports every input where they disagree:
+
+```
+✗ wallet-cap:py: 3 disagreement(s) in 1500 inputs (69 ms, seed 7); per candidate: app-wrapper 0, legacy 3
+  NEW legacy: input {"cap": 1, "spent": 0, "amount": 0} → proved rule says {"ok": false, ...}, legacy says {"ok": true, ...}
+```
+
+Each disagreement is a bug in that code, or a place where your spec says something other than what you meant.
+
+- **Setup, once per rule:** `/forge:diff-setup <function>`. Claude writes a small adapter (`diff/<check>_diff.mjs`
+  for JavaScript and TypeScript, `diff/<check>_diff.py` for Python) and adds `"diff"` to the check, with a `watch`
+  list of the files under test. It needs a `build` of the rule.
+- **Constantly, by itself:** at the end of every Claude turn in which a watched file changed (by any means:
+  Claude's edits, a shell command, your editor), Forge runs about 1,500 fresh random inputs per language. It
+  takes well under two seconds (60–110 ms on the example) and shows the result in the status line,
+  `fuzz ✓ 3,000 inputs` or `fuzz ✗ 2 disagreement(s)`. A turn that changed nothing runs nothing.
+- **On demand:** `/forge diff`. In CI: `python3 cli/forge_check.py diff --inputs 50000 --budget-ms 60000`.
+- **Smallest cases, kept:** each disagreement is shrunk to a small input that fails the same way, saved under
+  `.forge/regressions/`, and replayed first on every later run. Commit them: they are your new tests.
+
+Labels: the adapter and the runners are test code (not proved); a run is a FINITE TEST. It compares outputs
+only; side effects of the code under test are not checked.
 
 ## Use it in CI (GitHub Action)
 

@@ -775,8 +775,8 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None):
             res['verdict'] = 'BUILD_STALE'
             res['detail'] = 'the compiled proved code does not match the current Dafny files: run build'
             continue
-        n = inputs or df.get('inputs', 1500)
-        ms = budget_ms or df.get('budget_ms', 1500)
+        n = inputs if inputs is not None else df.get('inputs', 1500)
+        ms = budget_ms if budget_ms is not None else df.get('budget_ms', 1500)
         s = seed if seed is not None else int.from_bytes(os.urandom(4), 'little')
         reg = os.path.join(root, REGRESSIONS, key.replace(':', '-'))
         env = dict(os.environ)

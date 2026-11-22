@@ -134,6 +134,7 @@ try:
         return best
 
     seen = set()
+    kinds = set()
 
     def record(name, inp, is_new):
         d = disagrees(name, inp)
@@ -162,6 +163,9 @@ try:
                 if case.get('candidate') in names:
                     result['replayed'] += 1
                     record(case['candidate'], case['input'], False)
+                    d = disagrees(case['candidate'], case['input'])
+                    if d:
+                        kinds.add(case['candidate'] + '|' + signature(*d))
     rng = Rng(int(seed_arg))
     max_inputs, budget = int(max_inputs_arg), int(budget_ms_arg) / 1000.0
     while result['inputs'] < max_inputs and time.time() - started < budget:
@@ -173,8 +177,14 @@ try:
         for name in names:
             if sum(d['candidate'] == name for d in result['disagreements']) >= 5:
                 continue
-            if disagrees(name, inp):
-                record(name, shrink(name, inp), True)
+            d = disagrees(name, inp)
+            if not d:
+                continue
+            kind = name + '|' + signature(*d)
+            if kind in kinds:  # one saved case per kind of failure is enough
+                continue
+            kinds.add(kind)
+            record(name, shrink(name, inp), True)
     result['per_candidate'] = {n: sum(d['candidate'] == n for d in result['disagreements']) for n in names}
 except Exception as e:  # noqa: BLE001
     import traceback

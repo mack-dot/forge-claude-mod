@@ -141,6 +141,7 @@ function shrink(name, input) {
 
 const result = { inputs: 0, out_of_domain: 0, replayed: 0, disagreements: [], seed: Number(seedArg) }
 const seen = new Set()
+const kinds = new Set()
 function record(name, input, isNew) {
   const d = disagrees(name, input)
   if (!d) return false
@@ -163,7 +164,10 @@ try {
       const c = JSON.parse(readFileSync(path.join(regDir, f), 'utf8'))
       if (!names.includes(c.candidate)) continue
       result.replayed++
-      record(c.candidate, c.input, false)
+      if (record(c.candidate, c.input, false)) {
+        const d = disagrees(c.candidate, c.input)
+        if (d) kinds.add(c.candidate + '|' + signature(d.ref, d.got))
+      }
     }
   // 2. Fresh random inputs within the input and time budget.
   const rng = makeRng(Number(seedArg))
@@ -178,7 +182,12 @@ try {
     }
     for (const name of names) {
       if (result.disagreements.filter(d => d.candidate === name).length >= 5) continue
-      if (disagrees(name, input)) record(name, shrink(name, input), true)
+      const d = disagrees(name, input)
+      if (!d) continue
+      const sig = signature(d.ref, d.got)
+      if (kinds.has(name + '|' + sig)) continue // one saved case per kind of failure is enough
+      kinds.add(name + '|' + sig)
+      record(name, shrink(name, input), true)
     }
   }
 } catch (e) {

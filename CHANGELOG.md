@@ -2,6 +2,23 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## Unreleased (branch `wip/diff-fuzz`)
+- Added: `diff` (CLI), `/forge diff`, `/forge:diff-setup`: the person's real code (the shipped function, the
+  wrapper) against the compiled proved rule on fresh random inputs, JavaScript/TypeScript (node, `.ts` imported
+  directly) and Python. Shrinks each disagreement without letting it slide into a different bug (the failure
+  signature stays fixed), keeps one case per kind of failure, saves it under `.forge/regressions/`, replays saved
+  cases first. Checks by hashes only that the compiled code matches the Dafny files (`BUILD_STALE`).
+- Added: automatic run at the end of each Claude turn in which a watched file changed, found by modification time
+  (so shell edits and the person's own edits count); a turn without a change runs nothing; result in the status
+  line.
+- Tested: 35 cases (7 new). On the example: the three planted bugs in the shipped Python function (exact cap
+  rejected, zero accepted, negative accepted) and the two in the shipped TypeScript function are found; the
+  wrapper agrees; after the shipped code is fixed the saved cases pass. Runs take 50–250 ms per language for 1,500
+  inputs. In headless Claude Code sessions: `/forge diff` works; an Edit-tool edit and a shell edit each trigger
+  the automatic run (0.6 s); a turn with no change does not.
+- Not tested: a real project (chronicle is next, after its rule is approved); TypeScript that uses syntax Node
+  cannot strip (enums, namespaces); Windows.
+
 ## 0.7.1 — 2026-11-22
 - Fixed (usability): `/forge:approve` (with a colon) answered "Unknown command"; a tester typed it. Now
   `/forge:approve`, `/forge:check`, `/forge:build` and `/forge:status` each print the right command (with a
