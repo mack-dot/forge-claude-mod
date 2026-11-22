@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "wallet-cap",
+      "spec": "spec/WalletSpec.dfy",
+      "files": ["impl/Wallet.dfy"],
+      "binding": {
+        "file": "impl/Wallet.dfy",
+        "prefix": "include \"../spec/WalletSpec.dfy\"\n\nmodule Wallet refines WalletSpec {"
+      }
+    }
+  ]
+}

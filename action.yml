@@ -1,0 +1,41 @@
+name: "Forge check"
+description: "Prove the checks in .forge/forge.json with Dafny and fail the job unless every check is VERIFIED"
+branding:
+  icon: check-circle
+  color: green
+inputs:
+  root:
+    description: "Project folder that holds .forge/forge.json"
+    required: false
+    default: "."
+  base:
+    description: "Git ref to compare with. Any change to forge.json, approved.json or a spec against it gives APPROVAL_CHANGED. Default: the pull request's base branch; empty on other events."
+    required: false
+    default: ""
+  dafny-version:
+    description: "Dafny version to install"
+    required: false
+    default: "4.11.0"
+runs:
+  using: "composite"
+  steps:
+    - uses: dafny-lang/setup-dafny-action@be023fc606339d46ed6b077dcb8614d0279ded31 # v1.9.1
+      with:
+        dafny-version: ${{ inputs.dafny-version }}
+    - name: forge check
+      shell: bash
+      env:
+        FORGE_ROOT: ${{ inputs.root }}
+        FORGE_BASE: ${{ inputs.base }}
+        PR_BASE: ${{ github.base_ref }}
+      run: |
+        base="$FORGE_BASE"
+        if [ -z "$base" ] && [ -n "$PR_BASE" ]; then
+          git fetch --no-tags --depth=1 origin "$PR_BASE"
+          base="origin/$PR_BASE"
+        fi
+        if [ -n "$base" ]; then
+          python3 "$GITHUB_ACTION_PATH/cli/forge_check.py" check --root "$FORGE_ROOT" --no-write --base "$base"
+        else
+          python3 "$GITHUB_ACTION_PATH/cli/forge_check.py" check --root "$FORGE_ROOT" --no-write
+        fi

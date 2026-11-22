@@ -18,7 +18,7 @@ type Api = any
 // `module X refines Spec {` line), so it cannot switch to a weaker spec.
 type Check = { name: string; spec: string; files: string[]; binding?: { file: string; prefix: string } }
 type Config = { version: 1; checks: Check[]; dafny?: string }
-type Verdict = 'VERIFIED' | 'FAILED' | 'NOT_APPROVED' | 'SPEC_CHANGED' | 'CONFIG_CHANGED' | 'BINDING_BROKEN' | 'UNSOUND_CONSTRUCT' | 'ERROR'
+type Verdict = string
 type LastCheck = { at: string; verdicts: Record<string, Verdict>; detail: Record<string, string> }
 
 const DIR = '.forge'
@@ -47,16 +47,6 @@ async function writeJson($: Api, root: string, rel: string, value: unknown) {
 async function sha256($: Api, path: string): Promise<string | undefined> {
   const r = await $.process.run(['shasum', '-a', '256', path], { timeoutMs: 10_000 })
   return r.exitCode === 0 ? r.stdout.split(/\s+/)[0] : undefined
-}
-
-// Constructs that make Dafny accept a claim without proof. A text scan, not a parser.
-const UNSOUND = [/\bassume\b/, /\{:\s*verify\s+false/, /\{:\s*axiom/, /\{:\s*extern/, /\{:\s*only/]
-
-async function unsoundIn($: Api, path: string): Promise<string | undefined> {
-  const text: string = await $.fs.read(path)
-  const code = text.replace(/\/\/[^\n]*/g, '')
-  const hit = UNSOUND.find(r => r.test(code))
-  return hit ? String(hit) : undefined
 }
 
 async function findDafny($: Api, root: string, configured?: string): Promise<string | undefined> {
@@ -93,75 +83,35 @@ async function refreshStatus($: Api) {
   $.ui.status(cfg || last ? text : undefined)
 }
 
+// The verdicts come from cli/forge_check.py, the same checker CI runs.
 async function runChecks($: Api): Promise<string> {
   const root: string = await $.session.root()
-  const cfg = await readJson<Config>($, join(root, CONFIG))
-  if (!cfg?.checks?.length) return 'No checks yet. Run /forge to set one up.'
-  const dafny = await findDafny($, root, cfg.dafny)
-  if (!dafny) return 'Dafny was not found. Run /forge and Claude will help you install it.'
-  const approved = (await readJson<Record<string, string>>($, join(root, APPROVED))) ?? {}
-  const cfgHash = await sha256($, join(root, CONFIG))
-  const isConfigApproved = !!approved[CONFIG] && approved[CONFIG] === cfgHash
-
   isChecking = true
   await refreshStatus($)
-  const last: LastCheck = { at: new Date().toISOString(), verdicts: {}, detail: {} }
+  let r
   try {
-    for (const c of cfg.checks) {
-      const hash = await sha256($, join(root, c.spec))
-      if (!isConfigApproved) {
-        last.verdicts[c.name] = 'CONFIG_CHANGED'
-        last.detail[c.name] = `${CONFIG} is not approved as it is now (a check, spec path, file list or binding changed). Run /forge approve to read it.`
-        continue
-      }
-      if (!approved[c.spec]) {
-        last.verdicts[c.name] = 'NOT_APPROVED'
-        last.detail[c.name] = `${c.spec} is not approved. Run /forge approve to read it.`
-        continue
-      }
-      if (hash !== approved[c.spec]) {
-        last.verdicts[c.name] = 'SPEC_CHANGED'
-        last.detail[c.name] = `${c.spec} changed after you approved it. Run /forge approve to read the new version.`
-        continue
-      }
-      if (c.binding) {
-        const impl: string = await $.fs.read(join(root, c.binding.file)).catch(() => '')
-        if (!impl.startsWith(c.binding.prefix)) {
-          last.verdicts[c.name] = 'BINDING_BROKEN'
-          last.detail[c.name] = `${c.binding.file} no longer starts with the approved include and refines line, so it may not be checked against ${c.spec}.`
-          continue
-        }
-      }
-      let unsound: string | undefined
-      for (const f of c.files) {
-        const hit = await unsoundIn($, join(root, f)).catch(() => undefined)
-        if (hit) { unsound = `${f}: ${hit}`; break }
-      }
-      if (unsound) {
-        last.verdicts[c.name] = 'UNSOUND_CONSTRUCT'
-        last.detail[c.name] = `${unsound} lets Dafny accept a claim without proof. Remove it.`
-        continue
-      }
-      const r = await $.process.run([dafny, 'verify', ...c.files.map(f => join(root, f))], {
-        cwd: root,
-        timeoutMs: 600_000,
-      })
-      const out = (r.stdout + '\n' + r.stderr).trim()
-      last.verdicts[c.name] = r.exitCode === 0 ? 'VERIFIED' : r.exitCode === 4 ? 'FAILED' : 'ERROR'
-      last.detail[c.name] = `dafny exit ${r.exitCode}: ${out.split('\n').slice(-12).join('\n')}`
-    }
+    r = await $.process.run(
+      ['python3', `${$.plugin.root}/cli/forge_check.py`, 'check', '--root', root, '--json'],
+      { cwd: root, timeoutMs: 900_000 },
+    )
   } finally {
     isChecking = false
   }
-  await writeJson($, root, LAST, last)
+  let last: (LastCheck & { error?: string }) | undefined
+  try {
+    last = JSON.parse(r.stdout)
+  } catch {
+    last = undefined
+  }
+  await refreshStatus($)
+  if (!last) return `The checker did not run (exit ${r.exitCode}). It needs python3.\n${(r.stderr || r.stdout).slice(0, 600)}`
+  if (last.error) return `forge: ${last.error}`
   isStale = false
   await refreshStatus($)
-
-  const lines = cfg.checks.map(c => `${last.verdicts[c.name] === 'VERIFIED' ? '✓' : '✗'} ${c.name}: ${last.verdicts[c.name]}`)
-  const fails = cfg.checks
-    .filter(c => last.verdicts[c.name] !== 'VERIFIED')
-    .map(c => `\n--- ${c.name} ---\n${last.detail[c.name]}`)
-  return [summary(last, cfg.checks.length), ...lines, ...fails].join('\n')
+  const names = Object.keys(last.verdicts)
+  const lines = names.map(n => `${last.verdicts[n] === 'VERIFIED' ? '✓' : '✗'} ${n}: ${last.verdicts[n]}`)
+  const fails = names.filter(n => last.verdicts[n] !== 'VERIFIED').map(n => `\n--- ${n} ---\n${last.detail[n]}`)
+  return [summary(last, names.length), ...lines, ...fails].join('\n')
 }
 
 // Hashes shown to the person by `/forge approve`; `/forge approve yes` approves only these.

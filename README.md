@@ -49,6 +49,7 @@ Other commands: `/forge spec` (show the contract again), `/forge status`, `/forg
 | `CONFIG_CHANGED` | `.forge/forge.json` changed after approval (a check, spec path, file list or binding) |
 | `BINDING_BROKEN` | The implementation no longer starts with the approved `include` and `refines` lines |
 | `UNSOUND_CONSTRUCT` | A file uses `assume`, `{:verify false}`, `{:axiom}`, `{:extern}` or `{:only}` (text scan) |
+| `APPROVAL_CHANGED` | CI only: the pull request changes `forge.json`, `approved.json` or a spec |
 | `ERROR` | Dafny did not run correctly |
 
 Why `binding`: in Dafny 4.11 an implementation can switch to refining a weaker spec while the approved spec
@@ -58,6 +59,40 @@ pins the exact first lines of the implementation, for example
 
 Files it keeps in your project: `.forge/forge.json` (checks), `.forge/approved.json` (your approvals),
 `.forge/last-check.json` (last verdicts).
+
+## Use it in CI (GitHub Action)
+
+The same checker runs in CI. Commit `.forge/forge.json` and `.forge/approved.json`, then add:
+
+```yaml
+# .github/workflows/forge.yml
+name: forge
+on: [pull_request]
+permissions:
+  contents: read
+jobs:
+  forge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mack-dot/forge-claude-mod@v0.2.0
+```
+
+The job fails unless every check is `VERIFIED`. On a pull request, any change to `forge.json`,
+`approved.json` or a spec gives `APPROVAL_CHANGED`: a person with the right to approve specs must
+review that change. To make this a lock, require the job in branch protection and protect `.forge/`
+and `.github/` with CODEOWNERS.
+
+Without Claude Code, from a shell (Python 3.8+, Dafny on PATH or `FORGE_DAFNY`):
+
+```
+python3 cli/forge_check.py check     # exit 0 only if every check is VERIFIED
+python3 cli/forge_check.py spec      # show what an approval covers
+python3 cli/forge_check.py approve   # a person approves, at a terminal
+```
+
+`examples/wallet-cap` is a small complete project. `tests/run_tests.py` drives every verdict.
+See `PLAN.md` for what is built and what is not.
 
 ## Limits
 
