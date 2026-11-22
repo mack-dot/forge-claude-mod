@@ -114,6 +114,17 @@ async function runChecks($: Api): Promise<string> {
   return [summary(last, names.length), ...lines, ...fails].join('\n')
 }
 
+// Compiles the proved code to the targets in forge.json, fuzzes the compiled code in every
+// target, and checks that the app imports it. Same checker as CI.
+async function runBuild($: Api, isCheckOnly: boolean): Promise<string> {
+  const root: string = await $.session.root()
+  const argv = ['python3', `${$.plugin.root}/cli/forge_check.py`, 'build', '--root', root]
+  if (isCheckOnly) argv.push('--check')
+  const r = await $.process.run(argv, { cwd: root, timeoutMs: 1_800_000 })
+  await refreshStatus($)
+  return (r.stdout || r.stderr).slice(0, 6000) || `The checker did not run (exit ${r.exitCode}). It needs python3.`
+}
+
 // Hashes shown to the person by `/forge approve`; `/forge approve yes` approves only these.
 let shown: Record<string, string> = {}
 
@@ -225,6 +236,7 @@ async function wizard($: Api): Promise<{ text: string; prompt?: string }> {
       'Forge · step 5 of 5: done. Every check is VERIFIED.\n' +
       'Now let Claude (or any agent) change that code freely. After each turn that touches a covered file, the status line says "code changed"; run /forge check.\n' +
       'If a spec file changes, the check says SPEC_CHANGED until you approve again.\n' +
+      'To use the proved code in your app: /forge build (compiles it to py, js, go, java, cs or rs, fuzzes the compiled code, checks the app imports it).\n' +
       'Add more checks with /forge add.',
   }
 }
@@ -259,7 +271,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'forge',
       description: 'Forge proof gate: guided setup, then check / approve / status / add',
-      argumentHint: '[spec|approve|check|status|add]',
+      argumentHint: '[spec|approve|check|build|status|add]',
     })
     const r = await next(e)
     void refreshStatus($).catch(() => undefined)
@@ -269,6 +281,17 @@ export const register: Register = on => {
   on('command.run', { command: 'forge' }, async ($, e) => {
     const arg = e.args.trim().split(/\s+/)[0] ?? ''
     if (arg === 'check') return { text: await runChecks($) }
+    if (arg === 'build') {
+      const root: string = await $.session.root()
+      const cfg = await readJson<Config & { checks: Array<Check & { build?: unknown }> }>($, join(root, CONFIG))
+      if (cfg?.checks?.length && !cfg.checks.some(c => c.build)) {
+        void $.prompt.submit({
+          text: `${COACH}\nThe person typed /forge build, but no check in .forge/forge.json has a "build" entry yet. Ask with AskUserQuestion which languages their app needs (py, js, go, java, cs, rs; several allowed). Then: (1) write a fuzz harness in Dafny for the check, a file with a module that has "method Main()", which calls the proved method on boundary values (0, 1, each limit and its neighbours, 2^31, 2^32, 2^53, 2^63, 2^64) and about 2000 pseudo-random inputs from a linear congruential generator, repeats each ensures clause as an "expect", and prints one line per case; the module name must differ from the file name. (2) Add "build": {"targets": [...], "out": "verified", "fuzz": "<harness>", "usedBy": [{"file": "<app file>", "contains": "<import text>"}]} to the check. (3) Write a thin wrapper in the app's language that converts plain values to the generated types, and make the app call it; say plainly that the wrapper is unproved. (4) Tell the person that forge.json changed, so they run /forge approve, then /forge approve yes, then /forge build.`,
+        })
+        return { text: 'Forge · no build is set up yet. Claude will ask which languages you need.' }
+      }
+      return { text: await runBuild($, /^build\s+check\b/.test(e.args.trim())) }
+    }
     if (arg === 'approve') return { text: await approve($, /^approve\s+yes\b/.test(e.args.trim())) }
     if (arg === 'spec') {
       const { text, specs } = await showSpecs($, false)

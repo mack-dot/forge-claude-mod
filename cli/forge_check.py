@@ -5,6 +5,15 @@ Usage:
   forge_check.py check   [--root DIR] [--json] [--base GIT_REF]
   forge_check.py approve [--root DIR]            (interactive; a person's act)
   forge_check.py spec    [--root DIR]
+  forge_check.py build   [--root DIR] [--json] [--check]
+
+`build` first runs `check`. For each check with a "build" entry it then:
+  1. verifies the fuzz harness with Dafny, compiles it to every listed target, runs it,
+     and requires the same output from every target (catches one-backend miscompiles);
+  2. emits the proved code for every target under <out>/<check name>/<target>/;
+  3. requires each "usedBy" file to contain its text (a text check that the app imports it).
+With --check nothing is written: the emitted code on disk must equal a fresh build.
+Targets: py, js, go, java, cs, rs. Exit 0 only if every check is VERIFIED and BUILT.
 
 Exit codes of `check`: 0 every check VERIFIED; 1 at least one check is not
 VERIFIED; 2 usage or configuration error.
@@ -14,6 +23,8 @@ Files in the project:
   .forge/approved.json   SHA-256 of forge.json and of each spec, written on approval
   .forge/last-check.json verdicts of the last run
 
+LIMIT: the emitted code is a NATIVE CHECK: Dafny's compilers are not verified. The fuzz
+run is a FINITE TEST. Only the Dafny model is PROVED.
 LIMIT: a VERIFIED verdict says that Dafny proved the listed files against the
 approved spec text on this machine. It says nothing about code that no check
 lists, about the compiler, or about whether the application calls the proved code.
@@ -28,6 +39,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 DIR = '.forge'
 CONFIG = DIR + '/forge.json'
@@ -37,6 +49,14 @@ LAST = DIR + '/last-check.json'
 # Constructs that make Dafny accept a claim without proof. A text scan, not a parser.
 UNSOUND = [r'\bassume\b', r'\{:\s*verify\s+false', r'\{:\s*axiom', r'\{:\s*extern', r'\{:\s*only']
 TIMEOUT_S = 600
+TARGETS = {  # target: (tools that must be on PATH, extra Dafny options)
+    'py': (['python3'], []),
+    'js': (['node', 'npm'], []),
+    'go': (['go', 'goimports'], []),
+    'java': (['javac', 'java'], []),
+    'cs': (['dotnet'], []),
+    'rs': (['cargo'], ['--enforce-determinism']),
+}
 
 
 class ConfigError(Exception):
@@ -88,6 +108,23 @@ def load_config(root):
         b = c.get('binding')
         if b is not None and not (isinstance(b, dict) and 'file' in b and 'prefix' in b):
             raise ConfigError('check %s: "binding" needs "file" and "prefix"' % c['name'])
+        bd = c.get('build')
+        if bd is not None:
+            if not isinstance(bd, dict) or not bd.get('targets') or not bd.get('out'):
+                raise ConfigError('check %s: "build" needs "targets" and "out"' % c['name'])
+            unknown = [t for t in bd['targets'] if t not in TARGETS]
+            if unknown:
+                raise ConfigError('check %s: unknown target(s) %s; known: %s'
+                                  % (c['name'], ', '.join(unknown), ', '.join(TARGETS)))
+            if not re.match(r'^[A-Za-z0-9_]+$', c['name'].replace('-', '_')):
+                raise ConfigError('check %s: a built check needs a name of letters, digits, - and _' % c['name'])
+            inside(root, bd['out'])
+            if bd.get('fuzz'):
+                inside(root, bd['fuzz'])
+            for u in bd.get('usedBy', []):
+                if not (isinstance(u, dict) and 'file' in u and 'contains' in u):
+                    raise ConfigError('check %s: each "usedBy" needs "file" and "contains"' % c['name'])
+                inside(root, u['file'])
     return cfg
 
 
@@ -114,6 +151,22 @@ def unsound_in(path):
         if re.search(pattern, code):
             return pattern
     return None
+
+
+def include_closure(root, files):
+    """The listed files and every file they include, directly or not (project-relative)."""
+    seen, todo = [], [inside(root, f) for f in files]
+    while todo:
+        path = todo.pop()
+        if path in seen or not os.path.isfile(path):
+            continue
+        seen.append(path)
+        with open(path, encoding='utf-8', errors='replace') as f:
+            text = f.read()
+        for inc in re.findall(r'^\s*include\s+"([^"]+)"', text, flags=re.M):
+            todo.append(inside(root, os.path.relpath(os.path.join(os.path.dirname(path), inc),
+                                                      os.path.realpath(root))))
+    return [os.path.relpath(x, os.path.realpath(root)) for x in seen]
 
 
 def changed_since(root, base, paths):
@@ -185,7 +238,12 @@ def run_checks(root, base=None):
                     'lines, so it may not be checked against %s.' % (b['file'], spec))
                 continue
         hit = None
-        for f in c['files']:
+        try:
+            closure = include_closure(root, c['files'])
+        except ConfigError as e:
+            put('ERROR', str(e))
+            continue
+        for f in closure:
             pattern = unsound_in(inside(root, f))
             if pattern:
                 hit = '%s matches %s' % (f, pattern)
@@ -198,7 +256,7 @@ def run_checks(root, base=None):
                 'FORGE_DAFNY.' % CONFIG)
             continue
         try:
-            r = subprocess.run([dafny, 'verify'] + [inside(root, f) for f in c['files']],
+            r = subprocess.run([dafny, 'verify', '--verify-included-files'] + [inside(root, f) for f in c['files']],
                                cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                timeout=TIMEOUT_S, universal_newlines=True)
         except subprocess.TimeoutExpired:
@@ -232,6 +290,224 @@ def report(result):
     for name, verdict in result['verdicts'].items():
         if verdict != 'VERIFIED':
             lines.append('\n--- %s ---\n%s' % (name, result['detail'][name]))
+    return '\n'.join(lines)
+
+
+# ---------------------------------------------------------------------------- build
+
+def run_to_file(cmd, cwd, out_path, env=None):
+    """Run cmd with output to a file (no pipes: a pipe can deadlock). Returns exit code or None."""
+    with open(out_path, 'wb') as out:
+        try:
+            return subprocess.run(cmd, cwd=cwd, stdout=out, stderr=subprocess.STDOUT,
+                                  stdin=subprocess.DEVNULL, env=env, timeout=TIMEOUT_S).returncode
+        except subprocess.TimeoutExpired:
+            return None
+
+
+def read_text(path):
+    with open(path, encoding='utf-8', errors='replace') as f:
+        return f.read()
+
+
+def copy_dafny_sources(root, dest, skip):
+    """Copy every .dfy file under root to dest, keeping the layout. Build output is skipped."""
+    skip = [os.path.realpath(x) for x in skip]
+    for folder, dirs, files in os.walk(root):
+        real = os.path.realpath(folder)
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d != 'node_modules'
+                   and os.path.join(real, d) not in skip]
+        for name in files:
+            if name.endswith('.dfy'):
+                target = os.path.join(dest, os.path.relpath(folder, root))
+                os.makedirs(target, exist_ok=True)
+                shutil.copy2(os.path.join(folder, name), os.path.join(target, name))
+
+
+def js_node_path():
+    """Folder with bignumber.js, which Dafny's JavaScript output needs. Installed once."""
+    cache = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'), 'forge-check', 'js')
+    modules = os.path.join(cache, 'node_modules')
+    if not os.path.isdir(os.path.join(modules, 'bignumber.js')):
+        os.makedirs(cache, exist_ok=True)
+        r = subprocess.run(['npm', 'install', '--silent', '--no-audit', '--no-fund', '--prefix', cache,
+                            'bignumber.js@9'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           stdin=subprocess.DEVNULL, universal_newlines=True)
+        if r.returncode != 0:
+            return None
+    return modules
+
+
+def missing_tools(target):
+    return [t for t in TARGETS[target][0] if not shutil.which(t)]
+
+
+def fuzz_target(dafny, work, harness_rel, target, log):
+    """Compile and run the harness in one target. Returns (status, normalized output or reason)."""
+    missing = missing_tools(target)
+    if missing:
+        return 'TOOLCHAIN_MISSING', 'not on PATH: ' + ', '.join(missing)
+    extra = TARGETS[target][1]
+    if target == 'js':
+        modules = js_node_path()
+        if not modules:
+            return 'TOOLCHAIN_MISSING', 'npm could not install bignumber.js'
+        code = run_to_file([dafny, 'translate', 'js', '--no-verify', '--include-runtime', harness_rel], work, log)
+        if code != 0:
+            return 'FAILED', 'dafny translate js: exit %s\n%s' % (code, read_text(log)[-600:])
+        env = dict(os.environ, NODE_PATH=modules)
+        code = run_to_file(['node', os.path.splitext(harness_rel)[0] + '.js'], work, log, env)
+    else:
+        code = run_to_file([dafny, 'run', '--no-verify', '--target:' + target] + extra + [harness_rel], work, log)
+    text = read_text(log)
+    if code != 0:
+        return 'FAILED', 'exit %s\n%s' % ('timeout' if code is None else code, text[-600:])
+    lines = [l for l in text.split('\n') if l.strip() and not l.startswith('Dafny program verifier')]
+    return 'PASSED', '\n'.join(lines)
+
+
+def emit_target(dafny, work, files, target, out_dir, name, log):
+    extra = TARGETS[target][1]
+    cmd = [dafny, 'translate', target, '--no-verify', '--include-runtime'] + extra + \
+          ['--output', os.path.join(out_dir, name)] + files
+    code = run_to_file(cmd, work, log)
+    if code != 0:
+        return 'exit %s\n%s' % (code, read_text(log)[-600:])
+    return None
+
+
+def tree_hashes(folder):
+    out = {}
+    for d, _, files in os.walk(folder):
+        for f in files:
+            path = os.path.join(d, f)
+            out[os.path.relpath(path, folder).replace(os.sep, '/')] = sha256(path)
+    return out
+
+
+def build_one(root, cfg, c, dafny, check_only):
+    bd = c['build']
+    name = c['name'].replace('-', '_')
+    out_root = inside(root, bd['out'])
+    res = {'verdict': 'BUILT', 'targets': {}, 'notes': []}
+
+    def fail(verdict, note):
+        if res['verdict'] == 'BUILT':
+            res['verdict'] = verdict
+        res['notes'].append(note)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # 1. fuzz: one clean copy of the sources per target, so builds do not touch the project
+        fuzz = bd.get('fuzz')
+        outputs = {}
+        if not fuzz:
+            fail('NO_FUZZ', 'no "fuzz" harness: the compiled code would be untested. Add one.')
+        else:
+            pattern = unsound_in(inside(root, fuzz))
+            if pattern:
+                fail('UNSOUND_CONSTRUCT', '%s matches %s' % (fuzz, pattern))
+            r = subprocess.run([dafny, 'verify', inside(root, fuzz)], cwd=root, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, universal_newlines=True)
+            if r.returncode != 0:
+                fail('FUZZ_NOT_VERIFIED', 'dafny verify %s: exit %d\n%s' % (fuzz, r.returncode, r.stdout[-600:]))
+            else:
+                for t in bd['targets']:
+                    work = os.path.join(tmp, 'fuzz-' + t)
+                    copy_dafny_sources(root, work, [out_root])
+                    status, text = fuzz_target(dafny, work, fuzz, t, os.path.join(tmp, 'fuzz-%s.log' % t))
+                    entry = {'fuzz': status}
+                    if status == 'PASSED':
+                        outputs[t] = text
+                        entry['fuzz_output_sha256'] = hashlib.sha256(text.encode()).hexdigest()
+                        entry['fuzz_output_lines'] = text.count('\n') + 1
+                    else:
+                        entry['fuzz_detail'] = text
+                        fail('TOOLCHAIN_MISSING' if status == 'TOOLCHAIN_MISSING' else 'FUZZ_FAILED',
+                             '%s: %s' % (t, text.split('\n')[0]))
+                    res['targets'][t] = entry
+                if len(set(outputs.values())) > 1:
+                    fail('TARGETS_DIFFER', 'the targets printed different results: '
+                         + ', '.join('%s=%s' % (t, res['targets'][t]['fuzz_output_sha256'][:12]) for t in outputs))
+
+        # 2. emit the proved code
+        work = os.path.join(tmp, 'emit-src')
+        copy_dafny_sources(root, work, [out_root])
+        fresh = os.path.join(tmp, 'emit')
+        for t in bd['targets']:
+            entry = res['targets'].setdefault(t, {})
+            err = emit_target(dafny, work, c['files'], t, os.path.join(fresh, t), name,
+                              os.path.join(tmp, 'emit-%s.log' % t))
+            if err:
+                entry['emit'] = 'FAILED'
+                entry['emit_detail'] = err
+                fail('EMIT_FAILED', '%s: %s' % (t, err.split('\n')[0]))
+                continue
+            entry['emit'] = 'OK'
+            entry['files'] = tree_hashes(os.path.join(fresh, t))
+            dest = os.path.join(out_root, c['name'], t)
+            if check_only:
+                on_disk = tree_hashes(dest) if os.path.isdir(dest) else {}
+                if on_disk != entry['files']:
+                    changed = sorted(set(on_disk) ^ set(entry['files'])
+                                     | {k for k in on_disk if entry['files'].get(k) != on_disk[k]})
+                    fail('STALE_BUILD', '%s/%s/%s differs from a fresh build (%s). Run build again; '
+                         'never edit emitted code by hand.' % (bd['out'], c['name'], t, ', '.join(changed[:4])))
+            elif res['verdict'] == 'BUILT':
+                if os.path.isdir(dest):
+                    shutil.rmtree(dest)
+                shutil.copytree(os.path.join(fresh, t), dest)
+
+    # 3. does the application import the built code? (a text check)
+    for u in bd.get('usedBy', []):
+        path = inside(root, u['file'])
+        if not os.path.isfile(path) or u['contains'] not in read_text(path):
+            fail('NOT_WIRED', '%s does not contain %r, so the app may not call the built code'
+                 % (u['file'], u['contains']))
+    if not bd.get('usedBy'):
+        res['notes'].append('no "usedBy": nothing checks that the app calls the built code')
+    return res
+
+
+def run_build(root, check_only):
+    result = run_checks(root)
+    result['build'] = {}
+    if any(v != 'VERIFIED' for v in result['verdicts'].values()):
+        return result
+    cfg = load_config(root)
+    dafny = find_dafny(root, cfg)
+    for c in cfg['checks']:
+        if 'build' in c:
+            result['build'][c['name']] = build_one(root, cfg, c, dafny, check_only)
+    if not check_only:
+        for c in cfg['checks']:
+            b = result['build'].get(c['name'])
+            if b and b['verdict'] == 'BUILT':
+                manifest = {
+                    'check': c['name'],
+                    'labels': 'Dafny model: PROVED. This emitted code: NATIVE CHECK (unverified compiler). '
+                              'Fuzz run: FINITE TEST.',
+                    'sources': {f: sha256(inside(root, f)) for f in [c['spec']] + c['files']},
+                    'targets': b['targets'],
+                }
+                dest = os.path.join(inside(root, c['build']['out']), c['name'])
+                with open(os.path.join(dest, 'forge-build.json'), 'w', encoding='utf-8') as f:
+                    f.write(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+    return result
+
+
+def build_report(result):
+    lines = [report(result)]
+    for name, b in result.get('build', {}).items():
+        parts = []
+        for t, e in b['targets'].items():
+            parts.append('%s fuzz=%s%s emit=%s' % (t, e.get('fuzz', '-'),
+                         ' (%d lines)' % e['fuzz_output_lines'] if 'fuzz_output_lines' in e else '',
+                         e.get('emit', '-')))
+        lines.append('%s build %s: %s\n  %s' % ('✓' if b['verdict'] == 'BUILT' else '✗', name,
+                                                b['verdict'], '\n  '.join(parts)))
+        lines += ['  note: ' + n for n in b['notes']]
+    if not result.get('build') and all(v == 'VERIFIED' for v in result['verdicts'].values()):
+        lines.append('no check has a "build" entry')
     return '\n'.join(lines)
 
 
@@ -278,12 +554,14 @@ def write_json(root, rel, value):
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog='forge_check.py', description='Forge proof check')
-    p.add_argument('command', choices=['check', 'approve', 'spec'])
+    p.add_argument('command', choices=['check', 'approve', 'spec', 'build'])
     p.add_argument('--root', default='.', help='project folder (default: current folder)')
     p.add_argument('--json', action='store_true', help='print the result as JSON')
     p.add_argument('--base', help='git ref; any change to forge.json, approved.json or a spec '
                                   'against it gives APPROVAL_CHANGED (for pull requests)')
     p.add_argument('--no-write', action='store_true', help='do not write ' + LAST)
+    p.add_argument('--check', action='store_true', help='build: write nothing; the emitted code on '
+                                                        'disk must equal a fresh build')
     a = p.parse_args(argv)
     root = os.path.abspath(a.root)
     try:
@@ -306,6 +584,12 @@ def main(argv=None):
             write_json(root, APPROVED, hashes)
             print('approved: ' + ', '.join(hashes))
             return 0
+        if a.command == 'build':
+            result = run_build(root, a.check)
+            print(json.dumps(result, indent=2, ensure_ascii=False) if a.json else build_report(result))
+            ok = all(v == 'VERIFIED' for v in result['verdicts'].values()) and \
+                all(b['verdict'] == 'BUILT' for b in result['build'].values())
+            return 0 if ok else 1
         result = run_checks(root, a.base)
         if not a.no_write:
             write_json(root, LAST, result)

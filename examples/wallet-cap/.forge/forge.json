@@ -4,10 +4,26 @@
     {
       "name": "wallet-cap",
       "spec": "spec/WalletSpec.dfy",
-      "files": ["impl/Wallet.dfy"],
+      "files": [
+        "impl/Wallet.dfy"
+      ],
       "binding": {
         "file": "impl/Wallet.dfy",
         "prefix": "include \"../spec/WalletSpec.dfy\"\n\nmodule Wallet refines WalletSpec {"
+      },
+      "build": {
+        "targets": [
+          "py",
+          "js"
+        ],
+        "out": "verified",
+        "fuzz": "fuzz/WalletFuzz.dfy",
+        "usedBy": [
+          {
+            "file": "app.py",
+            "contains": "'verified', 'wallet-cap', 'py', 'wallet_cap-py'"
+          }
+        ]
       }
     }
   ]

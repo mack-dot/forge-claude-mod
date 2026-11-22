@@ -12,6 +12,10 @@ inputs:
     description: "Git ref to compare with. Any change to forge.json, approved.json or a spec against it gives APPROVAL_CHANGED. Default: the pull request's base branch; empty on other events."
     required: false
     default: ""
+  build:
+    description: "Also run `build --check`: fuzz the compiled code in every target and require the committed emitted code to equal a fresh build. The job must have each target's toolchain."
+    required: false
+    default: "false"
   dafny-version:
     description: "Dafny version to install"
     required: false
@@ -21,12 +25,17 @@ runs:
   steps:
     - uses: dafny-lang/setup-dafny-action@be023fc606339d46ed6b077dcb8614d0279ded31 # v1.9.1
       with:
-        dafny-version: ${{ inputs.dafny-version }}
+        build:
+    description: "Also run `build --check`: fuzz the compiled code in every target and require the committed emitted code to equal a fresh build. The job must have each target's toolchain."
+    required: false
+    default: "false"
+  dafny-version: ${{ inputs.dafny-version }}
     - name: forge check
       shell: bash
       env:
         FORGE_ROOT: ${{ inputs.root }}
         FORGE_BASE: ${{ inputs.base }}
+        FORGE_BUILD: ${{ inputs.build }}
         PR_BASE: ${{ github.base_ref }}
       run: |
         base="$FORGE_BASE"
@@ -38,4 +47,7 @@ runs:
           python3 "$GITHUB_ACTION_PATH/cli/forge_check.py" check --root "$FORGE_ROOT" --no-write --base "$base"
         else
           python3 "$GITHUB_ACTION_PATH/cli/forge_check.py" check --root "$FORGE_ROOT" --no-write
+        fi
+        if [ "$FORGE_BUILD" = "true" ]; then
+          python3 "$GITHUB_ACTION_PATH/cli/forge_check.py" build --check --root "$FORGE_ROOT" --no-write
         fi

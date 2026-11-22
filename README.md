@@ -36,6 +36,10 @@ Type `/forge` in any repository. Each time, it shows the next step and Claude wa
 4. `/forge check` runs Dafny. The status line shows `forge ✓ VERIFIED n/n` or what failed.
 5. When a later edit touches a covered file, the status line says "code changed" until you check again.
 
+6. `/forge build` puts the proved code into your app. It compiles it to the languages you list
+   (`py`, `js`, `go`, `java`, `cs`, `rs`), runs a fuzz harness on the compiled code in every language and
+   requires identical output from all of them, and checks that your app imports the result.
+
 Other commands: `/forge spec` (show the contract again), `/forge status`, `/forge add`.
 
 ### Verdicts
@@ -60,6 +64,51 @@ pins the exact first lines of the implementation, for example
 Files it keeps in your project: `.forge/forge.json` (checks), `.forge/approved.json` (your approvals),
 `.forge/last-check.json` (last verdicts).
 
+## Build: from proof to code your app runs
+
+A proof of a Dafny model does nothing until your app runs the proved code. Add a `build` entry to a check:
+
+```json
+"build": {
+  "targets": ["py", "js"],
+  "out": "verified",
+  "fuzz": "fuzz/WalletFuzz.dfy",
+  "usedBy": [{ "file": "app.py", "contains": "'verified', 'wallet-cap', 'py', 'wallet_cap-py'" }]
+}
+```
+
+`python3 cli/forge_check.py build` (or `/forge build`) then:
+
+1. runs `check`; every check must be `VERIFIED`;
+2. verifies the fuzz harness with Dafny, compiles it to every target, runs it, and requires the same
+   output from every target. The harness repeats the spec's clauses as runtime `expect` checks on boundary
+   values and pseudo-random inputs. This is what catches a miscompile in one backend;
+3. emits the code under `<out>/<check>/<target>/` with a `forge-build.json` manifest of hashes;
+4. requires each `usedBy` file to contain its text (a text check that the app imports the code).
+
+`build --check` writes nothing and requires the emitted code on disk to equal a fresh build, so a hand
+edit of emitted code gives `STALE_BUILD`. Commit the emitted code and run `build --check` in CI
+(`build: "true"` in the Action).
+
+| Build verdict | Meaning |
+| --- | --- |
+| `BUILT` | Every target passed the fuzz run with identical output, was emitted, and is imported |
+| `NO_FUZZ` | No fuzz harness: the compiled code would be untested |
+| `FUZZ_NOT_VERIFIED` | Dafny did not verify the harness |
+| `FUZZ_FAILED` | A target failed a runtime `expect`, crashed or timed out |
+| `TARGETS_DIFFER` | Two targets printed different results |
+| `TOOLCHAIN_MISSING` | A listed target's tools are not on PATH |
+| `EMIT_FAILED` | Dafny could not emit a target |
+| `STALE_BUILD` | The emitted code on disk differs from a fresh build |
+| `NOT_WIRED` | A `usedBy` file does not contain its import text |
+
+Tools per target: `py` python3; `js` node and npm (bignumber.js is fetched once into
+`~/.cache/forge-check`); `go` go and goimports; `java` javac and java; `cs` dotnet; `rs` cargo.
+
+Honest labels: the Dafny model is PROVED. The emitted code is a NATIVE CHECK, because Dafny's compilers are
+not verified. The fuzz run is a FINITE TEST. The wrapper that your app writes around the emitted code is
+ordinary unproved code, so keep it thin. `examples/wallet-cap` shows all of it, with `app.py` as the app.
+
 ## Use it in CI (GitHub Action)
 
 The same checker runs in CI. Commit `.forge/forge.json` and `.forge/approved.json`, then add:
@@ -75,7 +124,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mack-dot/forge-claude-mod@v0.2.0
+      - uses: mack-dot/forge-claude-mod@v0.3.0
 ```
 
 The job fails unless every check is `VERIFIED`. On a pull request, any change to `forge.json`,

@@ -73,6 +73,47 @@ def forge_approval(root):  # weaken the spec AND rewrite the approval to match
     json.dump({CONFIG: h(CONFIG), SPEC: h(SPEC)}, open(os.path.join(root, APPROVED), 'w'))
 
 
+def add_helper(root, body):
+    """Adds impl/Helper.dfy as a second include, in a project whose approved binding allows it."""
+    import hashlib
+    open(os.path.join(root, 'impl/Helper.dfy'), 'w').write(body)
+    old = 'include "../spec/WalletSpec.dfy"\n\nmodule Wallet refines WalletSpec {'
+    new = 'include "../spec/WalletSpec.dfy"\ninclude "Helper.dfy"\n\nmodule Wallet refines WalletSpec {'
+    edit(root, IMPL, old, new)
+    cfg = json.load(open(os.path.join(root, CONFIG)))
+    cfg['checks'][0]['binding']['prefix'] = new
+    json.dump(cfg, open(os.path.join(root, CONFIG), 'w'))
+    h = lambda p: hashlib.sha256(open(os.path.join(root, p), 'rb').read()).hexdigest()
+    json.dump({CONFIG: h(CONFIG), SPEC: h(SPEC)}, open(os.path.join(root, APPROVED), 'w'))
+
+
+def helper_with_assume(root):  # an included file that no check lists
+    add_helper(root, 'module Helper {\n  lemma Anything()\n    ensures 1 == 2\n  { assume false; }\n}\n')
+
+
+def helper_with_bug(root):  # an included, unlisted file whose proof fails
+    add_helper(root, 'module Helper {\n  lemma Wrong()\n    ensures 1 == 2\n  { }\n}\n')
+
+
+def helper_ok(root):
+    add_helper(root, 'module Helper {\n  lemma Fine()\n    ensures 1 + 1 == 2\n  { }\n}\n')
+
+
+def edit_emitted(root):  # hand edit of emitted code
+    path = os.path.join(root, 'verified/wallet-cap/py/wallet_cap-py/Wallet.py')
+    text = open(path).read()
+    assert '<=' in text
+    open(path, 'w').write(text.replace('<=', '<', 1))
+
+
+def wrong_expect(root):  # the harness expects something the code does not do
+    edit(root, 'fuzz/WalletFuzz.dfy', 'expect next.cap == cap, "W2";', 'expect next.cap == cap + 1, "W2";')
+
+
+def unwire(root):  # the app stops importing the built code
+    edit(root, 'app.py', "'verified', 'wallet-cap', 'py', 'wallet_cap-py'", "'old_wallet'")
+
+
 # name, change, expected verdict, expected exit code, use --base
 CASES = [
     ('unchanged example', no_change, 'VERIFIED', 0, False),
@@ -86,6 +127,17 @@ CASES = [
     ('spec weakened and approval rewritten, no --base', forge_approval, 'VERIFIED', 0, False),
     ('spec weakened and approval rewritten, with --base', forge_approval, 'APPROVAL_CHANGED', 1, True),
     ('code-only change, with --base', assume_in_comment, 'VERIFIED', 0, True),
+    ('assume in an included file that no check lists', helper_with_assume, 'UNSOUND_CONSTRUCT', 1, False),
+    ('failing proof in an included file that no check lists', helper_with_bug, 'FAILED', 1, False),
+    ('a sound included file', helper_ok, 'VERIFIED', 0, False),
+]
+
+# `build --check` cases: name, change, expected build verdict, expected exit code
+BUILD_CASES = [
+    ('emitted code equals a fresh build', no_change, 'BUILT', 0),
+    ('emitted code edited by hand', edit_emitted, 'STALE_BUILD', 1),
+    ('fuzz harness expects a wrong result', wrong_expect, 'FUZZ_FAILED', 1),
+    ('app no longer imports the built code', unwire, 'NOT_WIRED', 1),
 ]
 
 
@@ -112,7 +164,25 @@ def main():
             failed += not ok
             print('%s  %-52s want %s/%d  got %s/%d' % ('ok  ' if ok else 'FAIL', name, want_verdict,
                                                        want_exit, ','.join(verdicts), r.returncode))
-    print('%d cases, %d failed' % (len(CASES), failed))
+    for name, change, want_verdict, want_exit in BUILD_CASES:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, 'p')
+            shutil.copytree(EXAMPLE, root)
+            change(root)
+            r = subprocess.run([sys.executable, CLI, 'build', '--check', '--root', root, '--json'],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            try:
+                got = [b['verdict'] for b in json.loads(r.stdout)['build'].values()]
+                notes = [n for b in json.loads(r.stdout)['build'].values() for n in b['notes']]
+            except (ValueError, KeyError):
+                got, notes = ['<no result: %s %s>' % (r.stdout.strip()[:200], r.stderr.strip()[:200])], []
+            ok = got == [want_verdict] and r.returncode == want_exit
+            failed += not ok
+            print('%s  %-52s want %s/%d  got %s/%d' % ('ok  ' if ok else 'FAIL', 'build: ' + name, want_verdict,
+                                                       want_exit, ','.join(got), r.returncode))
+            if not ok:
+                print('      ' + ' | '.join(notes)[:400])
+    print('%d cases, %d failed' % (len(CASES) + len(BUILD_CASES), failed))
     return 1 if failed else 0
 
 
