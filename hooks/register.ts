@@ -92,7 +92,7 @@ async function runChecks($: Api): Promise<string> {
   try {
     r = await $.process.run(
       ['python3', `${$.plugin.root}/cli/forge_check.py`, 'check', '--root', root, '--json'],
-      { cwd: root, timeoutMs: 900_000 },
+      { cwd: root, timeoutMs: 600_000 },
     )
   } finally {
     isChecking = false
@@ -120,7 +120,7 @@ async function runBuild($: Api, isCheckOnly: boolean): Promise<string> {
   const root: string = await $.session.root()
   const argv = ['python3', `${$.plugin.root}/cli/forge_check.py`, 'build', '--root', root]
   if (isCheckOnly) argv.push('--check')
-  const r = await $.process.run(argv, { cwd: root, timeoutMs: 1_800_000 })
+  const r = await $.process.run(argv, { cwd: root, timeoutMs: 600_000 })
   await refreshStatus($)
   return (r.stdout || r.stderr).slice(0, 6000) || `The checker did not run (exit ${r.exitCode}). It needs python3.`
 }

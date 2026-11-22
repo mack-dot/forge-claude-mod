@@ -2,6 +2,17 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## 0.4.1 — 2026-11-22
+- Fixed: `/forge check` and `/forge build` did nothing inside Claude Code since 0.2.0. Their timeouts
+  (15 and 30 minutes) were over the host limit of 10 minutes, so the hook was refused. Found by the first
+  run of the installed plugin in a real Claude Code session. A static test now fails on any timeout over
+  the limit.
+- Added: a prerequisites table in the README.
+- Tested: install from GitHub into a clean config (`claude plugin install`, exit 0); `/forge check`,
+  `/forge build check`, `/forge status` in a headless Claude Code session with the plugin loaded.
+- Not tested: `/forge approve` then `/forge approve yes` typed by a person in one interactive session; the
+  rule conversation.
+
 ## 0.4.0 — 2026-11-22
 - Changed: `/forge` step 2 and `/forge add` are a conversation that starts from the person's own words
   (before: Claude picked a function from the code and wrote the rule itself). Defaults to confirm, then

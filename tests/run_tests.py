@@ -3,6 +3,7 @@
 and requires one verdict and one exit code. Needs Dafny (PATH or FORGE_DAFNY)."""
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -173,8 +174,21 @@ BUILD_CASES = [
 ]
 
 
+def static_checks():
+    """Mistakes that only show up inside Claude Code, where CI cannot run the mod."""
+    problems = []
+    src = open(os.path.join(HERE, '..', 'hooks', 'register.ts'), encoding='utf-8').read()
+    for m in re.finditer(r'timeoutMs:\s*([0-9_]+)', src):
+        if int(m.group(1).replace('_', '')) > 600000:
+            problems.append('register.ts: timeoutMs %s is over the host limit of 600000' % m.group(1))
+    return problems
+
+
 def main():
     failed = 0
+    for problem in static_checks():
+        failed += 1
+        print('FAIL  static: ' + problem)
     for name, change, want_verdict, want_exit, use_base in CASES:
         with tempfile.TemporaryDirectory() as tmp:
             root = os.path.join(tmp, 'p')

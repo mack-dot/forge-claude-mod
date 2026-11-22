@@ -5,7 +5,16 @@ You approve a short spec once. After that, code may change only if Dafny proves 
 
 ## Install
 
-At the prompt of a Claude Code terminal session:
+You need:
+
+| For | What | How (macOS) |
+| --- | --- | --- |
+| everything | Claude Code (terminal) | already installed |
+| everything | Python 3.8 or newer as `python3` | already on most machines |
+| proofs | Dafny 4.11 | `brew install dafny` |
+| `/forge build` only | the tools of each language you build for | `py`: python3; `js`: node + npm; `go`: go + goimports; `java`: a JDK; `cs`: dotnet; `rs`: cargo |
+
+Then, at the prompt of a Claude Code terminal session:
 
 ```
 /plugin install forge --marketplace mack-dot/forge-claude-mod
@@ -128,7 +137,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mack-dot/forge-claude-mod@v0.4.0   # better: pin the commit hash, tags can move
+      - uses: mack-dot/forge-claude-mod@v0.4.1   # better: pin the commit hash, tags can move
 ```
 
 The job fails unless every check is `VERIFIED`. On a pull request, any change to `forge.json`,
