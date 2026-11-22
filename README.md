@@ -11,7 +11,7 @@ You need:
 | --- | --- | --- |
 | everything | Claude Code (terminal) | already installed |
 | everything | Python 3.8 or newer as `python3` | already on most machines |
-| proofs | Dafny 4.11 | `brew install dafny` |
+| proofs | Dafny 4.11 | nothing: downloaded automatically on first use (pinned 4.11.0, SHA-256 checked, about 60 MB, into `~/.cache/forge-check`). Or install it yourself (`brew install dafny`); set `FORGE_NO_DOWNLOAD=1` to forbid the download |
 | `/forge build` only | the tools of each language you build for | `py`: python3; `js`: node + npm; `go`: go + goimports; `java`: a JDK; `cs`: dotnet; `rs`: cargo |
 
 Then, at the prompt of a Claude Code terminal session:
@@ -35,8 +35,8 @@ In the desktop app: click + next to the prompt box, then Plugins, Add marketplac
 
 Type `/forge` in any repository. Each time, it shows the next step and Claude walks you through it:
 
-1. Install Dafny (the proof checker). The mod uses the `"dafny"` path in `.forge/forge.json` if set,
-   then `dafny` on PATH, then the `FORGE_DAFNY` environment variable.
+1. Dafny (the proof checker) is set up for you: the `"dafny"` path in `.forge/forge.json` if set, else
+   `dafny` on PATH, else `FORGE_DAFNY`, else a pinned download (macOS arm64/x64, Linux x64, Windows x64).
 2. **Say the rule in your own words.** Claude does not guess it from your code. It tells you whether the
    rule can be proved, confirms a few safe defaults with you, then asks about the edge cases with concrete
    numbers ("cap $50.00, spent $40.00, spend $20.00: reject, or cut to $10.00?"), as many rounds as needed.
@@ -137,7 +137,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mack-dot/forge-claude-mod@v0.4.1   # better: pin the commit hash, tags can move
+      - uses: mack-dot/forge-claude-mod@v0.5.0   # better: pin the commit hash, tags can move
 ```
 
 The job fails unless every check is `VERIFIED`. On a pull request, any change to `forge.json`,
@@ -148,6 +148,7 @@ and `.github/` with CODEOWNERS.
 Without Claude Code, from a shell (Python 3.8+, Dafny on PATH or `FORGE_DAFNY`):
 
 ```
+python3 cli/forge_check.py setup     # find Dafny or download the pinned release
 python3 cli/forge_check.py check     # exit 0 only if every check is VERIFIED
 python3 cli/forge_check.py spec      # show what an approval covers
 python3 cli/forge_check.py approve   # a person approves, at a terminal

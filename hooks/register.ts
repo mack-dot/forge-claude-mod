@@ -49,18 +49,18 @@ async function sha256($: Api, path: string): Promise<string | undefined> {
   return r.exitCode === 0 ? r.stdout.split(/\s+/)[0] : undefined
 }
 
-async function findDafny($: Api, root: string, configured?: string): Promise<string | undefined> {
-  // The "dafny" path in .forge/forge.json, else Dafny on PATH, else FORGE_DAFNY.
-  if (configured) {
-    const path = join(root, configured)
-    if (await $.fs.exists(path)) return path
+// Finds Dafny the same way CI does, and downloads the pinned release once if none is found.
+async function findDafny($: Api, root: string, _configured?: string): Promise<string | undefined> {
+  const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'setup', '--root', root, '--json'], {
+    cwd: root,
+    timeoutMs: 600_000,
+  })
+  try {
+    const out = JSON.parse(r.stdout) as { dafny: string | null; version: string | null }
+    return out.version && out.dafny ? out.dafny : undefined
+  } catch {
+    return undefined
   }
-  const r = await $.process.run(
-    ['/bin/sh', '-c', 'command -v dafny || { [ -x "$FORGE_DAFNY" ] && echo "$FORGE_DAFNY"; }'],
-    { timeoutMs: 5_000 },
-  )
-  const path = r.stdout.trim()
-  return r.exitCode === 0 && path ? path : undefined
 }
 
 function summary(last: LastCheck | undefined, total: number): string {
@@ -224,8 +224,8 @@ async function wizard($: Api): Promise<{ text: string; prompt?: string }> {
 
   if (!dafny)
     return {
-      text: 'Forge · step 1 of 5: install Dafny (the proof checker). Claude will help.',
-      prompt: `${COACH}\nStep 1 of 5: Dafny is not on PATH. Explain in two lines what Dafny is. Offer to install it (macOS: brew install dafny), or, if a Dafny binary already exists, putting its path as "dafny" in .forge/forge.json, and ask before running the install. Then tell them to run /forge again.`,
+      text: 'Forge · step 1 of 5: Dafny (the proof checker) could not be set up automatically. Claude will help.',
+      prompt: `${COACH}\nStep 1 of 5: the automatic Dafny download failed (it needs python3 and internet access; or this machine is not macOS arm64/x64, Linux x64 or Windows x64). Run: python3 "${$.plugin.root}/cli/forge_check.py" setup --root "${root}" and read its error. Explain it in two lines. Offer the fix (for example: brew install dafny), ask before installing anything, then tell the person to run /forge again.`,
     }
   if (!cfg?.checks?.length)
     return {

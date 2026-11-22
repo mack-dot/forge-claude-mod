@@ -47,3 +47,15 @@ jobs:
           hashes=$(python3 ../../cli/forge_check.py spec --json | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["hashes"]))')
           python3 ../../cli/forge_check.py approve --hashes "$hashes"
           python3 ../../cli/forge_check.py build --no-write
+  auto-dafny:
+    # No Dafny installed: the checker must download the pinned release, check its SHA-256 and prove the example.
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          if command -v dafny; then echo "dafny is already installed; this job must start without it"; exit 1; fi
+          python3 cli/forge_check.py setup --root examples/wallet-cap
+          python3 cli/forge_check.py check --root examples/wallet-cap --no-write

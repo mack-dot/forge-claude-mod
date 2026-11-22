@@ -12,7 +12,7 @@ Nothing below claims an end-to-end guarantee.
 | --- | --- | --- |
 | 0 | Timed trial: 3 to 5 people take one real rule through `/forge add`; record minutes and questions asked. First productivity number. | NOT STARTED (needs people) |
 | 1 | One standalone checker (`cli/forge_check.py`) used by the mod and by CI; a GitHub Action; `APPROVAL_CHANGED` on pull requests that touch a spec or an approval; included files are verified and scanned | BUILT (v0.2.0, v0.3.0); see README |
-| 2a | Pinned Dafny downloaded on first run (no manual install) | NOT STARTED |
+| 2a | Pinned Dafny downloaded on first run (no manual install) | BUILT (v0.5.0): SHA-256 pinned per platform; Windows untested |
 | 2b | `/forge build`: compile the proved code to py, js, go, java, cs, rs; a Dafny fuzz harness run on the compiled code in every target with identical output required; `STALE_BUILD` and `NOT_WIRED` checks | BUILT (v0.3.0). The harness is written per check (by Claude or by hand), not generated. `usedBy` is a text check, not a call-graph check |
 | 2c | `/forge add` as a conversation: fail-closed defaults to confirm, then concrete A/B questions with numbers; answers saved as examples next to the spec | BUILT (v0.4.0). Answers are Dafny-checked against the spec (`EXAMPLES_FAILED`). The conversation and the gap probes are a prompt to Claude, not code: their quality is not measured |
 | 3 | `/forge challenge`: a blind second implementation; disagreements become questions only when the spec allows both answers | NOT STARTED |

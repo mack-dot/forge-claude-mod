@@ -2,6 +2,16 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## 0.5.0 — 2026-11-22
+- Added: no manual Dafny install. If Dafny is not found, the checker downloads the official Dafny 4.11.0
+  release for the machine (macOS arm64/x64, Linux x64, Windows x64) into `~/.cache/forge-check`, checks
+  the SHA-256 that GitHub publishes for that file, and refuses to install on a mismatch. `setup` command;
+  `FORGE_NO_DOWNLOAD=1` forbids the download. `/forge` step 1 runs it.
+- Tested: with no Dafny on the machine, `/forge` in a headless Claude Code session downloaded Dafny and
+  proved the example (16 s); a wrong pinned hash is refused and nothing is installed; macOS's own
+  `/usr/bin/python3` (3.9) runs the checker. CI job `auto-dafny` does the same on fresh Linux and macOS.
+- Not tested: Windows; a machine behind a proxy.
+
 ## 0.4.1 — 2026-11-22
 - Fixed: `/forge check` and `/forge build` did nothing inside Claude Code since 0.2.0. Their timeouts
   (15 and 30 minutes) were over the host limit of 10 minutes, so the hook was refused. Found by the first

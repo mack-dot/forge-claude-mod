@@ -7,6 +7,7 @@ Usage:
   forge_check.py approve [--root DIR] --hashes JSON  (approves exactly what `spec --json` showed)
   forge_check.py spec    [--root DIR] [--json]
   forge_check.py build   [--root DIR] [--json] [--check]
+  forge_check.py setup   [--root DIR] [--json]     (find Dafny, or download the pinned release)
 
 `build` first runs `check`. For each check with a "build" entry it then:
   1. verifies the fuzz harness with Dafny, compiles it to every listed target, runs it,
@@ -29,6 +30,9 @@ run is a FINITE TEST. Only the Dafny model is PROVED.
 LIMIT: a VERIFIED verdict says that Dafny proved the listed files against the
 approved spec text on this machine. It says nothing about code that no check
 lists, about the compiler, or about whether the application calls the proved code.
+Dafny: the "dafny" path in forge.json, else `dafny` on PATH, else FORGE_DAFNY, else Dafny 4.11.0 downloaded
+once from its GitHub release into ~/.cache/forge-check (SHA-256 pinned below; set FORGE_NO_DOWNLOAD=1
+to forbid the download).
 Python 3.8+, standard library only.
 """
 import argparse
@@ -40,7 +44,10 @@ import re
 import shutil
 import subprocess
 import sys
+import platform
 import tempfile
+import urllib.request
+import zipfile
 
 DIR = '.forge'
 CONFIG = DIR + '/forge.json'
@@ -50,6 +57,18 @@ LAST = DIR + '/last-check.json'
 # Constructs that make Dafny accept a claim without proof. A text scan, not a parser.
 UNSOUND = [r'\bassume\b', r'\{:\s*verify\s+false', r'\{:\s*axiom', r'\{:\s*extern', r'\{:\s*only']
 TIMEOUT_S = 600
+DAFNY_VERSION = '4.11.0'
+# Release files of dafny-lang/dafny v4.11.0 and the SHA-256 that GitHub publishes for each.
+DAFNY_RELEASES = {
+    ('Darwin', 'arm64'): ('dafny-4.11.0-arm64-macos-13.zip',
+                          'c90c75e7d5db9c6ccbb7127840dfe43f0ac938b039a7ebed146d8ead383a572f'),
+    ('Darwin', 'x86_64'): ('dafny-4.11.0-x64-macos-13.zip',
+                           '5fc0de946c5b2fad33f16bd22a5b06f4fd0dfa7f6d770284237e3f1f3ca9f73d'),
+    ('Linux', 'x86_64'): ('dafny-4.11.0-x64-ubuntu-22.04.zip',
+                          'a46a9ff7cdd720f7955854c78e95df13f4cfe6b80691b05f8654fe19e8267179'),
+    ('Windows', 'AMD64'): ('dafny-4.11.0-x64-windows-2022.zip',
+                           '3653f05a111ca21e234709ea7b25ce96083fd6c6f10484256ba54110dbc0654d'),
+}
 TARGETS = {  # target: (tools that must be on PATH, extra Dafny options)
     'py': (['python3'], []),
     'js': (['node', 'npm'], []),
@@ -138,7 +157,66 @@ def contract_files(c):
     return [c['spec']] + contract_extras(c)
 
 
-def find_dafny(root, cfg):
+def cache_dir():
+    base = os.environ.get('XDG_CACHE_HOME') or os.path.join(os.path.expanduser('~'), '.cache')
+    return os.path.join(base, 'forge-check')
+
+
+def cached_dafny():
+    exe = 'dafny.exe' if platform.system() == 'Windows' else 'dafny'
+    path = os.path.join(cache_dir(), 'dafny-' + DAFNY_VERSION, 'dafny', exe)
+    return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
+
+
+def download_dafny(log=sys.stderr):
+    """Download the pinned Dafny release for this machine, check its SHA-256, unpack it into the
+    cache. Returns the path of the dafny program, or raises ConfigError."""
+    key = (platform.system(), platform.machine())
+    if key not in DAFNY_RELEASES:
+        raise ConfigError('no pinned Dafny %s download for %s %s; install Dafny yourself and put it '
+                          'on PATH' % (DAFNY_VERSION, key[0], key[1]))
+    name, want = DAFNY_RELEASES[key]
+    url = 'https://github.com/dafny-lang/dafny/releases/download/v%s/%s' % (DAFNY_VERSION, name)
+    os.makedirs(cache_dir(), exist_ok=True)
+    print('forge: downloading Dafny %s (%s, about 60 MB, once)…' % (DAFNY_VERSION, name), file=log)
+    fd, part = tempfile.mkstemp(prefix='dafny-', suffix='.zip.part', dir=cache_dir())
+    try:
+        digest = hashlib.sha256()
+        with os.fdopen(fd, 'wb') as out, urllib.request.urlopen(url, timeout=120) as resp:
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                out.write(chunk)
+        if digest.hexdigest() != want:
+            raise ConfigError('the Dafny download has SHA-256 %s, not the pinned %s; nothing was '
+                              'installed' % (digest.hexdigest(), want))
+        final = os.path.join(cache_dir(), 'dafny-' + DAFNY_VERSION)
+        staging = tempfile.mkdtemp(prefix='dafny-unpack-', dir=cache_dir())
+        with zipfile.ZipFile(part) as z:
+            for info in z.infolist():
+                target = os.path.realpath(os.path.join(staging, info.filename))
+                if os.path.commonpath([target, os.path.realpath(staging)]) != os.path.realpath(staging):
+                    raise ConfigError('the Dafny zip has a path outside its folder: ' + info.filename)
+                z.extract(info, staging)
+                mode = (info.external_attr >> 16) & 0o777
+                if mode and not info.is_dir():
+                    os.chmod(target, mode)
+        if os.path.isdir(final):
+            shutil.rmtree(final)
+        os.replace(staging, final)
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
+    path = cached_dafny()
+    if not path:
+        raise ConfigError('Dafny was unpacked but its program is missing or not executable')
+    print('forge: Dafny %s is ready at %s' % (DAFNY_VERSION, path), file=log)
+    return path
+
+
+def find_dafny(root, cfg, download=True):
     configured = cfg.get('dafny')
     if configured:
         path = configured if os.path.isabs(configured) else os.path.join(root, configured)
@@ -150,6 +228,11 @@ def find_dafny(root, cfg):
     env = os.environ.get('FORGE_DAFNY')
     if env and os.path.isfile(env) and os.access(env, os.X_OK):
         return env
+    cached = cached_dafny()
+    if cached:
+        return cached
+    if download and not os.environ.get('FORGE_NO_DOWNLOAD'):
+        return download_dafny()
     return None
 
 
@@ -592,7 +675,7 @@ def write_json(root, rel, value):
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog='forge_check.py', description='Forge proof check')
-    p.add_argument('command', choices=['check', 'approve', 'spec', 'build'])
+    p.add_argument('command', choices=['check', 'approve', 'spec', 'build', 'setup'])
     p.add_argument('--root', default='.', help='project folder (default: current folder)')
     p.add_argument('--json', action='store_true', help='print the result as JSON')
     p.add_argument('--base', help='git ref; any change to forge.json, approved.json or a spec '
@@ -605,6 +688,17 @@ def main(argv=None):
     a = p.parse_args(argv)
     root = os.path.abspath(a.root)
     try:
+        if a.command == 'setup':
+            cfg = read_json(os.path.join(root, CONFIG), {}) or {}
+            path = find_dafny(root, cfg)
+            r = subprocess.run([path, '--version'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               universal_newlines=True) if path else None
+            version = r.stdout.strip().split('\n')[-1] if r and r.returncode == 0 else None
+            if a.json:
+                print(json.dumps({'dafny': path, 'version': version, 'pinned': DAFNY_VERSION}))
+            else:
+                print('dafny: %s\nversion: %s (pinned download: %s)' % (path, version, DAFNY_VERSION))
+            return 0 if version else 1
         if a.command == 'spec':
             text, hashes = show_specs(root)
             print(json.dumps({'text': text, 'hashes': hashes}, ensure_ascii=False) if a.json else text)
