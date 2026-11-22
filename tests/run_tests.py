@@ -13,6 +13,7 @@ CLI = os.path.join(HERE, '..', 'cli', 'forge_check.py')
 EXAMPLE = os.path.join(HERE, '..', 'examples', 'wallet-cap')
 IMPL, SPEC = 'impl/Wallet.dfy', 'spec/WalletSpec.dfy'
 CONFIG, APPROVED = '.forge/forge.json', '.forge/approved.json'
+EXAMPLES, DECISIONS = 'spec/WalletExamples.dfy', '.forge/decisions/wallet-cap.md'
 
 
 def edit(root, rel, old, new):
@@ -70,7 +71,7 @@ def forge_approval(root):  # weaken the spec AND rewrite the approval to match
     import hashlib
     weaken_spec(root)
     h = lambda p: hashlib.sha256(open(os.path.join(root, p), 'rb').read()).hexdigest()
-    json.dump({CONFIG: h(CONFIG), SPEC: h(SPEC)}, open(os.path.join(root, APPROVED), 'w'))
+    json.dump({f: h(f) for f in [CONFIG, SPEC, EXAMPLES, DECISIONS]}, open(os.path.join(root, APPROVED), 'w'))
 
 
 def add_helper(root, body):
@@ -84,7 +85,7 @@ def add_helper(root, body):
     cfg['checks'][0]['binding']['prefix'] = new
     json.dump(cfg, open(os.path.join(root, CONFIG), 'w'))
     h = lambda p: hashlib.sha256(open(os.path.join(root, p), 'rb').read()).hexdigest()
-    json.dump({CONFIG: h(CONFIG), SPEC: h(SPEC)}, open(os.path.join(root, APPROVED), 'w'))
+    json.dump({f: h(f) for f in [CONFIG, SPEC, EXAMPLES, DECISIONS]}, open(os.path.join(root, APPROVED), 'w'))
 
 
 def helper_with_assume(root):  # an included file that no check lists
@@ -97,6 +98,32 @@ def helper_with_bug(root):  # an included, unlisted file whose proof fails
 
 def helper_ok(root):
     add_helper(root, 'module Helper {\n  lemma Fine()\n    ensures 1 + 1 == 2\n  { }\n}\n')
+
+
+def reapprove(root):
+    import hashlib
+    h = lambda p: hashlib.sha256(open(os.path.join(root, p), 'rb').read()).hexdigest()
+    json.dump({f: h(f) for f in [CONFIG, SPEC, EXAMPLES, DECISIONS]}, open(os.path.join(root, APPROVED), 'w'))
+
+
+def spec_contradicts_answer(root):  # spec now allows a partial spend; the person said no (D2)
+    edit(root, SPEC, '    ensures !(0 < amount && s.spent + amount <= s.cap) ==>\n      outcome == Rejected && next == s\n',
+         '    ensures (amount <= 0) ==> outcome == Rejected && next == s\n')
+    reapprove(root)
+
+
+def spec_leaves_answer_open(root):  # spec no longer says what happens to a zero amount (D3)
+    edit(root, SPEC, '    ensures !(0 < amount && s.spent + amount <= s.cap) ==>\n      outcome == Rejected && next == s\n',
+         '    ensures !(0 <= amount && s.spent + amount <= s.cap) ==>\n      outcome == Rejected && next == s\n')
+    reapprove(root)
+
+
+def answer_edited(root):  # someone flips an answer after approval
+    edit(root, EXAMPLES, 'assert outcome == S.Rejected && next.spent == 0;', 'assert next.spent == 0;')
+
+
+def decision_record_edited(root):
+    edit(root, DECISIONS, '| Reject; never a partial spend |', '| Allow a partial spend |')
 
 
 def edit_emitted(root):  # hand edit of emitted code
@@ -130,6 +157,11 @@ CASES = [
     ('assume in an included file that no check lists', helper_with_assume, 'UNSOUND_CONSTRUCT', 1, False),
     ('failing proof in an included file that no check lists', helper_with_bug, 'FAILED', 1, False),
     ('a sound included file', helper_ok, 'VERIFIED', 0, False),
+    ('spec contradicts an answer (D2), re-approved', spec_contradicts_answer, 'EXAMPLES_FAILED', 1, False),
+    ('spec leaves an answer open (D3), re-approved', spec_leaves_answer_open, 'EXAMPLES_FAILED', 1, False),
+    ('an answer edited after approval', answer_edited, 'SPEC_CHANGED', 1, False),
+    ('decision record edited after approval', decision_record_edited, 'SPEC_CHANGED', 1, False),
+    ('answers file changed, with --base', answer_edited, 'APPROVAL_CHANGED', 1, True),
 ]
 
 # `build --check` cases: name, change, expected build verdict, expected exit code
@@ -164,6 +196,7 @@ def main():
             failed += not ok
             print('%s  %-52s want %s/%d  got %s/%d' % ('ok  ' if ok else 'FAIL', name, want_verdict,
                                                        want_exit, ','.join(verdicts), r.returncode))
+    extra = 0
     for name, change, want_verdict, want_exit in BUILD_CASES:
         with tempfile.TemporaryDirectory() as tmp:
             root = os.path.join(tmp, 'p')
@@ -182,7 +215,30 @@ def main():
                                                        want_exit, ','.join(got), r.returncode))
             if not ok:
                 print('      ' + ' | '.join(notes)[:400])
-    print('%d cases, %d failed' % (len(CASES) + len(BUILD_CASES), failed))
+    # approval through `spec --json` then `approve --hashes` (the path the mod uses)
+    for name, tamper, want_exit, want_verdict in [
+            ('approve exactly what was shown', False, 0, 'VERIFIED'),
+            ('answers changed between showing and approving', True, 1, 'CONFIG_CHANGED')]:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, 'p')
+            shutil.copytree(EXAMPLE, root)
+            open(os.path.join(root, APPROVED), 'w').write('{}\n')
+            shown = json.loads(subprocess.run([sys.executable, CLI, 'spec', '--root', root, '--json'],
+                                              stdout=subprocess.PIPE, universal_newlines=True).stdout)['hashes']
+            if tamper:
+                edit(root, EXAMPLES, '// D3:', '// D3 (edited):')
+            r = subprocess.run([sys.executable, CLI, 'approve', '--root', root, '--hashes', json.dumps(shown)],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            c = subprocess.run([sys.executable, CLI, 'check', '--root', root, '--json'],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            got = list(json.loads(c.stdout)['verdicts'].values())
+            covered = sorted(shown) == sorted([CONFIG, SPEC, EXAMPLES, DECISIONS])
+            ok = r.returncode == want_exit and got == [want_verdict] and covered
+            failed += not ok
+            extra += 1
+            print('%s  %-52s want approve %d, %s  got %d, %s%s' % ('ok  ' if ok else 'FAIL', 'approval: ' + name,
+                  want_exit, want_verdict, r.returncode, ','.join(got), '' if covered else ' (hashes miss a file)'))
+    print('%d cases, %d failed' % (len(CASES) + len(BUILD_CASES) + extra, failed))
     return 1 if failed else 0
 
 

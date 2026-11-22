@@ -28,14 +28,17 @@ Type `/forge` in any repository. Each time, it shows the next step and Claude wa
 
 1. Install Dafny (the proof checker). The mod uses the `"dafny"` path in `.forge/forge.json` if set,
    then `dafny` on PATH, then the `FORGE_DAFNY` environment variable.
-2. Pick one small, critical function (money, limits, permissions). Claude writes the spec, the
-   implementation and `.forge/forge.json`.
-3. Type `/forge approve`. It shows the contract and `.forge/forge.json`, and Claude explains each clause in
-   plain words. Type `/forge approve yes` when it says what you want. If a file changes between reading and
-   "yes", the approval is refused.
-4. `/forge check` runs Dafny. The status line shows `forge ✓ VERIFIED n/n` or what failed.
+2. **Say the rule in your own words.** Claude does not guess it from your code. It tells you whether the
+   rule can be proved, confirms a few safe defaults with you, then asks about the edge cases with concrete
+   numbers ("cap $50.00, spent $40.00, spend $20.00: reject, or cut to $10.00?"), as many rounds as needed.
+   It also probes the spec with Dafny for cases nobody asked about and brings those back as questions.
+3. Claude writes three files: the spec, **your answers as Dafny checks** (`<Name>Examples.dfy`), and a
+   decision record (`.forge/decisions/<check>.md`). Type `/forge approve` to read all of it, then
+   `/forge approve yes`. Approval covers all three and `forge.json`.
+4. `/forge check` runs Dafny. Your answers are checked against the spec: if the spec says otherwise, or
+   leaves one of your answers open, the check gives `EXAMPLES_FAILED`. Then the code is checked against
+   the spec. The status line shows `forge ✓ VERIFIED n/n` or what failed.
 5. When a later edit touches a covered file, the status line says "code changed" until you check again.
-
 6. `/forge build` puts the proved code into your app. It compiles it to the languages you list
    (`py`, `js`, `go`, `java`, `cs`, `rs`), runs a fuzz harness on the compiled code in every language and
    requires identical output from all of them, and checks that your app imports the result.
@@ -48,8 +51,9 @@ Other commands: `/forge spec` (show the contract again), `/forge status`, `/forg
 | --- | --- |
 | `VERIFIED` | Dafny proved the files against the approved spec |
 | `FAILED` | Dafny found a proof failure |
+| `EXAMPLES_FAILED` | The spec contradicts one of your recorded answers, or leaves it open |
 | `NOT_APPROVED` | The spec was never approved |
-| `SPEC_CHANGED` | The spec changed after approval |
+| `SPEC_CHANGED` | The spec, your answers or the decision record changed after approval |
 | `CONFIG_CHANGED` | `.forge/forge.json` changed after approval (a check, spec path, file list or binding) |
 | `BINDING_BROKEN` | The implementation no longer starts with the approved `include` and `refines` lines |
 | `UNSOUND_CONSTRUCT` | A file uses `assume`, `{:verify false}`, `{:axiom}`, `{:extern}` or `{:only}` (text scan) |
@@ -124,7 +128,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mack-dot/forge-claude-mod@v0.3.1   # better: pin the commit hash, tags can move
+      - uses: mack-dot/forge-claude-mod@v0.4.0   # better: pin the commit hash, tags can move
 ```
 
 The job fails unless every check is `VERIFIED`. On a pull request, any change to `forge.json`,
@@ -138,6 +142,7 @@ Without Claude Code, from a shell (Python 3.8+, Dafny on PATH or `FORGE_DAFNY`):
 python3 cli/forge_check.py check     # exit 0 only if every check is VERIFIED
 python3 cli/forge_check.py spec      # show what an approval covers
 python3 cli/forge_check.py approve   # a person approves, at a terminal
+python3 cli/forge_check.py build     # compile, fuzz in every target, emit (see below)
 ```
 
 `examples/wallet-cap` is a small complete project. `tests/run_tests.py` drives every verdict.

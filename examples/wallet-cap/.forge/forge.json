@@ -24,7 +24,9 @@
             "contains": "'verified', 'wallet-cap', 'py', 'wallet_cap-py'"
           }
         ]
-      }
+      },
+      "examples": "spec/WalletExamples.dfy",
+      "decisions": ".forge/decisions/wallet-cap.md"
     }
   ]
 }

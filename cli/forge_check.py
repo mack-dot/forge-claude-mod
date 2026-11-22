@@ -4,7 +4,8 @@
 Usage:
   forge_check.py check   [--root DIR] [--json] [--base GIT_REF]
   forge_check.py approve [--root DIR]            (interactive; a person's act)
-  forge_check.py spec    [--root DIR]
+  forge_check.py approve [--root DIR] --hashes JSON  (approves exactly what `spec --json` showed)
+  forge_check.py spec    [--root DIR] [--json]
   forge_check.py build   [--root DIR] [--json] [--check]
 
 `build` first runs `check`. For each check with a "build" entry it then:
@@ -103,7 +104,7 @@ def load_config(root):
         names.add(c['name'])
         if not isinstance(c['files'], list) or not c['files']:
             raise ConfigError('check %s has no files' % c['name'])
-        for rel in [c['spec']] + c['files']:
+        for rel in [c['spec']] + c['files'] + contract_extras(c):
             inside(root, rel)
         b = c.get('binding')
         if b is not None and not (isinstance(b, dict) and 'file' in b and 'prefix' in b):
@@ -126,6 +127,15 @@ def load_config(root):
                     raise ConfigError('check %s: each "usedBy" needs "file" and "contains"' % c['name'])
                 inside(root, u['file'])
     return cfg
+
+
+def contract_extras(c):
+    """Files that are part of the approved contract besides the spec: the person's answers."""
+    return [c[k] for k in ('examples', 'decisions') if c.get(k)]
+
+
+def contract_files(c):
+    return [c['spec']] + contract_extras(c)
 
 
 def find_dafny(root, cfg):
@@ -191,7 +201,7 @@ def run_checks(root, base=None):
     config_ok = approved.get(CONFIG) == sha256(os.path.join(root, CONFIG))
     approval_changed = []
     if base:
-        protected = [CONFIG, APPROVED] + sorted({c['spec'] for c in cfg['checks']})
+        protected = [CONFIG, APPROVED] + sorted({f for c in cfg['checks'] for f in contract_files(c)})
         approval_changed = changed_since(root, base, protected)
         if approval_changed is None:
             raise ConfigError('cannot compare with git ref %s (fetch it first)' % base)
@@ -215,12 +225,18 @@ def run_checks(root, base=None):
         if not os.path.isfile(spec_path):
             put('ERROR', 'spec file %s is missing' % spec)
             continue
-        if spec not in approved:
-            put('NOT_APPROVED', '%s was never approved. Read it and approve it.' % spec)
+        missing_contract = [f for f in contract_files(c) if not os.path.isfile(inside(root, f))]
+        if missing_contract:
+            put('ERROR', 'missing contract file(s): ' + ', '.join(missing_contract))
             continue
-        if approved[spec] != sha256(spec_path):
-            put('SPEC_CHANGED', '%s changed after it was approved. Read the new version and '
-                'approve it.' % spec)
+        unapproved = [f for f in contract_files(c) if f not in approved]
+        if unapproved:
+            put('NOT_APPROVED', '%s never approved. Read and approve.' % ', '.join(unapproved))
+            continue
+        changed = [f for f in contract_files(c) if approved[f] != sha256(inside(root, f))]
+        if changed:
+            put('SPEC_CHANGED', '%s changed after approval. Read the new version and approve it.'
+                % ', '.join(changed))
             continue
         missing = [f for f in c['files'] if not os.path.isfile(inside(root, f))]
         if missing:
@@ -255,6 +271,26 @@ def run_checks(root, base=None):
             put('ERROR', 'Dafny was not found: set "dafny" in %s, put dafny on PATH, or set '
                 'FORGE_DAFNY.' % CONFIG)
             continue
+        if c.get('examples'):
+            # The person's answers, written as asserts against the abstract spec. They verify only
+            # if the spec forces exactly the answer the person gave.
+            ex = c['examples']
+            pattern = unsound_in(inside(root, ex))
+            if pattern:
+                put('UNSOUND_CONSTRUCT', '%s matches %s' % (ex, pattern))
+                continue
+            try:
+                r = subprocess.run([dafny, 'verify', inside(root, ex)], cwd=root, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, timeout=TIMEOUT_S, universal_newlines=True)
+            except subprocess.TimeoutExpired:
+                put('ERROR', 'dafny ran longer than %d s on %s' % (TIMEOUT_S, ex))
+                continue
+            if r.returncode != 0:
+                tail = '\n'.join(r.stdout.strip().split('\n')[-12:])
+                put('EXAMPLES_FAILED' if r.returncode == 4 else 'ERROR',
+                    'the spec does not force the answer you gave in %s (it says otherwise, or it '
+                    'allows more than one answer). dafny exit %d: %s' % (ex, r.returncode, tail))
+                continue
         try:
             r = subprocess.run([dafny, 'verify', '--verify-included-files'] + [inside(root, f) for f in c['files']],
                                cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -537,12 +573,14 @@ def show_specs(root):
     parts = ['=== which code is checked against which spec: %s (%s) ===\n%s'
              % (CONFIG, state(CONFIG), json.dumps(cfg, indent=2))]
     for c in cfg['checks']:
-        spec = c['spec']
-        if spec in hashes:
-            continue
-        hashes[spec] = sha256(inside(root, spec))
-        parts.append('=== %s: %s (%s, sha256 %s…) ===\n%s'
-                     % (c['name'], spec, state(spec), hashes[spec][:12], contract_of(inside(root, spec))))
+        for rel in contract_files(c):
+            if rel in hashes:
+                continue
+            hashes[rel] = sha256(inside(root, rel))
+            body = contract_of(inside(root, rel)) if rel == c['spec'] else read_text(inside(root, rel))
+            kind = 'spec' if rel == c['spec'] else 'your answers' if rel == c.get('examples') else 'decision record'
+            parts.append('=== %s %s: %s (%s, sha256 %s…) ===\n%s'
+                         % (c['name'], kind, rel, state(rel), hashes[rel][:12], body))
     return '\n\n'.join(parts), hashes
 
 
@@ -560,13 +598,30 @@ def main(argv=None):
     p.add_argument('--base', help='git ref; any change to forge.json, approved.json or a spec '
                                   'against it gives APPROVAL_CHANGED (for pull requests)')
     p.add_argument('--no-write', action='store_true', help='do not write ' + LAST)
+    p.add_argument('--hashes', help='approve: the hashes that `spec --json` printed; refused if any '
+                                    'file changed since')
     p.add_argument('--check', action='store_true', help='build: write nothing; the emitted code on '
                                                         'disk must equal a fresh build')
     a = p.parse_args(argv)
     root = os.path.abspath(a.root)
     try:
         if a.command == 'spec':
-            print(show_specs(root)[0])
+            text, hashes = show_specs(root)
+            print(json.dumps({'text': text, 'hashes': hashes}, ensure_ascii=False) if a.json else text)
+            return 0
+        if a.command == 'approve' and a.hashes:
+            try:
+                shown = json.loads(a.hashes)
+            except ValueError:
+                print('--hashes is not JSON', file=sys.stderr)
+                return 2
+            current = show_specs(root)[1]
+            if shown != current:
+                differ = sorted(k for k in set(shown) | set(current) if shown.get(k) != current.get(k))
+                print('changed since it was shown: %s. Read it again.' % ', '.join(differ))
+                return 1
+            write_json(root, APPROVED, current)
+            print('\n'.join('approved %s  sha256 %s…' % (k, h[:12]) for k, h in current.items()))
             return 0
         if a.command == 'approve':
             if not (sys.stdin.isatty() and sys.stdout.isatty()):

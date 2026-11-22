@@ -2,6 +2,18 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## 0.4.0 — 2026-11-22
+- Changed: `/forge` step 2 and `/forge add` are a conversation that starts from the person's own words
+  (before: Claude picked a function from the code and wrote the rule itself). Defaults to confirm, then
+  concrete A/B questions in rounds, then Dafny probes for cases that nobody asked about.
+- Added: a check can list `examples` (the person's answers as asserts against the abstract spec) and
+  `decisions` (a plain-text record). Approval covers both. New verdict `EXAMPLES_FAILED` when the spec
+  contradicts an answer or leaves it open.
+- Changed: the mod's `/forge approve` goes through the checker (`spec --json`, then
+  `approve --hashes`), so the mod and CI agree on what an approval covers.
+- Tested: 25 cases (7 new); `tsc` exit 0.
+- Not tested: the conversation itself with a person (it is a prompt to Claude, not code); Phase 0.
+
 ## 0.3.1 — 2026-11-22
 - Fixed: two TypeScript type errors in the mod, found by the first type-check (`tsc`, exit 0 after the fix).
 - Added: `CHANGELOG.md`, `SECURITY.md`, `CONTRIBUTING.md`, `TRIAL.md`.

@@ -16,7 +16,7 @@ type Api = any
 
 // binding: the implementation file must start with exactly this text (its include and
 // `module X refines Spec {` line), so it cannot switch to a weaker spec.
-type Check = { name: string; spec: string; files: string[]; binding?: { file: string; prefix: string }; build?: unknown }
+type Check = { name: string; spec: string; files: string[]; binding?: { file: string; prefix: string }; build?: unknown; examples?: string; decisions?: string }
 type Config = { version: 1; checks: Check[]; dafny?: string }
 type Verdict = string
 type LastCheck = { at: string; verdicts: Record<string, Verdict>; detail: Record<string, string> }
@@ -125,73 +125,45 @@ async function runBuild($: Api, isCheckOnly: boolean): Promise<string> {
   return (r.stdout || r.stderr).slice(0, 6000) || `The checker did not run (exit ${r.exitCode}). It needs python3.`
 }
 
-// Hashes shown to the person by `/forge approve`; `/forge approve yes` approves only these.
-let shown: Record<string, string> = {}
+// What `/forge approve` showed, as hashes; `/forge approve yes` approves exactly these.
+// Both steps go through cli/forge_check.py, so the mod and CI agree on what an approval covers
+// (forge.json, each spec, and the person's answers and decision record).
+let shown: string | undefined
 
-async function contractOf($: Api, path: string): Promise<string> {
-  const text: string = await $.fs.read(path)
-  const keep = text
-    .split('\n')
-    .filter(l => /^\s*(\/\/|requires\b|ensures\b|(ghost\s+)?(predicate|function|method)\b|datatype\b|\S.*::)/.test(l) || /^\s+\S/.test(l) && /ensures|requires/.test(l))
-    .map(l => l.replace(/\s+$/, ''))
-  return (keep.length > 80 ? [...keep.slice(0, 80), `… (${keep.length - 80} more lines in the file)`] : keep).join('\n')
-}
-
-async function showSpecs($: Api, onlyPending: boolean): Promise<{ text: string; specs: string[] }> {
+async function showSpecs($: Api): Promise<{ text: string; isOk: boolean }> {
   const root: string = await $.session.root()
-  const cfg = await readJson<Config>($, join(root, CONFIG))
-  if (!cfg?.checks?.length) return { text: 'No checks yet. Run /forge.', specs: [] }
-  const approved = (await readJson<Record<string, string>>($, join(root, APPROVED))) ?? {}
-  const parts: string[] = []
-  const specs: string[] = []
-  shown = {}
-  const cfgHash = await sha256($, join(root, CONFIG))
-  if (!cfgHash) return { text: `Cannot read ${CONFIG}.`, specs: [] }
-  shown[CONFIG] = cfgHash
-  if (!onlyPending || approved[CONFIG] !== cfgHash)
-    parts.push(`=== which code is checked against which spec: ${CONFIG} (${approved[CONFIG] === cfgHash ? 'approved' : approved[CONFIG] ? 'CHANGED since you approved it' : 'not approved yet'}) ===\n${JSON.stringify(cfg, null, 2)}`)
-  for (const c of cfg.checks) {
-    const h = await sha256($, join(root, c.spec))
-    if (!h) return { text: `Cannot read ${c.spec}.`, specs: [] }
-    shown[c.spec] = h
-    const state = approved[c.spec] === h ? 'approved' : approved[c.spec] ? 'CHANGED since you approved it' : 'not approved yet'
-    if (onlyPending && state === 'approved') continue
-    specs.push(c.spec)
-    parts.push(`=== ${c.name}: ${c.spec} (${state}, sha256 ${h.slice(0, 12)}…) ===\n${await contractOf($, join(root, c.spec))}`)
+  const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'spec', '--root', root, '--json'], {
+    cwd: root,
+    timeoutMs: 60_000,
+  })
+  try {
+    const out = JSON.parse(r.stdout) as { text: string; hashes: Record<string, string> }
+    shown = JSON.stringify(out.hashes)
+    return { text: out.text, isOk: true }
+  } catch {
+    shown = undefined
+    return { text: (r.stderr || r.stdout || `checker exit ${r.exitCode}`).trim(), isOk: false }
   }
-  return { text: parts.join('\n\n'), specs }
 }
 
 async function approve($: Api, isConfirmed: boolean): Promise<string> {
   const root: string = await $.session.root()
-  const cfg = await readJson<Config>($, join(root, CONFIG))
-  if (!cfg?.checks?.length) return 'Nothing to approve yet. Run /forge.'
   if (!isConfirmed) {
-    const { text, specs } = await showSpecs($, false)
-    if (specs.length)
-      void $.prompt.submit({
-        text: `${COACH}\nThe person typed /forge approve and is reading the contract of ${specs.join(', ')}. Explain it clause by clause in plain words, in a short table (clause | guarantee). Then list what the spec does NOT guarantee. Do not approve it yourself. End with: type /forge approve yes if this is what you want.`,
-      })
-    return `You are about to approve this contract. Claude will explain it in plain words below.\n\n${text}\n\nIf this is what you want: /forge approve yes`
+    const { text, isOk } = await showSpecs($)
+    if (!isOk) return text
+    void $.prompt.submit({
+      text: `${COACH}\nThe person typed /forge approve and is reading the contract: forge.json, each spec, and, where present, their own answers (examples) and decision record. Explain the spec clause by clause in plain words, in a short table (clause | guarantee). If there is a decision record, check that each answer in it appears in the examples file. Then list what is NOT guaranteed. Do not approve it yourself. End with: type /forge approve yes if this is what you want.`,
+    })
+    return `You are about to approve this. Claude will explain it in plain words below.\n\n${text}\n\nIf this is what you want: /forge approve yes`
   }
-  if (!Object.keys(shown).length) return 'Run /forge approve first to read the contract, then /forge approve yes.'
-  const approvedNow: Record<string, string> = {}
-  const rows: string[] = []
-  const cfgHash = await sha256($, join(root, CONFIG))
-  if (shown[CONFIG] !== cfgHash) return `${CONFIG} changed after you read it. Run /forge approve again.`
-  approvedNow[CONFIG] = cfgHash as string
-  rows.push(`approved ${CONFIG}  sha256 ${(cfgHash as string).slice(0, 12)}…`)
-  for (const c of cfg.checks) {
-    const h = await sha256($, join(root, c.spec))
-    if (!h) return `Cannot read ${c.spec}.`
-    if (shown[c.spec] !== h) return `${c.spec} changed after you read it. Run /forge approve again to read the new version.`
-    approvedNow[c.spec] = h
-    rows.push(`approved ${c.spec}  sha256 ${h.slice(0, 12)}…`)
-  }
-  shown = {}
-  await writeJson($, root, APPROVED, approvedNow)
+  if (!shown) return 'Run /forge approve first to read everything, then /forge approve yes.'
+  const r = await $.process.run(
+    ['python3', `${$.plugin.root}/cli/forge_check.py`, 'approve', '--root', root, '--hashes', shown],
+    { cwd: root, timeoutMs: 60_000 },
+  )
+  shown = undefined
   await refreshStatus($)
-  return rows.join('\n') + '\nNext: /forge check'
+  return r.exitCode === 0 ? `${r.stdout.trim()}\nNext: /forge check` : (r.stdout || r.stderr).trim()
 }
 
 const COACH = `You are guiding the person through Forge setup, one small step at a time. Use short sentences.
@@ -199,6 +171,49 @@ Forge rule: the person approves a short spec once; after that, code may change o
 Files: .forge/forge.json = {"version":1,"checks":[{"name":"<name>","spec":"<path to spec .dfy>","files":["<every .dfy file to verify>"]}]}.
 Keep the spec (requires/ensures, 10-30 lines) in an abstract module in its own file; the implementation in another file that starts with include "<spec>" and "module X refines SpecModule {". Put that exact start as "binding": {"file": "<impl>", "prefix": "<exact first lines>"} in the check. Never use assume, {:verify false}, {:axiom} or {:extern}.
 Never write .forge/approved.json and never run /forge approve yourself: approval is the person's act.`
+
+// The /forge add conversation. The rule must start from the person's words, not from Claude's
+// reading of the code; every answer becomes a Dafny-checked example and a line in a decision record.
+function interview(dafny: string | undefined, root: string): string {
+  return `${COACH}
+You are running the Forge rule conversation in ${root}. Follow these steps in order. Short sentences.
+
+1. ASK FIRST. Ask the person to say, in their own words, one rule their software must never break.
+   Do not suggest a rule and do not read the code before they answer. Only if they say they do not
+   know, look at the code and offer up to three candidates, and let them pick or rephrase.
+2. CLASSIFY and say it plainly:
+   - pure rule (limits, prices, permissions, state changes, parsing): can be PROVED in a Dafny model;
+   - rule mixed with I/O (database, network, time): split the rule out; only the rule is proved;
+   - taste or judgment (UI, ML output, "good"): cannot be proved; say so, suggest tests or review, stop.
+3. READ the code where this rule lives now (if any), so your questions use their real names and units.
+4. DEFAULTS. Show a short checklist of fail-closed defaults (money in whole integer units; invalid input
+   rejected with no change; time passed in as a value; no floats) and ask them to confirm or change.
+5. QUESTIONS. Ask only real choices where both answers are sensible, always with concrete numbers
+   ("cap $50.00, spent $40.00, spend $20.00: reject, or cut to $10.00?"). Use AskUserQuestion, at most
+   4 questions per call, as many rounds as needed. No fixed number of questions. Cover: zero and
+   negative values, exactly at each limit, one past each limit, units, which error wins when two apply,
+   repeats and retries, ordering in time. Stop only when nothing is open.
+6. WRITE three files and keep them consistent:
+   a. spec/<Name>Spec.dfy: an abstract module with requires/ensures that captures every answer.
+   b. spec/<Name>Examples.dfy: starts with include "<Name>Spec.dfy"; an abstract module with
+      "import S : <Name>Spec"; one method per decision, named D1_..., D2_..., with a comment holding the
+      concrete question, that calls S.<Method>(...) on the concrete values and asserts the answer given.
+   c. .forge/decisions/<check-name>.md: the rule in their exact words; confirmed defaults; a table
+      Id | Question | Answer; and "Out of scope (not guaranteed)".
+7. PROBE for gaps the questions missed. For a few other inputs (boundaries, zero, maximum values), write a
+   temporary Dafny file OUTSIDE the project (in a temp folder) that includes the spec and asserts one
+   outcome, then another file asserting the other outcome. If neither verifies, the spec leaves that case
+   open: ask the person as a new question, add it as a new D-method and decision, update the spec.
+   Dafny: ${dafny ?? 'not found; ask the person to install it first'}.
+8. CHECK before handing over: run dafny verify on the examples file; it must pass (exit 0). If it fails,
+   the spec contradicts or leaves open one of their answers: fix the spec, never the answer, unless the
+   person changes their answer.
+9. IMPLEMENT the rule in impl/<Name>.dfy: starts with include "../spec/<Name>Spec.dfy", a blank line,
+   then "module <Name> refines <Name>Spec {". Add the check to .forge/forge.json with "examples",
+   "decisions" and "binding" (file and that exact first-lines prefix).
+10. HAND OVER: list the decisions in a short table, name what is out of scope, and tell the person to
+   type /forge approve to read everything, then /forge approve yes. Never approve for them.`
+}
 
 async function wizard($: Api): Promise<{ text: string; prompt?: string }> {
   const root: string = await $.session.root()
@@ -214,13 +229,13 @@ async function wizard($: Api): Promise<{ text: string; prompt?: string }> {
     }
   if (!cfg?.checks?.length)
     return {
-      text: 'Forge · step 2 of 5: pick one small, critical function to protect. Claude will help you choose.',
-      prompt: `${COACH}\nStep 2 of 5: no .forge/forge.json in ${root}. Look at this project briefly and suggest up to three small, critical functions (money, limits, permissions, parsing of untrusted input). Ask the person to pick one with AskUserQuestion. Then write the spec file, a Dafny implementation, and .forge/forge.json. Show the spec to the person in plain words (what it guarantees, what it does not). Tell them the next step is to type /forge approve, which shows the contract; they approve with /forge approve yes.`,
+      text: 'Forge · step 2 of 5: tell Claude, in your own words, one rule your software must never break. Claude will ask about the edge cases.',
+      prompt: interview(dafny, root),
     }
-  const unapproved = cfg.checks.filter(c => !approved[c.spec])
+  const unapproved = cfg.checks.filter(c => [c.spec, c.examples, c.decisions].some(f => f && !approved[f]))
   if (unapproved.length || !approved[CONFIG])
     return {
-      text: `Forge · step 3 of 5: read and approve the spec (${unapproved.map(c => c.spec).join(', ')}). When it says what you want, type /forge approve yes.`,
+      text: `Forge · step 3 of 5: type /forge approve to read the spec and your answers (${unapproved.map(c => c.name).join(', ')}); then /forge approve yes if they say what you want.`,
       prompt: `${COACH}\nStep 3 of 5: explain the spec file(s) ${unapproved.map(c => c.spec).join(', ')} in plain words, clause by clause, and name one thing the spec does NOT guarantee. Do not approve it yourself. End by telling the person to type /forge approve yes if they agree.`,
     }
   if (!last || isStale)
@@ -294,10 +309,11 @@ export const register: Register = on => {
     }
     if (arg === 'approve') return { text: await approve($, /^approve\s+yes\b/.test(e.args.trim())) }
     if (arg === 'spec') {
-      const { text, specs } = await showSpecs($, false)
-      if (specs.length)
+      const { text, isOk } = await showSpecs($)
+      shown = undefined
+      if (isOk)
         void $.prompt.submit({
-          text: `${COACH}\nThe person typed /forge spec. Explain the contract of ${specs.join(', ')} clause by clause in plain words, in a short table (clause | guarantee), then what it does NOT guarantee.`,
+          text: `${COACH}\nThe person typed /forge spec. Explain each contract shown above clause by clause in plain words, in a short table (clause | guarantee), then what it does NOT guarantee.`,
         })
       return { text }
     }
@@ -307,10 +323,10 @@ export const register: Register = on => {
       return { text: last ? `${summary(last, 0)}\nlast run ${last.at}\n${JSON.stringify(last.verdicts, null, 2)}` : 'No check has run yet. Try /forge.' }
     }
     if (arg === 'add') {
-      void $.prompt.submit({
-        text: `${COACH}\nThe person wants to add one more check to .forge/forge.json. Suggest candidates, ask which with AskUserQuestion, write spec + implementation, add the entry, then tell them to run /forge approve to read the contract.`,
-      })
-      return { text: 'Forge · adding a check. Claude will help you pick the next function.' }
+      const root: string = await $.session.root()
+      const cfg = await readJson<Config>($, join(root, CONFIG))
+      void $.prompt.submit({ text: interview(await findDafny($, root, cfg?.dafny), root) })
+      return { text: 'Forge · new rule. Tell Claude, in your own words, one rule your software must never break.' }
     }
     const step = await wizard($)
     if (step.prompt) void $.prompt.submit({ text: step.prompt })
