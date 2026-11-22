@@ -13,15 +13,25 @@ jobs:
       - uses: dafny-lang/setup-dafny-action@be023fc606339d46ed6b077dcb8614d0279ded31 # v1.9.1
         with:
           dafny-version: "4.11.0"
-      - run: python3 tests/run_tests.py
+      # After the Dafny setup, which installs Node 16 for itself: TypeScript needs Node 22.18 or newer.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: node --version && python3 tests/run_tests.py
   action-on-example:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
       - uses: ./
         with:
           root: examples/wallet-cap
           build: "true"
+          # The example's approvals change in this repository's own pull requests; the APPROVAL_CHANGED gate
+          # has its own test cases in checker-tests.
+          base: none
   all-targets:
     # Fuzz and emit the example in all six targets on Linux.
     runs-on: ubuntu-latest

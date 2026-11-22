@@ -2,6 +2,31 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## Unreleased (branch `wip/diff-fuzz`)
+- Added: the differential fuzz: the person's real code (the shipped function, the wrapper) against the compiled
+  proved rule on fresh inputs. One language-neutral core (`cli/forge_diff.py`): seeds, the person's recorded
+  decisions as fixed inputs, replay of saved cases, shrinking that keeps the failure signature fixed (no sliding
+  into another bug), one saved case per kind of failure under `.forge/regressions/`, a 2-second limit per call
+  (hangs are reported), running totals since the last new failure (`.forge/diff-stats.json`). Each language only
+  needs an evaluator that speaks a line protocol: shipped for JavaScript/TypeScript and Python; any other language
+  as a `"cmd"` entry. Inputs are one Python file per rule, shared by every language.
+- Added: automatic run at the end of each Claude turn in which a watched file changed (by modification time, so
+  shell and editor edits count); `/forge add` sets the fuzz up when the rule already exists in code; `/forge fuzz`
+  sets it up for other rules or does a deep run; `/forge diff` is the quick run; `/forge build` without a set-up
+  puts the set-up command in the prompt box.
+- Added: integers above 2^53 cross the line protocol exactly (the JavaScript evaluator reads them as BigInt and
+  writes BigInt and bignumber.js values with all their digits; plain JSON.parse would round 2^63 - 1). The example
+  inputs now include values near 2^53 and 2^63; the fuzz found, unplanted, that the shipped TypeScript function
+  (plain numbers) computes a wrong balance above 2^53.
+- Tested: 41 cases (13 new). On the example: the planted bugs in the shipped Python function (exact cap rejected,
+  zero accepted, negative accepted) and in the shipped TypeScript function are found through the decisions and the
+  random search; the wrapper agrees; fixing the shipped code makes every decision agree; an outdated build is
+  detected; a `"cmd"` evaluator works through the protocol alone; a hanging function is reported within seconds.
+  A run takes under a second for both languages. Headless Claude Code sessions (before the core refactor):
+  `/forge diff`, an Edit-tool edit and a shell edit each trigger the automatic run; a turn without change does not.
+- Not tested: a real project (chronicle is next); evaluators for Go, Rust, Java and C#; TypeScript syntax Node
+  cannot strip; Windows (the core uses `select` on pipes, which Windows does not support for pipes).
+
 ## 0.7.2 — 2026-11-22
 - Fixed (regression in 0.7.1): the hint commands `commands/approve.md`, `check.md`, `build.md`, `status.md`
   shadowed the fixed steps: in a headless session `/forge approve yes` printed the hint instead of approving.

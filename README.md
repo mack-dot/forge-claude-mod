@@ -44,6 +44,7 @@ conversation with Claude; commands with a **space** (`/forge approve`) run a fix
 | Read it | `/forge:explain` | Claude explains every clause in plain words, checks that each of your answers is covered, and lists what is not guaranteed. |
 | Approve it | `/forge approve`, then `/forge approve yes` | Shows exactly what you approve (spec, your answers, decision record, `forge.json`); "yes" approves exactly that, even after a restart. Typing "yes" first only shows it. If a file changed in between, it shows the new version instead. Only you can do this. |
 | Prove it | `/forge check` | Your answers are checked against the spec (`EXAMPLES_FAILED` if the spec says otherwise or leaves one open), then the code against the spec. The status line shows `forge ✓ VERIFIED n/n` or what failed. |
+| Find bugs in your real code | automatic (set up by `/forge add` when the rule already exists in your code), or `/forge fuzz` | Runs your shipped code and the proved rule on fresh random inputs at the end of each turn that changed them (about a second), saves each disagreement as a small repeatable case. `/forge fuzz` on its own is a deep run. See **Fuzz** below. |
 | Measure it | `/forge mutate` | Plants up to 30 small bugs in the proved code, one at a time in a temporary copy, and counts how many the proof catches. A survivor is a change your spec allows: harmless, or a gap in the spec. Changes nothing. |
 | Something failed | `/forge:fix` | Claude explains the verdict and proposes a fix to the code; it never weakens the spec without your word. |
 | Use it in your app | `/forge:build-setup`, then `/forge build` | Compiles the proved code to your languages (`py`, `js`, `go`, `java`, `cs`, `rs`), fuzzes the compiled code in every language (identical output required), and checks that your app imports it. |
@@ -103,6 +104,45 @@ Tools per target: `py` python3; `js` node and npm (bignumber.js is fetched once 
 Honest labels: the Dafny model is PROVED. The emitted code is a NATIVE CHECK, because Dafny's compilers are
 not verified. The fuzz run is a FINITE TEST. The wrapper that your app writes around the emitted code is
 ordinary unproved code, so keep it thin. `examples/wallet-cap` shows all of it, with `app.py` as the app.
+
+## Fuzz: your real code against the proved rule
+
+A proof shows that the Dafny model is right. Your app may still run its own, older version of the rule. The
+differential fuzz runs your **real code** (the shipped function, and the wrapper around the proved code) and the
+compiled proved rule on the same fresh inputs, and reports every input where they disagree:
+
+```
+✗ wallet-cap:py: 3 failing decision(s), 0 other disagreement(s) in 1500 random inputs (225 ms)
+  your recorded decisions: 1 of 4 agree; failing: D1 exact cap allowed (legacy), D3 zero rejected (legacy), D4 negative rejected (legacy)
+  searched so far: 3,000 inputs in 2 runs; nothing new for 1 run
+```
+
+Each disagreement is a bug in that code, or a place where your spec says something other than what you meant.
+
+- **Turned on for you:** when the rule already exists in your code, `/forge add` sets the fuzz up next to the spec.
+  For other rules: `/forge fuzz <function>`. After that it runs by itself at the end of every Claude turn in
+  which a watched file changed (by any means: Claude's edits, a shell command, your editor): about 1,500 fresh
+  inputs per language, under a second on the example, result in the status line. A turn without a change runs
+  nothing. `/forge fuzz` again is a deep run (50,000 inputs); `/forge diff` is the quick run on demand.
+- **Your decisions, always:** every decision recorded in `/forge add` runs as a fixed input on every run.
+- **How much it has searched:** inputs and runs so far, and since the last new failure. A long stretch with
+  nothing new is evidence, not proof, that the easy bugs are gone.
+- **Smallest cases, kept:** each disagreement is shrunk to a small input that fails the same way, saved under
+  `.forge/regressions/`, and replayed first next time. Commit them: they are your new tests.
+- **Hangs:** a function that does not answer within 2 seconds is reported, not waited on.
+- **Big integers:** values above 2^53 reach JavaScript and TypeScript code exactly (as BigInt); on the example the
+  fuzz found that the shipped TypeScript code, which uses plain numbers, gets the balance wrong above 2^53.
+
+**Any language.** One Python core does the search: seeds, your decisions, shrinking, saved cases. Each language
+only needs an evaluator: a process that reads one input per line (`{"input": …}`) and prints the proved rule's
+answer and the code's answer (`{"reference": …, "candidates": {"name": …}}`), after a first line naming the
+candidates. Forge ships evaluators for JavaScript/TypeScript (Node 22.18+ imports `.ts` directly) and Python.
+For Go, Rust, Java or C#, `/forge fuzz` has Claude write that small program; such an entry is
+`{"lang": "cmd", "run": [program, args…]}`. The inputs (`diff/<check>_inputs.py`) are shared by every language.
+Evaluators for Go, Rust, Java and C# are not tested yet.
+
+Labels: the inputs, the evaluators and the core are test code (not proved); a run is a FINITE TEST. It compares
+returned values only; side effects of the code under test are not checked.
 
 ## Use it in CI (GitHub Action)
 

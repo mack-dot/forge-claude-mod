@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLI = os.path.join(HERE, '..', 'cli', 'forge_check.py')
@@ -300,6 +301,102 @@ def main():
                   '' if unchanged else ' (PROJECT CHANGED)'))
             if not ok:
                 print('      ' + (r.stderr or r.stdout)[-400:])
+    # differential fuzz: shipped code and wrapper against the compiled proved rule
+    def diff(root, *extra_args):
+        r = subprocess.run([sys.executable, CLI, 'diff', '--root', root, '--json', '--seed', '7'] + list(extra_args),  # writes stats
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        try:
+            return r.returncode, json.loads(r.stdout)['checks']
+        except (ValueError, KeyError):
+            return r.returncode, {'error': (r.stderr or r.stdout)[-300:]}
+
+    def fix_legacy(root):
+        open(os.path.join(root, 'legacy_wallet.py'), 'w').write(
+            'def legacy_spend(cap, spent, amount):\n'
+            '    if 0 < amount and spent + amount <= cap:\n        return True, spent + amount\n    return False, spent\n')
+        open(os.path.join(root, 'legacy_wallet.ts'), 'w').write(
+            'export function legacySpend(cap: number, spent: number, amount: number) {\n'
+            '  if (0 < amount && spent + amount <= cap) return { ok: true, spent: spent + amount }\n'
+            '  return { ok: false, spent }\n}\n')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, 'p')
+        shutil.copytree(EXAMPLE, root)
+        code, res = diff(root)
+        py, js = res.get('wallet-cap:py', {}), res.get('wallet-cap:js', {})
+        kinds_py = sorted({json.dumps(d['reference']['ok']) + '>' + json.dumps(d['got']['ok']) for d in py.get('disagreements', [])})
+        failing_py = sorted(f['id'][:2] for f in (py.get('decisions') or {}).get('failing', []))
+        failing_js = sorted(f['id'][:2] for f in (js.get('decisions') or {}).get('failing', []))
+        cases = [
+            ('diff: shipped Python bugs found (exact cap, zero, negative)', code == 1 and py.get('verdict') == 'DISAGREE'
+             and failing_py == ['D1', 'D3', 'D4']),
+            ('diff: the wrapper agrees with the proved rule', (py.get('per_candidate') or {}).get('app-wrapper') == 0),
+            ('diff: shipped TypeScript bugs found (zero, negative)', js.get('verdict') == 'DISAGREE'
+             and failing_js == ['D3', 'D4']),
+            ('diff: each run under 2 seconds', py.get('ms', 9999) < 2000 and js.get('ms', 9999) < 2000),
+            ('diff: random search adds no duplicate of a failing decision', len(py.get('disagreements', [])) == 0),
+            ('diff: recorded decisions run as fixed inputs (legacy fails D1, D3, D4; the wrapper agrees)',
+             (py.get('decisions') or {}).get('total') == 4
+             and sorted(f['id'][:2] for f in (py.get('decisions') or {}).get('failing', [])) == ['D1', 'D3', 'D4']
+             and all(f['candidates'] == ['legacy'] for f in (py.get('decisions') or {}).get('failing', []))),
+        ]
+        fix_legacy(root)
+        code2, res2 = diff(root, '--inputs', '0')
+        js2 = res2.get('wallet-cap:js', {})
+        cases.append(('diff: after the shipped code is fixed, every decision agrees',
+                      all(r['decisions']['agree'] == 4 for r in res2.values())
+                      and res2.get('wallet-cap:py', {}).get('verdict') == 'DIFF_OK'))
+        # The "fixed" TypeScript still uses plain numbers: above 2^53 it loses precision, and the fuzz keeps saying so.
+        code_big, res_big = diff(root, '--inputs', '3000')
+        jsb = res_big.get('wallet-cap:js', {})
+        cases.append(('diff: finds the precision loss above 2^53 in TypeScript number code',
+                      any(d['input']['cap'] > 2 ** 53 for d in jsb.get('disagreements', []))))
+        edit(root, IMPL, 's.spent + amount <= s.cap {', 's.spent + amount <= s.cap && true {')
+        code3, res3 = diff(root)
+        cases.append(('diff: an outdated build is detected', code3 == 1 and all(r.get('verdict') == 'BUILD_STALE' for r in res3.values())))
+        stats = json.load(open(os.path.join(root, '.forge/diff-stats.json')))
+        # big integers cross the line protocol exactly (JSON.parse alone would round 2^63 - 1)
+        modules = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'), 'forge-check', 'js', 'node_modules')
+        p = subprocess.Popen(['node', os.path.join(HERE, '..', 'cli', 'eval', 'node_eval.mjs'), os.path.join(root, 'diff/wallet_diff.mjs')],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                             env=dict(os.environ, NODE_PATH=modules), cwd=root)
+        out, err = p.communicate(json.dumps({'input': {'cap': 2 ** 63 - 1, 'spent': 2 ** 63 - 2, 'amount': 1}}) + '\n', timeout=60)
+        lines = [json.loads(l) for l in out.strip().split('\n')]
+        exact = lines[1]['reference'] == {'ok': True, 'spent': 2 ** 63 - 1}
+        rounded = lines[1]['candidates']['legacy-ts']['spent'] != 2 ** 63 - 1  # the shipped code uses plain numbers
+        cases.append(('diff: integers above 2^53 cross the protocol exactly', exact and rounded))
+        # any language through "cmd": here the Python evaluator, named as a plain program
+        cfg = json.load(open(os.path.join(root, CONFIG)))
+        cfg['checks'][0]['diff'] = [{'name': 'any', 'lang': 'cmd', 'inputs': 'diff/wallet_inputs.py',
+                                     'run': [sys.executable, os.path.join(HERE, '..', 'cli', 'eval', 'py_eval.py'),
+                                             'diff/wallet_diff.py']}]
+        json.dump(cfg, open(os.path.join(root, CONFIG), 'w'))
+        shutil.rmtree(os.path.join(root, 'verified'), ignore_errors=True)
+        shutil.copytree(os.path.join(EXAMPLE, 'verified'), os.path.join(root, 'verified'))
+        edit(root, IMPL, 's.spent + amount <= s.cap && true {', 's.spent + amount <= s.cap {')
+        code4, res4 = diff(root)
+        cmd_res = res4.get('wallet-cap', {})
+        cases.append(('diff: any language through a "cmd" evaluator (protocol only)',
+                      cmd_res.get('verdict') == 'DIFF_OK' and cmd_res.get('decisions', {}).get('agree') == 4))
+        # a hanging function is reported, not waited on
+        open(os.path.join(root, 'diff/wallet_diff.py'), 'a').write(
+            "\ndef _hang(i):\n    while True:\n        pass\n\ncandidates['hangs'] = _hang\n")
+        t0 = time.time()
+        code5, res5 = diff(root)
+        cases.append(('diff: a hanging function is reported within seconds',
+                      res5.get('wallet-cap', {}).get('verdict') == 'DIFF_ERROR'
+                      and 'no answer within' in res5['wallet-cap'].get('error', '') and time.time() - t0 < 30))
+        cases.append(('diff: search totals kept across runs (saturation)',
+                      stats.get('wallet-cap:py', {}).get('runs') == 3 and stats['wallet-cap:py']['runs_since_new'] == 2
+                      and stats['wallet-cap:py']['failing_decisions'] == []
+                      and stats['wallet-cap:py']['inputs'] >= 1500))
+        for name, ok in cases:
+            failed += not ok
+            extra += 1
+            print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
+            if not ok:
+                print('      ' + json.dumps({k: {kk: v.get(kk) for kk in ('verdict', 'per_candidate', 'ms', 'error')} if isinstance(v, dict) else v
+                                             for k, v in res.items()})[:500])
     print('%d cases, %d failed' % (len(CASES) + len(BUILD_CASES) + extra, failed))
     return 1 if failed else 0
 
