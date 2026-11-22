@@ -257,8 +257,18 @@ export const register: Register = on => {
       const last = await readJson<LastCheck>($, join(root, LAST))
       return { text: last ? `${summary(last, 0)}\nlast run ${last.at}\n${JSON.stringify(last.verdicts, null, 2)}` : 'No check has run yet. Try /forge.' }
     }
-    const moved: Record<string, string> = { scan: '/forge:scan', add: '/forge:add <the rule in your own words>', explain: '/forge:explain', fix: '/forge:fix', doctor: '/forge:doctor' }
-    if (moved[arg]) return { text: `Type ${moved[arg]} (Claude runs it as a conversation).` }
+    // Steps where Claude talks with the person are Markdown commands (/forge:scan …). A command.run hook
+    // cannot start a Claude turn, so put the right command in the prompt box: the person presses Enter.
+    const moved = ['scan', 'add', 'explain', 'fix', 'doctor', 'build-setup']
+    if (moved.includes(arg)) {
+      const rest = e.args.trim().slice(arg.length).trim()
+      const line = `/forge:${arg}${rest ? ' ' + rest : ' '}`
+      const isFilled = await $.prompt.fill({ text: line }).then(
+        () => true,
+        () => false,
+      )
+      return { text: isFilled ? `Press Enter to run ${line.trim()}.` : `Type ${line.trim()} (Claude runs it as a conversation).` }
+    }
     return { text: await wizard($) }
   })
 

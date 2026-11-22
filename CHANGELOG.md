@@ -2,6 +2,12 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## 0.6.1 — 2026-11-22
+- Changed: typing `/forge scan` (with a space, as earlier versions said) now puts `/forge:scan` into the prompt
+  box, so the person presses Enter. The same for `add`, `explain`, `fix`, `doctor`, `build-setup`.
+- Not tested: the prompt-box fill in an interactive session (headless sessions have no prompt box); if the
+  fill fails, the message tells the person to type the command.
+
 ## 0.6.0 — 2026-11-22
 - Fixed: every step where Claude was meant to talk with the person never started. The mod handed its
   instructions to Claude with `$.prompt.submit` from inside the `/forge` command, and Claude Code refuses
