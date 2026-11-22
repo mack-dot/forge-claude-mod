@@ -14,9 +14,11 @@ import type { Register } from 'claude-code'
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Api = any
 
-type Check = { name: string; spec: string; files: string[] }
+// binding: the implementation file must start with exactly this text (its include and
+// `module X refines Spec {` line), so it cannot switch to a weaker spec.
+type Check = { name: string; spec: string; files: string[]; binding?: { file: string; prefix: string } }
 type Config = { version: 1; checks: Check[]; dafny?: string }
-type Verdict = 'VERIFIED' | 'FAILED' | 'NOT_APPROVED' | 'SPEC_CHANGED' | 'ERROR'
+type Verdict = 'VERIFIED' | 'FAILED' | 'NOT_APPROVED' | 'SPEC_CHANGED' | 'CONFIG_CHANGED' | 'BINDING_BROKEN' | 'UNSOUND_CONSTRUCT' | 'ERROR'
 type LastCheck = { at: string; verdicts: Record<string, Verdict>; detail: Record<string, string> }
 
 const DIR = '.forge'
@@ -47,6 +49,16 @@ async function sha256($: Api, path: string): Promise<string | undefined> {
   return r.exitCode === 0 ? r.stdout.split(/\s+/)[0] : undefined
 }
 
+// Constructs that make Dafny accept a claim without proof. A text scan, not a parser.
+const UNSOUND = [/\bassume\b/, /\{:\s*verify\s+false/, /\{:\s*axiom/, /\{:\s*extern/, /\{:\s*only/]
+
+async function unsoundIn($: Api, path: string): Promise<string | undefined> {
+  const text: string = await $.fs.read(path)
+  const code = text.replace(/\/\/[^\n]*/g, '')
+  const hit = UNSOUND.find(r => r.test(code))
+  return hit ? String(hit) : undefined
+}
+
 async function findDafny($: Api, root: string, configured?: string): Promise<string | undefined> {
   // The "dafny" path in .forge/forge.json, else Dafny on PATH, else FORGE_DAFNY.
   if (configured) {
@@ -64,6 +76,7 @@ async function findDafny($: Api, root: string, configured?: string): Promise<str
 function summary(last: LastCheck | undefined, total: number): string {
   if (!last) return total ? 'forge: not checked yet · /forge check' : 'forge: not set up · /forge'
   const vs = Object.entries(last.verdicts)
+  if (!vs.length) return 'forge: no checks · /forge'
   const ok = vs.filter(([, v]) => v === 'VERIFIED').length
   const bad = vs.find(([, v]) => v !== 'VERIFIED')
   if (!bad) return `forge ✓ VERIFIED ${ok}/${vs.length}`
@@ -87,6 +100,8 @@ async function runChecks($: Api): Promise<string> {
   const dafny = await findDafny($, root, cfg.dafny)
   if (!dafny) return 'Dafny was not found. Run /forge and Claude will help you install it.'
   const approved = (await readJson<Record<string, string>>($, join(root, APPROVED))) ?? {}
+  const cfgHash = await sha256($, join(root, CONFIG))
+  const isConfigApproved = !!approved[CONFIG] && approved[CONFIG] === cfgHash
 
   isChecking = true
   await refreshStatus($)
@@ -94,14 +109,37 @@ async function runChecks($: Api): Promise<string> {
   try {
     for (const c of cfg.checks) {
       const hash = await sha256($, join(root, c.spec))
+      if (!isConfigApproved) {
+        last.verdicts[c.name] = 'CONFIG_CHANGED'
+        last.detail[c.name] = `${CONFIG} is not approved as it is now (a check, spec path, file list or binding changed). Run /forge approve to read it.`
+        continue
+      }
       if (!approved[c.spec]) {
         last.verdicts[c.name] = 'NOT_APPROVED'
-        last.detail[c.name] = `${c.spec} is not approved. Read it, then run /forge approve.`
+        last.detail[c.name] = `${c.spec} is not approved. Run /forge approve to read it.`
         continue
       }
       if (hash !== approved[c.spec]) {
         last.verdicts[c.name] = 'SPEC_CHANGED'
-        last.detail[c.name] = `${c.spec} changed after you approved it. Review the change, then /forge approve.`
+        last.detail[c.name] = `${c.spec} changed after you approved it. Run /forge approve to read the new version.`
+        continue
+      }
+      if (c.binding) {
+        const impl: string = await $.fs.read(join(root, c.binding.file)).catch(() => '')
+        if (!impl.startsWith(c.binding.prefix)) {
+          last.verdicts[c.name] = 'BINDING_BROKEN'
+          last.detail[c.name] = `${c.binding.file} no longer starts with the approved include and refines line, so it may not be checked against ${c.spec}.`
+          continue
+        }
+      }
+      let unsound: string | undefined
+      for (const f of c.files) {
+        const hit = await unsoundIn($, join(root, f)).catch(() => undefined)
+        if (hit) { unsound = `${f}: ${hit}`; break }
+      }
+      if (unsound) {
+        last.verdicts[c.name] = 'UNSOUND_CONSTRUCT'
+        last.detail[c.name] = `${unsound} lets Dafny accept a claim without proof. Remove it.`
         continue
       }
       const r = await $.process.run([dafny, 'verify', ...c.files.map(f => join(root, f))], {
@@ -126,19 +164,71 @@ async function runChecks($: Api): Promise<string> {
   return [summary(last, cfg.checks.length), ...lines, ...fails].join('\n')
 }
 
-async function approve($: Api): Promise<string> {
+// Hashes shown to the person by `/forge approve`; `/forge approve yes` approves only these.
+let shown: Record<string, string> = {}
+
+async function contractOf($: Api, path: string): Promise<string> {
+  const text: string = await $.fs.read(path)
+  const keep = text
+    .split('\n')
+    .filter(l => /^\s*(\/\/|requires\b|ensures\b|(ghost\s+)?(predicate|function|method)\b|datatype\b|\S.*::)/.test(l) || /^\s+\S/.test(l) && /ensures|requires/.test(l))
+    .map(l => l.replace(/\s+$/, ''))
+  return (keep.length > 80 ? [...keep.slice(0, 80), `… (${keep.length - 80} more lines in the file)`] : keep).join('\n')
+}
+
+async function showSpecs($: Api, onlyPending: boolean): Promise<{ text: string; specs: string[] }> {
+  const root: string = await $.session.root()
+  const cfg = await readJson<Config>($, join(root, CONFIG))
+  if (!cfg?.checks?.length) return { text: 'No checks yet. Run /forge.', specs: [] }
+  const approved = (await readJson<Record<string, string>>($, join(root, APPROVED))) ?? {}
+  const parts: string[] = []
+  const specs: string[] = []
+  shown = {}
+  const cfgHash = await sha256($, join(root, CONFIG))
+  if (!cfgHash) return { text: `Cannot read ${CONFIG}.`, specs: [] }
+  shown[CONFIG] = cfgHash
+  if (!onlyPending || approved[CONFIG] !== cfgHash)
+    parts.push(`=== which code is checked against which spec: ${CONFIG} (${approved[CONFIG] === cfgHash ? 'approved' : approved[CONFIG] ? 'CHANGED since you approved it' : 'not approved yet'}) ===\n${JSON.stringify(cfg, null, 2)}`)
+  for (const c of cfg.checks) {
+    const h = await sha256($, join(root, c.spec))
+    if (!h) return { text: `Cannot read ${c.spec}.`, specs: [] }
+    shown[c.spec] = h
+    const state = approved[c.spec] === h ? 'approved' : approved[c.spec] ? 'CHANGED since you approved it' : 'not approved yet'
+    if (onlyPending && state === 'approved') continue
+    specs.push(c.spec)
+    parts.push(`=== ${c.name}: ${c.spec} (${state}, sha256 ${h.slice(0, 12)}…) ===\n${await contractOf($, join(root, c.spec))}`)
+  }
+  return { text: parts.join('\n\n'), specs }
+}
+
+async function approve($: Api, isConfirmed: boolean): Promise<string> {
   const root: string = await $.session.root()
   const cfg = await readJson<Config>($, join(root, CONFIG))
   if (!cfg?.checks?.length) return 'Nothing to approve yet. Run /forge.'
-  const approved: Record<string, string> = {}
+  if (!isConfirmed) {
+    const { text, specs } = await showSpecs($, false)
+    if (specs.length)
+      void $.prompt.submit({
+        text: `${COACH}\nThe person typed /forge approve and is reading the contract of ${specs.join(', ')}. Explain it clause by clause in plain words, in a short table (clause | guarantee). Then list what the spec does NOT guarantee. Do not approve it yourself. End with: type /forge approve yes if this is what you want.`,
+      })
+    return `You are about to approve this contract. Claude will explain it in plain words below.\n\n${text}\n\nIf this is what you want: /forge approve yes`
+  }
+  if (!Object.keys(shown).length) return 'Run /forge approve first to read the contract, then /forge approve yes.'
+  const approvedNow: Record<string, string> = {}
   const rows: string[] = []
+  const cfgHash = await sha256($, join(root, CONFIG))
+  if (shown[CONFIG] !== cfgHash) return `${CONFIG} changed after you read it. Run /forge approve again.`
+  approvedNow[CONFIG] = cfgHash as string
+  rows.push(`approved ${CONFIG}  sha256 ${(cfgHash as string).slice(0, 12)}…`)
   for (const c of cfg.checks) {
     const h = await sha256($, join(root, c.spec))
     if (!h) return `Cannot read ${c.spec}.`
-    approved[c.spec] = h
+    if (shown[c.spec] !== h) return `${c.spec} changed after you read it. Run /forge approve again to read the new version.`
+    approvedNow[c.spec] = h
     rows.push(`approved ${c.spec}  sha256 ${h.slice(0, 12)}…`)
   }
-  await writeJson($, root, APPROVED, approved)
+  shown = {}
+  await writeJson($, root, APPROVED, approvedNow)
   await refreshStatus($)
   return rows.join('\n') + '\nNext: /forge check'
 }
@@ -146,7 +236,7 @@ async function approve($: Api): Promise<string> {
 const COACH = `You are guiding the person through Forge setup, one small step at a time. Use short sentences.
 Forge rule: the person approves a short spec once; after that, code may change only if Dafny proves it still meets the spec.
 Files: .forge/forge.json = {"version":1,"checks":[{"name":"<name>","spec":"<path to spec .dfy>","files":["<every .dfy file to verify>"]}]}.
-Keep the spec (requires/ensures, 10-30 lines) in its own file; the implementation in another file that includes it.
+Keep the spec (requires/ensures, 10-30 lines) in an abstract module in its own file; the implementation in another file that starts with include "<spec>" and "module X refines SpecModule {". Put that exact start as "binding": {"file": "<impl>", "prefix": "<exact first lines>"} in the check. Never use assume, {:verify false}, {:axiom} or {:extern}.
 Never write .forge/approved.json and never run /forge approve yourself: approval is the person's act.`
 
 async function wizard($: Api): Promise<{ text: string; prompt?: string }> {
@@ -164,13 +254,13 @@ async function wizard($: Api): Promise<{ text: string; prompt?: string }> {
   if (!cfg?.checks?.length)
     return {
       text: 'Forge · step 2 of 5: pick one small, critical function to protect. Claude will help you choose.',
-      prompt: `${COACH}\nStep 2 of 5: no .forge/forge.json in ${root}. Look at this project briefly and suggest up to three small, critical functions (money, limits, permissions, parsing of untrusted input). Ask the person to pick one with AskUserQuestion. Then write the spec file, a Dafny implementation, and .forge/forge.json. Show the spec to the person in plain words (what it guarantees, what it does not). Tell them the next step is to read the spec and type /forge approve.`,
+      prompt: `${COACH}\nStep 2 of 5: no .forge/forge.json in ${root}. Look at this project briefly and suggest up to three small, critical functions (money, limits, permissions, parsing of untrusted input). Ask the person to pick one with AskUserQuestion. Then write the spec file, a Dafny implementation, and .forge/forge.json. Show the spec to the person in plain words (what it guarantees, what it does not). Tell them the next step is to type /forge approve, which shows the contract; they approve with /forge approve yes.`,
     }
   const unapproved = cfg.checks.filter(c => !approved[c.spec])
-  if (unapproved.length)
+  if (unapproved.length || !approved[CONFIG])
     return {
-      text: `Forge · step 3 of 5: read and approve the spec (${unapproved.map(c => c.spec).join(', ')}). When it says what you want, type /forge approve.`,
-      prompt: `${COACH}\nStep 3 of 5: explain the spec file(s) ${unapproved.map(c => c.spec).join(', ')} in plain words, clause by clause, and name one thing the spec does NOT guarantee. Do not approve it yourself. End by telling the person to type /forge approve if they agree.`,
+      text: `Forge · step 3 of 5: read and approve the spec (${unapproved.map(c => c.spec).join(', ')}). When it says what you want, type /forge approve yes.`,
+      prompt: `${COACH}\nStep 3 of 5: explain the spec file(s) ${unapproved.map(c => c.spec).join(', ')} in plain words, clause by clause, and name one thing the spec does NOT guarantee. Do not approve it yourself. End by telling the person to type /forge approve yes if they agree.`,
     }
   if (!last || isStale)
     return { text: 'Forge · step 4 of 5: prove it. Running /forge check now…\n\n' + (await runChecks($)) }
@@ -219,7 +309,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'forge',
       description: 'Forge proof gate: guided setup, then check / approve / status / add',
-      argumentHint: '[check|approve|status|add]',
+      argumentHint: '[spec|approve|check|status|add]',
     })
     const r = await next(e)
     void refreshStatus($).catch(() => undefined)
@@ -229,7 +319,15 @@ export const register: Register = on => {
   on('command.run', { command: 'forge' }, async ($, e) => {
     const arg = e.args.trim().split(/\s+/)[0] ?? ''
     if (arg === 'check') return { text: await runChecks($) }
-    if (arg === 'approve') return { text: await approve($) }
+    if (arg === 'approve') return { text: await approve($, /^approve\s+yes\b/.test(e.args.trim())) }
+    if (arg === 'spec') {
+      const { text, specs } = await showSpecs($, false)
+      if (specs.length)
+        void $.prompt.submit({
+          text: `${COACH}\nThe person typed /forge spec. Explain the contract of ${specs.join(', ')} clause by clause in plain words, in a short table (clause | guarantee), then what it does NOT guarantee.`,
+        })
+      return { text }
+    }
     if (arg === 'status') {
       const root: string = await $.session.root()
       const last = await readJson<LastCheck>($, join(root, LAST))
@@ -237,7 +335,7 @@ export const register: Register = on => {
     }
     if (arg === 'add') {
       void $.prompt.submit({
-        text: `${COACH}\nThe person wants to add one more check to .forge/forge.json. Suggest candidates, ask which with AskUserQuestion, write spec + implementation, add the entry, then tell them to read the spec and run /forge approve.`,
+        text: `${COACH}\nThe person wants to add one more check to .forge/forge.json. Suggest candidates, ask which with AskUserQuestion, write spec + implementation, add the entry, then tell them to run /forge approve to read the contract.`,
       })
       return { text: 'Forge · adding a check. Claude will help you pick the next function.' }
     }
