@@ -9,6 +9,14 @@ Usage:
   forge_check.py build   [--root DIR] [--json] [--check]
   forge_check.py setup   [--root DIR] [--json]     (find Dafny, or download the pinned release)
   forge_check.py mutate  [--root DIR] [--json] [--max N]
+  forge_check.py diff    [--root DIR] [--json] [--inputs N] [--budget-ms MS] [--seed S]
+
+`diff` compares code under test (the shipped app function, the wrapper around the proved code) with the
+compiled proved rule on fresh random inputs, in one process per check (JavaScript/TypeScript: node;
+Python: python3). A disagreement is shrunk to a small input, saved under .forge/regressions/<check>/, and
+replayed first on every later run. It needs a check with "build" (the compiled proved code) and "diff":
+{"lang": "js" | "py", "adapter": "<file>"}; the adapter is test code written once per check. It reads only
+hashes to see whether the compiled code still matches the Dafny files, so a run takes about a second.
 
 `mutate` plants small bugs in the implementation files (one at a time, in a temporary copy) and runs the
 proof on each. A mutant is "caught" when the check is no longer VERIFIED. A mutant that survives means the
@@ -59,6 +67,8 @@ DIR = '.forge'
 CONFIG = DIR + '/forge.json'
 APPROVED = DIR + '/approved.json'
 LAST = DIR + '/last-check.json'
+LAST_DIFF = DIR + '/last-diff.json'
+REGRESSIONS = DIR + '/regressions'
 
 # Constructs that make Dafny accept a claim without proof. A text scan, not a parser.
 UNSOUND = [r'\bassume\b', r'\{:\s*verify\s+false', r'\{:\s*axiom', r'\{:\s*extern', r'\{:\s*only']
@@ -151,7 +161,17 @@ def load_config(root):
                 if not (isinstance(u, dict) and 'file' in u and 'contains' in u):
                     raise ConfigError('check %s: each "usedBy" needs "file" and "contains"' % c['name'])
                 inside(root, u['file'])
+        for df in diff_entries(c):
+            if not isinstance(df, dict) or df.get('lang') not in ('js', 'py') or not df.get('adapter'):
+                raise ConfigError('check %s: each "diff" entry needs "lang" ("js" or "py") and "adapter"' % c['name'])
+            inside(root, df['adapter'])
     return cfg
+
+
+def diff_entries(c):
+    """A check's "diff" may be one entry or a list of entries."""
+    d = c.get('diff')
+    return [] if d is None else d if isinstance(d, list) else [d]
 
 
 def contract_extras(c):
@@ -719,6 +739,98 @@ def mutate_report(out):
     return '\n'.join(lines)
 
 
+# ---------------------------------------------------------------------------- diff
+
+def build_is_fresh(root, c):
+    """True if the emitted code's manifest names the current hashes of the spec and the Dafny files."""
+    manifest = os.path.join(inside(root, c['build']['out']), c['name'], 'forge-build.json')
+    if not os.path.isfile(manifest):
+        return False
+    sources = (read_json(manifest, {}) or {}).get('sources', {})
+    want = [c['spec']] + c['files']
+    return sorted(sources) == sorted(want) and all(sources[f] == sha256(inside(root, f)) for f in want)
+
+
+def run_diff(root, inputs=None, budget_ms=None, seed=None):
+    cfg = load_config(root)
+    here = os.path.dirname(os.path.abspath(__file__))
+    out = {'at': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'), 'checks': {}}
+    jobs = []
+    for c in cfg['checks']:
+        entries = diff_entries(c)
+        for df in entries:
+            jobs.append((c, df, c['name'] if len(entries) == 1 else '%s:%s' % (c['name'], df['lang'])))
+    for c, df, key in jobs:
+        res = out['checks'][key] = {}
+        if not c.get('build'):
+            res['verdict'] = 'NO_BUILD'
+            res['detail'] = 'diff compares against the compiled proved code: add a "build" entry first'
+            continue
+        if not build_is_fresh(root, c):
+            res['verdict'] = 'BUILD_STALE'
+            res['detail'] = 'the compiled proved code does not match the current Dafny files: run build'
+            continue
+        n = inputs or df.get('inputs', 1500)
+        ms = budget_ms or df.get('budget_ms', 1500)
+        s = seed if seed is not None else int.from_bytes(os.urandom(4), 'little')
+        reg = os.path.join(root, REGRESSIONS, key.replace(':', '-'))
+        env = dict(os.environ)
+        if df['lang'] == 'js':
+            if not shutil.which('node'):
+                res['verdict'], res['detail'] = 'TOOLCHAIN_MISSING', 'node is not on PATH'
+                continue
+            modules = js_node_path()
+            if not modules:
+                res['verdict'], res['detail'] = 'TOOLCHAIN_MISSING', 'npm could not install bignumber.js'
+                continue
+            env['NODE_PATH'] = modules
+            cmd = ['node', os.path.join(here, 'diff_runner.mjs')]
+        else:
+            cmd = [sys.executable, os.path.join(here, 'diff_runner.py')]
+        cmd += [inside(root, df['adapter']), str(s), str(n), str(ms), reg]
+        try:
+            r = subprocess.run(cmd, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               stdin=subprocess.DEVNULL, timeout=max(60, ms // 1000 * 4 + 60), universal_newlines=True)
+            line = [l for l in r.stdout.strip().split('\n') if l.startswith('{')][-1:]
+            data = json.loads(line[0]) if line else {'error': (r.stderr or r.stdout)[-800:]}
+        except subprocess.TimeoutExpired:
+            data = {'error': 'the diff run timed out'}
+        res.update(data)
+        if data.get('error'):
+            res['verdict'] = 'DIFF_ERROR'
+        elif data.get('disagreements'):
+            res['verdict'] = 'DISAGREE'
+        else:
+            res['verdict'] = 'DIFF_OK'
+    return out
+
+
+def diff_report(out):
+    if not out['checks']:
+        return 'forge diff: no check has a "diff" entry (see /forge:diff-setup)'
+    lines = []
+    for name, r in out['checks'].items():
+        v = r['verdict']
+        if v == 'DIFF_OK':
+            lines.append('✓ %s: %d inputs (%d skipped, outside the rule), %d saved cases replayed, 0 disagreements '
+                         'for %s, %d ms, seed %s' % (name, r['inputs'], r['out_of_domain'], r['replayed'],
+                                                     ', '.join(r.get('candidates') or []), r['ms'], r['seed']))
+        elif v == 'DISAGREE':
+            lines.append('✗ %s: %d disagreement(s) in %d inputs (%d ms, seed %s); per candidate: %s'
+                         % (name, len(r['disagreements']), r['inputs'], r['ms'], r['seed'],
+                            ', '.join('%s %d' % kv for kv in (r.get('per_candidate') or {}).items())))
+            for d in r['disagreements']:
+                lines.append('  %s%s: input %s → proved rule says %s, %s says %s  [%s]' % (
+                    'NEW ' if d.get('new') else '', d['candidate'], json.dumps(d['input'], ensure_ascii=False)[:200],
+                    json.dumps(d['reference'], ensure_ascii=False)[:120], d['candidate'],
+                    json.dumps(d['got'], ensure_ascii=False)[:120], d['file']))
+            lines.append('  Each one is a bug in that code, or a place where the spec says something other than '
+                         'what you meant. Saved cases under %s/%s/ run first next time.' % (REGRESSIONS, name.replace(':', '-')))
+        else:
+            lines.append('✗ %s: %s: %s' % (name, v, (r.get('detail') or r.get('error') or '')[:600]))
+    return '\n'.join(lines)
+
+
 def contract_of(path):
     keep = []
     with open(path, encoding='utf-8', errors='replace') as f:
@@ -764,7 +876,7 @@ def write_json(root, rel, value):
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog='forge_check.py', description='Forge proof check')
-    p.add_argument('command', choices=['check', 'approve', 'spec', 'build', 'setup', 'mutate'])
+    p.add_argument('command', choices=['check', 'approve', 'spec', 'build', 'setup', 'mutate', 'diff'])
     p.add_argument('--root', default='.', help='project folder (default: current folder)')
     p.add_argument('--json', action='store_true', help='print the result as JSON')
     p.add_argument('--base', help='git ref; any change to forge.json, approved.json or a spec '
@@ -773,11 +885,20 @@ def main(argv=None):
     p.add_argument('--hashes', help='approve: the hashes that `spec --json` printed; refused if any '
                                     'file changed since')
     p.add_argument('--max', type=int, default=40, help='mutate: at most this many mutants')
+    p.add_argument('--inputs', type=int, help='diff: at most this many random inputs (default from forge.json, 1500)')
+    p.add_argument('--budget-ms', type=int, help='diff: time budget per check in ms (default 1500)')
+    p.add_argument('--seed', type=int, help='diff: random seed (default: a fresh one each run)')
     p.add_argument('--check', action='store_true', help='build: write nothing; the emitted code on '
                                                         'disk must equal a fresh build')
     a = p.parse_args(argv)
     root = os.path.abspath(a.root)
     try:
+        if a.command == 'diff':
+            out = run_diff(root, a.inputs, a.budget_ms, a.seed)
+            if not a.no_write:
+                write_json(root, LAST_DIFF, out)
+            print(json.dumps(out, indent=2, ensure_ascii=False) if a.json else diff_report(out))
+            return 0 if all(r['verdict'] == 'DIFF_OK' for r in out['checks'].values()) else 1
         if a.command == 'mutate':
             out = run_mutate(root, a.max)
             print(json.dumps(out, indent=2) if a.json else mutate_report(out))

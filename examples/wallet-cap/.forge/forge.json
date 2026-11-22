@@ -26,7 +26,17 @@
         ]
       },
       "examples": "spec/WalletExamples.dfy",
-      "decisions": ".forge/decisions/wallet-cap.md"
+      "decisions": ".forge/decisions/wallet-cap.md",
+      "diff": [
+        {
+          "lang": "py",
+          "adapter": "diff/wallet_diff.py"
+        },
+        {
+          "lang": "js",
+          "adapter": "diff/wallet_diff.mjs"
+        }
+      ]
     }
   ]
 }
