@@ -10,6 +10,12 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
   `invariants --check` (Action input `invariants: "true"`) fails when the committed file is stale.
 - Tested: 49 cases (4 new): a fresh generation equals the committed example; a changed decision makes it stale;
   after regeneration the change is visible and the rule is marked not approved as written.
+- Changed: `/forge:scan` also ranks the code that acts on a decision, small predicates that decisions depend on, and
+  retry/backoff/timing rules. From a blind evaluation of 0.10.2 on 10 FRESH bugs in 5 repositories never used before
+  (PyrateLimiter, cron-parser, dinero.js, node-jsonwebtoken, unleash-client-node): recall 7 of 10 in the top 5 (3 of
+  4 for fixes made after the model's training cutoff), top-5 hit rate 25 of 25 at HEAD, median scan 56 s. The three
+  misses were exactly these three kinds of code. n = 10, one scan per checkout, grading by one agent, not blind.
+  This set has now shaped the instructions too; the next measurement needs new bugs.
 
 ## 0.10.2 — 2026-11-22
 - Changed: `/forge:scan` ranks the code that decides which rule applies next to the rule it selects.
