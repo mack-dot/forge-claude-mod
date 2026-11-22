@@ -118,3 +118,97 @@ serde_json = { version = "1", features = ["arbitrary_precision"] }
     env = dict(os.environ, CARGO_TARGET_DIR=os.environ.get('FORGE_CARGO_TARGET_DIR') or os.path.join(work, 'target'))
     _run(['cargo', 'build', '--quiet'], work, env, 'cargo build of the evaluator')
     return [os.path.join(env['CARGO_TARGET_DIR'], 'debug', 'forge_eval')]
+
+
+def _java_files(path):
+    if os.path.isfile(path):
+        return [path] if path.endswith('.java') else []
+    out = []
+    for d, _, files in os.walk(path):
+        out += [os.path.join(d, f) for f in files if f.endswith('.java')]
+    return sorted(out)
+
+
+def build_java(root, emitted_dir, adapter, work, sources=None):
+    """emitted_dir: <out>/<check>/java/<name>-java. `sources`: files or folders (relative to the project) with the
+    Java code under test, compiled together with the evaluator. Java has no incremental build tool here, so the
+    evaluator is recompiled only when the content of any of these files changes (a SHA-256 over all of them)."""
+    import hashlib
+    if not (shutil.which('javac') and shutil.which('java')):
+        raise BuildError('javac and java are not on PATH (a JDK is needed)')
+    if not os.path.isdir(emitted_dir):
+        raise BuildError('no Java build output at %s: add "java" to the check\'s build targets and run build' % emitted_dir)
+    template = os.path.join(HERE, 'eval', 'java', 'ForgeMain.java')
+    files = _java_files(emitted_dir) + [template]
+    for s in sources or []:
+        p = os.path.join(root, s)
+        if not os.path.exists(p):
+            raise BuildError('java_sources: %s does not exist' % s)
+        files += _java_files(p)
+    h = hashlib.sha256()
+    for f in files + [adapter]:
+        h.update(f.encode())
+        with open(f, 'rb') as fh:
+            h.update(fh.read())
+    stamp = os.path.join(work, 'classes.sha256')
+    classes = os.path.join(work, 'classes')
+    if not (os.path.exists(stamp) and open(stamp).read() == h.hexdigest() and os.path.isdir(classes)):
+        if os.path.isdir(classes):
+            shutil.rmtree(classes)
+        os.makedirs(classes)
+        # The adapter's public class is ForgeAdapter, whatever its file is called.
+        _write_if_changed(os.path.join(work, 'src', 'ForgeAdapter.java'), open(adapter, encoding='utf-8').read())
+        argfile = os.path.join(work, 'sources.txt')
+        with open(argfile, 'w', encoding='utf-8') as f:
+            f.write('\n'.join('"%s"' % x.replace('\\', '/') for x in files + [os.path.join(work, 'src', 'ForgeAdapter.java')]))
+        _run(['javac', '-nowarn', '-encoding', 'UTF-8', '-d', classes, '@' + argfile], work, dict(os.environ),
+             'javac of the evaluator')
+        with open(stamp, 'w') as f:
+            f.write(h.hexdigest())
+    return ['java', '-cp', classes, 'ForgeMain']
+
+
+def build_cs(root, emitted_dir, adapter, work, sources=None):
+    """emitted_dir: <out>/<check>/cs (one .cs file with the Dafny runtime). `sources`: files or folders with the C#
+    code under test. Rebuilt only when the content of any of these files changes (a SHA-256 over all of them)."""
+    import hashlib
+    if not shutil.which('dotnet'):
+        raise BuildError('dotnet is not on PATH (the .NET SDK is needed)')
+    emitted = [os.path.join(emitted_dir, f) for f in sorted(os.listdir(emitted_dir)) if f.endswith('.cs')] \
+        if os.path.isdir(emitted_dir) else []
+    if not emitted:
+        raise BuildError('no C# build output at %s: add "cs" to the check\'s build targets and run build' % emitted_dir)
+    files = emitted + [os.path.join(HERE, 'eval', 'cs', 'ForgeMain.cs'), adapter]
+    for s in sources or []:
+        p = os.path.join(root, s)
+        if not os.path.exists(p):
+            raise BuildError('cs_sources: %s does not exist' % s)
+        files += [p] if os.path.isfile(p) else sorted(os.path.join(d, f) for d, _, fs in os.walk(p) for f in fs if f.endswith('.cs'))
+    h = hashlib.sha256()
+    for f in files:
+        h.update(f.encode())
+        with open(f, 'rb') as fh:
+            h.update(fh.read())
+    stamp, out = os.path.join(work, 'bin.sha256'), os.path.join(work, 'bin')
+    dll = os.path.join(out, 'forgeeval.dll')
+    if not (os.path.exists(stamp) and open(stamp).read() == h.hexdigest() and os.path.exists(dll)):
+        major = subprocess.run(['dotnet', '--version'], stdout=subprocess.PIPE, universal_newlines=True).stdout.strip().split('.')[0]
+        includes = ''.join('    <Compile Include="%s" />\n' % f.replace('\\', '/') for f in files)
+        _write_if_changed(os.path.join(work, 'forgeeval.csproj'), '''<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net%s.0</TargetFramework>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <Nullable>disable</Nullable>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <NoWarn>$(NoWarn);CS0162;CS0164;CS0168;CS0219;CS0414;CS1998;CS8981</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+%s  </ItemGroup>
+</Project>
+''' % (major, includes))
+        _run(['dotnet', 'build', '-c', 'Release', '-o', out, '--nologo', '-v', 'q'], work,
+             dict(os.environ, DOTNET_CLI_TELEMETRY_OPTOUT='1', DOTNET_NOLOGO='1'), 'dotnet build of the evaluator')
+        with open(stamp, 'w') as f:
+            f.write(h.hexdigest())
+    return ['dotnet', dll]

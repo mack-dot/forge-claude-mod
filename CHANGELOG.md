@@ -2,6 +2,17 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## 0.10.0 — 2026-11-22
+- Added: Java and C# evaluators for the differential fuzz (`"lang": "java"`, `"lang": "cs"`), so all six languages
+  Dafny compiles to are covered. Each ships a protocol program with a small exact JSON reader/writer (Java) or
+  System.Text.Json (C#); Dafny integers are BigInteger in both. The code under test is listed in "java_sources" or
+  "cs_sources". Rebuilt only when a source's content changes (javac and dotnet have no quick no-op build).
+- Tested (Java, locally): the shipped Java function's planted bugs are found: the exact-cap rule (D1) and, by
+  itself, the long wraparound near 2^63 (the shipped code accepted the spend and set the balance to
+  -9223372036854775808). About 220 ms per run once built. 45 cases.
+- Tested (C#, CI only; this machine has no .NET): `tests/run_cs_diff.py` builds the C# target and requires the
+  planted zero-amount bug (D3) and the long wraparound to be found.
+
 ## 0.9.1 — 2026-11-22
 - Changed: `/forge:scan` instructions, from a blind evaluation (13 headless scans of chronicle and 4 public
   repositories: golang/time, casl, node-rate-limiter-flexible, transitions). Top-5 hit rate was 96 % (24 of 25), but

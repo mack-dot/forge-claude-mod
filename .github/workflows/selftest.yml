@@ -65,6 +65,8 @@ jobs:
           hashes=$(python3 ../../cli/forge_check.py spec --json | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["hashes"]))')
           python3 ../../cli/forge_check.py approve --hashes "$hashes"
           python3 ../../cli/forge_check.py build --no-write
+      - name: C# differential fuzz (needs the .NET SDK, which this runner has)
+        run: dotnet --version && python3 tests/run_cs_diff.py
   auto-dafny:
     # No Dafny installed: the checker must download the pinned release, check its SHA-256 and prove the example.
     strategy:

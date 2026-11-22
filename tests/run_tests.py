@@ -323,6 +323,9 @@ def main():
         open(os.path.join(root, 'legacygo', 'legacy.go'), 'w').write(
             'package legacygo\n\nfunc Spend(cap, spent, amount int64) (bool, int64) {\n'
             '\tif 0 < amount && amount <= cap-spent {\n\t\treturn true, spent + amount\n\t}\n\treturn false, spent\n}\n')
+        open(os.path.join(root, 'legacyjava', 'LegacyWallet.java'), 'w').write(
+            'package legacyjava;\npublic final class LegacyWallet {\n  public static long[] spend(long cap, long spent, long amount) {\n'
+            '    if (amount > 0 && amount <= cap - spent) return new long[] {1, spent + amount};\n    return new long[] {0, spent};\n  }\n}\n')
         open(os.path.join(root, 'legacy_wallet.rs'), 'w').write(
             'pub fn spend(cap: u64, spent: u64, amount: i64) -> (bool, u64) {\n'
             '    if amount > 0 && (amount as u64) <= cap - spent { (true, spent + amount as u64) } else { (false, spent) }\n}\n')
@@ -371,6 +374,12 @@ def main():
                       [f['id'][:2] for f in (rs_res.get('decisions') or {}).get('failing', [])] == ['D3']
                       and any('overflow' in json.dumps(d['got']) for d in rs_res.get('disagreements', []))))
         cases.append(('diff: Go and Rust runs under 2 seconds once built', go_res.get('ms', 9999) < 2000 and rs_res.get('ms', 9999) < 2000))
+        java_res = res.get('wallet-cap:java', {})
+        cases.append(('diff: Java evaluator finds the exact-cap bug and the long wraparound',
+                      [f['id'][:2] for f in (java_res.get('decisions') or {}).get('failing', [])] == ['D1']
+                      and any(isinstance(d.get('got'), dict) and d['got'].get('ok') is True
+                              and isinstance(d['got'].get('spent'), int) and d['got']['spent'] < 0
+                              for d in java_res.get('disagreements', []))))
         # big integers cross the line protocol exactly (JSON.parse alone would round 2^63 - 1)
         modules = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'), 'forge-check', 'js', 'node_modules')
         p = subprocess.Popen(['node', os.path.join(HERE, '..', 'cli', 'eval', 'node_eval.mjs'), os.path.join(root, 'diff/wallet_diff.mjs')],

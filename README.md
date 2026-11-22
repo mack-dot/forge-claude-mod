@@ -136,15 +136,17 @@ Each disagreement is a bug in that code, or a place where your spec says somethi
 **Any language.** One Python core does the search: seeds, your decisions, shrinking, saved cases. Each language
 only needs an evaluator: a process that reads one input per line (`{"input": …}`) and prints the proved rule's
 answer and the code's answer (`{"reference": …, "candidates": {"name": …}}`), after a first line naming the
-candidates. Forge ships evaluators for **JavaScript/TypeScript** (Node 22.18+ imports `.ts` directly),
-**Python**, **Go** and **Rust**. For Go and Rust you write only a small adapter; Forge generates the protocol
-program, links the compiled proved code and your code, and builds it in `.forge/cache/` (add that folder to your
-`.gitignore`), relying on `go build` and `cargo`'s own incremental caches. Any other language plugs in as
-`{"lang": "cmd", "run": [program, args…]}`: a small program that speaks the protocol. The inputs
-(`diff/<check>_inputs.py`) are shared by every language. Java and C# evaluators are next; they are not built yet.
+candidates. Forge ships evaluators for all six languages Dafny compiles to: **JavaScript/TypeScript** (Node
+22.18+ imports `.ts` directly), **Python**, **Go**, **Rust**, **Java** and **C#**. For the compiled languages you
+write only a small adapter; Forge generates the protocol program, links the compiled proved code and your code,
+and builds it in `.forge/cache/` (add that folder to your `.gitignore`): `go build` and `cargo` decide
+themselves what to rebuild; Java and C# are rebuilt only when a source file's content changes. Any other language
+plugs in as `{"lang": "cmd", "run": [program, args…]}`: a small program that speaks the protocol. The inputs
+(`diff/<check>_inputs.py`) are shared by every language. Integers stay exact in every language (BigInt, big.Int,
+BigInteger, arbitrary-precision JSON).
 
-Measured on the example (one machine): all four languages in one run take 0.9–1.3 s once built (120–400 ms per
-language); after an edit to Rust code, cargo's rebuild makes it about 2 s; the first run that compiles the Go and
+Measured on the example (one machine): Python, TypeScript, Go and Rust in one run take 0.9–1.3 s once built
+(120–400 ms per language; Java about 220 ms); after an edit to Rust code, cargo's rebuild makes it about 2 s; the first run that compiles the Go and
 Rust evaluators takes about 7 s.
 
 Labels: the inputs, the evaluators and the core are test code (not proved); a run is a FINITE TEST. It compares
@@ -165,7 +167,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mack-dot/forge-claude-mod@v0.9.1   # better: pin the commit hash, tags can move
+      - uses: mack-dot/forge-claude-mod@v0.10.0   # better: pin the commit hash, tags can move
 ```
 
 The job fails unless every check is `VERIFIED`. On a pull request, any change to `forge.json`,

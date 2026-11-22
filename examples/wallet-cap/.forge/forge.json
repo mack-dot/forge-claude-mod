@@ -16,7 +16,8 @@
           "py",
           "js",
           "go",
-          "rs"
+          "rs",
+          "java"
         ],
         "out": "verified",
         "fuzz": "fuzz/WalletFuzz.dfy",
@@ -61,6 +62,17 @@
           "adapter": "diff/wallet_diff.rs",
           "watch": [
             "legacy_wallet.rs"
+          ]
+        },
+        {
+          "lang": "java",
+          "inputs": "diff/wallet_inputs.py",
+          "adapter": "diff/wallet_diff.java",
+          "java_sources": [
+            "legacyjava"
+          ],
+          "watch": [
+            "legacyjava/LegacyWallet.java"
           ]
         }
       ]

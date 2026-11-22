@@ -164,11 +164,11 @@ def load_config(root):
                 inside(root, u['file'])
         for df in diff_entries(c):
             ok = isinstance(df, dict) and df.get('inputs') and (
-                (df.get('lang') in ('js', 'py', 'go', 'rs') and df.get('adapter'))
+                (df.get('lang') in ('js', 'py', 'go', 'rs', 'java', 'cs') and df.get('adapter'))
                 or (df.get('lang') == 'cmd' and isinstance(df.get('run'), list) and df['run']))
             if not ok:
                 raise ConfigError('check %s: each "diff" entry needs "inputs" (a Python file) and either "lang": "js", '
-                                  '"py", "go" or "rs" with "adapter", or "lang": "cmd" with "run": [program, args...]'
+                                  '"py", "go", "rs", "java" or "cs" with "adapter", or "lang": "cmd" with "run": [program, args...]'
                                   % c['name'])
             inside(root, df['inputs'])
             if df.get('adapter'):
@@ -808,7 +808,7 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None):
             cmd = ['node', os.path.join(here, 'eval', 'node_eval.mjs'), inside(root, df['adapter'])]
         elif df['lang'] == 'py':
             cmd = [sys.executable, os.path.join(here, 'eval', 'py_eval.py'), inside(root, df['adapter'])]
-        elif df['lang'] in ('go', 'rs'):
+        elif df['lang'] in ('go', 'rs', 'java', 'cs'):
             import eval_build
             target = df['lang']
             if target not in c['build'].get('targets', []):
@@ -816,12 +816,17 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None):
                 res['detail'] = 'add "%s" to the check\'s build targets, approve, and run build' % target
                 continue
             name = c['name'].replace('-', '_')
-            emitted = os.path.join(inside(root, c['build']['out']), c['name'], target,
-                                   '%s-%s' % (name, 'go' if target == 'go' else 'rust'))
+            emitted = os.path.join(inside(root, c['build']['out']), c['name'], target)
+            if target != 'cs':  # C# output is one file directly in <out>/<check>/cs
+                emitted = os.path.join(emitted, '%s-%s' % (name, {'go': 'go', 'rs': 'rust', 'java': 'java'}[target]))
             work = os.path.join(root, DIR, 'cache', 'diff-%s-%s' % (key.replace(':', '-'), target))
             try:
                 if target == 'go':
                     cmd = eval_build.build_go(root, emitted, inside(root, df['adapter']), work)
+                elif target == 'java':
+                    cmd = eval_build.build_java(root, emitted, inside(root, df['adapter']), work, df.get('java_sources'))
+                elif target == 'cs':
+                    cmd = eval_build.build_cs(root, emitted, inside(root, df['adapter']), work, df.get('cs_sources'))
                 else:
                     cmd = eval_build.build_rust(root, emitted, inside(root, df['adapter']), work, df.get('rust_deps'))
             except eval_build.BuildError as e:
