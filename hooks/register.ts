@@ -16,7 +16,7 @@ type Api = any
 
 // binding: the implementation file must start with exactly this text (its include and
 // `module X refines Spec {` line), so it cannot switch to a weaker spec.
-type Check = { name: string; spec: string; files: string[]; binding?: { file: string; prefix: string } }
+type Check = { name: string; spec: string; files: string[]; binding?: { file: string; prefix: string }; build?: unknown }
 type Config = { version: 1; checks: Check[]; dafny?: string }
 type Verdict = string
 type LastCheck = { at: string; verdicts: Record<string, Verdict>; detail: Record<string, string> }
@@ -283,7 +283,7 @@ export const register: Register = on => {
     if (arg === 'check') return { text: await runChecks($) }
     if (arg === 'build') {
       const root: string = await $.session.root()
-      const cfg = await readJson<Config & { checks: Array<Check & { build?: unknown }> }>($, join(root, CONFIG))
+      const cfg = await readJson<Config>($, join(root, CONFIG))
       if (cfg?.checks?.length && !cfg.checks.some(c => c.build)) {
         void $.prompt.submit({
           text: `${COACH}\nThe person typed /forge build, but no check in .forge/forge.json has a "build" entry yet. Ask with AskUserQuestion which languages their app needs (py, js, go, java, cs, rs; several allowed). Then: (1) write a fuzz harness in Dafny for the check, a file with a module that has "method Main()", which calls the proved method on boundary values (0, 1, each limit and its neighbours, 2^31, 2^32, 2^53, 2^63, 2^64) and about 2000 pseudo-random inputs from a linear congruential generator, repeats each ensures clause as an "expect", and prints one line per case; the module name must differ from the file name. (2) Add "build": {"targets": [...], "out": "verified", "fuzz": "<harness>", "usedBy": [{"file": "<app file>", "contains": "<import text>"}]} to the check. (3) Write a thin wrapper in the app's language that converts plain values to the generated types, and make the app call it; say plainly that the wrapper is unproved. (4) Tell the person that forge.json changed, so they run /forge approve, then /forge approve yes, then /forge build.`,
@@ -317,13 +317,20 @@ export const register: Register = on => {
     return { text: step.text }
   })
 
-  for (const tool of ['Edit', 'Write'] as const) {
-    on('tool.call', { tool }, async ($, e, next) => {
-      const deny = await guard($, e.file_path)
-      if (deny) return { deny }
-      const ran = await next(e)
-      await watch($, e.file_path)
-      return ran
-    }).catch(($, e, next) => (next.called ? next(e) : { deny: 'forge: its guard failed.' }))
-  }
+  // One registration per tool: the hook API types each tool's input by its literal name.
+  on('tool.call', { tool: 'Edit' }, async ($, e, next) => {
+    const deny = await guard($, e.file_path)
+    if (deny) return { deny }
+    const ran = await next(e)
+    await watch($, e.file_path)
+    return ran
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: 'forge: its guard failed.' }))
+
+  on('tool.call', { tool: 'Write' }, async ($, e, next) => {
+    const deny = await guard($, e.file_path)
+    if (deny) return { deny }
+    const ran = await next(e)
+    await watch($, e.file_path)
+    return ran
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: 'forge: its guard failed.' }))
 }

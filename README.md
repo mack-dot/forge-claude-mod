@@ -124,7 +124,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mack-dot/forge-claude-mod@v0.3.0
+      - uses: mack-dot/forge-claude-mod@v0.3.1   # better: pin the commit hash, tags can move
 ```
 
 The job fails unless every check is `VERIFIED`. On a pull request, any change to `forge.json`,
@@ -152,4 +152,4 @@ See `PLAN.md` for what is built and what is not.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. See `LICENSE`. Also: `CHANGELOG.md`, `SECURITY.md`, `CONTRIBUTING.md`, `PLAN.md`, `TRIAL.md`.
