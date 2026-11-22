@@ -2,7 +2,10 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
-## Unreleased (branch `wip/diff-fuzz`)
+## 0.8.0 — 2026-11-22
+Released on the owner's word before the first real-project test (chronicle). Treat the differential fuzz as
+early: report what it misses or gets wrong.
+
 - Added: the differential fuzz: the person's real code (the shipped function, the wrapper) against the compiled
   proved rule on fresh inputs. One language-neutral core (`cli/forge_diff.py`): seeds, the person's recorded
   decisions as fixed inputs, replay of saved cases, shrinking that keeps the failure signature fixed (no sliding
