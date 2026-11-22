@@ -9,7 +9,7 @@ inputs:
     required: false
     default: "."
   base:
-    description: "Git ref to compare with. Any change to forge.json, approved.json or a spec against it gives APPROVAL_CHANGED. Default: the pull request's base branch; empty on other events."
+    description: "Git ref to compare with. Any change to forge.json, approved.json or a spec against it gives APPROVAL_CHANGED. Default: the pull request's base branch; empty on other events. \"none\" turns the comparison off (only for repositories whose approvals are test fixtures)."
     required: false
     default: ""
   build:
@@ -35,7 +35,9 @@ runs:
         PR_BASE: ${{ github.base_ref }}
       run: |
         base="$FORGE_BASE"
-        if [ -z "$base" ] && [ -n "$PR_BASE" ]; then
+        if [ "$base" = "none" ]; then
+          base=""
+        elif [ -z "$base" ] && [ -n "$PR_BASE" ]; then
           git fetch --no-tags --depth=1 origin "$PR_BASE"
           base="origin/$PR_BASE"
         fi

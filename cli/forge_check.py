@@ -801,7 +801,12 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None):
         except subprocess.TimeoutExpired:
             data = {'error': 'the diff run timed out'}
         res.update(data)
-        if data.get('error'):
+        if data.get('error') and 'Unknown file extension ".ts"' in data['error']:
+            res['verdict'] = 'TOOLCHAIN_MISSING'
+            res['detail'] = ('this Node cannot import TypeScript directly (%s); it needs Node 22.18 or newer'
+                             % subprocess.run(['node', '--version'], stdout=subprocess.PIPE,
+                                              universal_newlines=True).stdout.strip())
+        elif data.get('error'):
             res['verdict'] = 'DIFF_ERROR'
         elif data.get('disagreements'):
             res['verdict'] = 'DISAGREE'
