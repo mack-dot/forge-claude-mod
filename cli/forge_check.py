@@ -502,9 +502,14 @@ def emit_target(dafny, work, files, target, out_dir, name, log):
 
 
 def tree_hashes(folder):
+    """Hashes of the emitted files. Caches that running the code creates (__pycache__, .pyc) are not emitted
+    code and are skipped, so importing the built Python module does not make the build look stale."""
     out = {}
-    for d, _, files in os.walk(folder):
+    for d, dirs, files in os.walk(folder):
+        dirs[:] = [x for x in dirs if x != '__pycache__']
         for f in files:
+            if f.endswith(('.pyc', '.pyo')):
+                continue
             path = os.path.join(d, f)
             out[os.path.relpath(path, folder).replace(os.sep, '/')] = sha256(path)
     return out

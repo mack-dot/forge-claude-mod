@@ -2,6 +2,15 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## 0.7.1 — 2026-11-22
+- Fixed (usability): `/forge:approve` (with a colon) answered "Unknown command"; a tester typed it. Now
+  `/forge:approve`, `/forge:check`, `/forge:build` and `/forge:status` each print the right command (with a
+  space). They change nothing and Claude cannot run them on its own (`disable-model-invocation`).
+- Fixed: `build --check` reported `STALE_BUILD` after the app had simply run the built Python code, because
+  Python's cache files (`__pycache__`) appeared inside the emitted folder. They are now skipped. Found by
+  the test suite after the example was run.
+- Tested: `/forge:approve` in a headless Claude Code session prints the two lines; 28 cases (1 new).
+
 ## 0.7.0 — 2026-11-22
 - Added: `mutate` (CLI) and `/forge mutate`. Plants small bugs (14 kinds: comparison, arithmetic, logic,
   constants) in the implementation files, one at a time in a temporary copy, and counts how many the proof
