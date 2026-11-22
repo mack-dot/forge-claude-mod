@@ -180,7 +180,8 @@ You are running the Forge rule conversation in ${root}. Follow these steps in or
 
 1. ASK FIRST. Ask the person to say, in their own words, one rule their software must never break.
    Do not suggest a rule and do not read the code before they answer. Only if they say they do not
-   know, look at the code and offer up to three candidates, and let them pick or rephrase.
+   know, look at the code and offer up to three candidates (or suggest /forge scan), and let them pick
+   or rephrase.
 2. CLASSIFY and say it plainly:
    - pure rule (limits, prices, permissions, state changes, parsing): can be PROVED in a Dafny model;
    - rule mixed with I/O (database, network, time): split the rule out; only the rule is proved;
@@ -286,7 +287,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'forge',
       description: 'Forge proof gate: guided setup, then check / approve / status / add',
-      argumentHint: '[spec|approve|check|build|status|add]',
+      argumentHint: '[scan|add|approve|check|build|spec|status]',
     })
     const r = await next(e)
     void refreshStatus($).catch(() => undefined)
@@ -321,6 +322,19 @@ export const register: Register = on => {
       const root: string = await $.session.root()
       const last = await readJson<LastCheck>($, join(root, LAST))
       return { text: last ? `${summary(last, 0)}\nlast run ${last.at}\n${JSON.stringify(last.verdicts, null, 2)}` : 'No check has run yet. Try /forge.' }
+    }
+    if (arg === 'scan') {
+      const root: string = await $.session.root()
+      void $.prompt.submit({
+        text: `${COACH}
+The person typed /forge scan in ${root}. Survey the codebase and recommend what is worth proving. Do NOT write or change any file.
+1. Read the layout, then the code that decides money, limits, quotas, permissions and access, state changes (status fields, lifecycles), retries and idempotency, parsing of untrusted input, and scoring or ranking rules.
+2. Rank at most 7 candidates in one table: rank | file:line | function | the rule in one plain sentence | what goes wrong if it breaks | kind (pure rule: provable / rule mixed with I/O: split the rule out / judgment: not provable) | effort (small, medium, large).
+3. Prefer small pure rules with a high cost of failure. Say plainly if the codebase has none.
+4. Name up to 3 things that look important but should NOT be proved, and why (UI, ML output, glue).
+5. End with: to start on one, type /forge add and say the rule in your own words; the table is a suggestion, not the rule.`,
+      })
+      return { text: 'Forge · scanning the codebase for rules worth proving. Nothing will be changed.' }
     }
     if (arg === 'add') {
       const root: string = await $.session.root()

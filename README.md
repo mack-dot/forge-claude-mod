@@ -52,7 +52,7 @@ Type `/forge` in any repository. Each time, it shows the next step and Claude wa
    (`py`, `js`, `go`, `java`, `cs`, `rs`), runs a fuzz harness on the compiled code in every language and
    requires identical output from all of them, and checks that your app imports the result.
 
-Other commands: `/forge spec` (show the contract again), `/forge status`, `/forge add`.
+Other commands: `/forge scan` (Claude ranks the rules in your codebase worth proving; changes nothing), `/forge spec` (show the contract again), `/forge status`, `/forge add`.
 
 ### Verdicts
 
@@ -137,7 +137,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mack-dot/forge-claude-mod@v0.5.0   # better: pin the commit hash, tags can move
+      - uses: mack-dot/forge-claude-mod@v0.5.1   # better: pin the commit hash, tags can move
 ```
 
 The job fails unless every check is `VERIFIED`. On a pull request, any change to `forge.json`,

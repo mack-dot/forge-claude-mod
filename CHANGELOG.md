@@ -2,6 +2,11 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## 0.5.1 — 2026-11-22
+- Added: `/forge scan`. Claude surveys the codebase and ranks up to 7 rules worth proving (file, rule,
+  cost of failure, provable or not, effort) and names what should not be proved. It changes no file. It is a
+  prompt to Claude: its ranking is a suggestion, not measured.
+
 ## 0.5.0 — 2026-11-22
 - Added: no manual Dafny install. If Dafny is not found, the checker downloads the official Dafny 4.11.0
   release for the machine (macOS arm64/x64, Linux x64, Windows x64) into `~/.cache/forge-check`, checks
