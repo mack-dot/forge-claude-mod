@@ -2,6 +2,15 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## 0.10.1 — 2026-11-22
+- Changed: `/forge:scan` ranking, from a second blind evaluation of the v0.9.1 instructions: blind recall of 8
+  known bugs rose from 3 to 6 in the top 5 (7 in the top 7), but the top-5 hit rate fell from 96 % to 92 %, scans
+  took about twice as long, and 14 of 15 top-3 rows were ranked on a suspected bug rather than on stakes (one
+  high-stakes chronicle rule dropped out of the top 7). Now: rank by stakes first, a suspected bug only breaks
+  ties; work quickly (search first, read only the functions being ranked); general wording instead of a
+  test-specific example. n = 8 is small; each scan ran once.
+- Not tested: these changes; the evaluation should be run again.
+
 ## 0.10.0 — 2026-11-22
 - Added: Java and C# evaluators for the differential fuzz (`"lang": "java"`, `"lang": "cs"`), so all six languages
   Dafny compiles to are covered. Each ships a protocol program with a small exact JSON reader/writer (Java) or
