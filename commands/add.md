@@ -1,0 +1,25 @@
+---
+description: Forge · turn one rule, in your own words, into an approved, proved spec
+argument-hint: "[the rule in your own words]"
+---
+Forge rule: the person approves a short spec once; after that, code may change only if Dafny proves it still meets the spec. Use short sentences. Never write `.forge/approved.json`, never run `forge_check.py approve`, and never type `/forge approve yes` for the person: approval is their act. The checker is `python3 "${CLAUDE_PLUGIN_ROOT}/cli/forge_check.py"`.
+
+You are running the Forge rule conversation in the current project. Follow these steps in order.
+
+0. SET UP. Run `python3 "${CLAUDE_PLUGIN_ROOT}/cli/forge_check.py" setup --json` and note the "dafny" path (it downloads Dafny once if needed). If it fails, explain the error in two lines and stop.
+1. ASK FIRST. The person's rule, if they already gave it: "$ARGUMENTS". If that is empty, ask them to say, in their own words, one rule their software must never break. Do not suggest a rule and do not read the code before they answer. Only if they say they do not know, look at the code and offer up to three candidates (or suggest `/forge:scan`), and let them pick or rephrase.
+2. CLASSIFY and say it plainly:
+   - pure rule (limits, prices, permissions, state changes, parsing): can be PROVED in a Dafny model;
+   - rule mixed with I/O (database, network, time): split the rule out; only the rule is proved;
+   - taste or judgment (UI, ML output, "good"): cannot be proved; say so, suggest tests or review, stop.
+3. READ the code where this rule lives now (if any), so your questions use their real names and units.
+4. DEFAULTS. Show a short checklist of fail-closed defaults (money in whole integer units; invalid input rejected with no change; time passed in as a value; no floats) and ask them to confirm or change.
+5. QUESTIONS. Ask only real choices where both answers are sensible, always with concrete numbers ("cap $50.00, spent $40.00, spend $20.00: reject, or cut to $10.00?"). Use AskUserQuestion, at most 4 questions per call, as many rounds as needed. No fixed number of questions. Cover: zero and negative values, exactly at each limit, one past each limit, units, which error wins when two apply, repeats and retries, ordering in time. Stop only when nothing is open.
+6. WRITE three files and keep them consistent:
+   a. `spec/<Name>Spec.dfy`: an abstract module with requires/ensures that captures every answer.
+   b. `spec/<Name>Examples.dfy`: starts with `include "<Name>Spec.dfy"`; an abstract module with `import S : <Name>Spec`; one method per decision, named D1_..., D2_..., with a comment holding the concrete question, that calls S.<Method>(...) on the concrete values and asserts the answer given.
+   c. `.forge/decisions/<check-name>.md`: the rule in their exact words; confirmed defaults; a table Id | Question | Answer; and "Out of scope (not guaranteed)".
+7. PROBE for gaps the questions missed. For a few other inputs (boundaries, zero, maximum values), write a temporary Dafny file OUTSIDE the project (in a temp folder) that includes the spec and asserts one outcome, then another file asserting the other outcome. If neither verifies, the spec leaves that case open: ask the person as a new question, add it as a new D-method and decision, update the spec.
+8. CHECK before handing over: run `<dafny> verify spec/<Name>Examples.dfy`; it must exit 0. If it fails, the spec contradicts or leaves open one of their answers: fix the spec, never the answer, unless the person changes their answer.
+9. IMPLEMENT the rule in `impl/<Name>.dfy`: it starts with `include "../spec/<Name>Spec.dfy"`, a blank line, then `module <Name> refines <Name>Spec {`. Never use assume, {:verify false}, {:axiom} or {:extern}. Add the check to `.forge/forge.json` (create it if missing): {"version": 1, "checks": [{"name": "<check-name>", "spec": "spec/<Name>Spec.dfy", "files": ["impl/<Name>.dfy"], "examples": "spec/<Name>Examples.dfy", "decisions": ".forge/decisions/<check-name>.md", "binding": {"file": "impl/<Name>.dfy", "prefix": "<the exact first lines up to and including the module line>"}}]}. Run `<dafny> verify impl/<Name>.dfy` until it passes.
+10. HAND OVER: list the decisions in a short table, name what is out of scope, and tell the person to type `/forge approve` to read everything, then `/forge approve yes`, then `/forge check`. Never approve for them.

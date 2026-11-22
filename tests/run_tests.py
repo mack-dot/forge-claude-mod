@@ -181,6 +181,14 @@ def static_checks():
     for m in re.finditer(r'timeoutMs:\s*([0-9_]+)', src):
         if int(m.group(1).replace('_', '')) > 600000:
             problems.append('register.ts: timeoutMs %s is over the host limit of 600000' % m.group(1))
+    code = re.sub(r'//[^\n]*', '', src)
+    if '$.prompt.submit(' in code:
+        problems.append('register.ts calls $.prompt.submit: the host refuses it inside command.run; '
+                        'use a Markdown command in commands/ instead')
+    for name in os.listdir(os.path.join(HERE, '..', 'commands')):
+        text = open(os.path.join(HERE, '..', 'commands', name), encoding='utf-8').read()
+        if not text.startswith('---\ndescription:'):
+            problems.append('commands/%s has no description front matter' % name)
     return problems
 
 

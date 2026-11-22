@@ -2,6 +2,24 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## 0.6.0 — 2026-11-22
+- Fixed: every step where Claude was meant to talk with the person never started. The mod handed its
+  instructions to Claude with `$.prompt.submit` from inside the `/forge` command, and Claude Code refuses
+  that there ("it would wait on the turn this hook is holding"). The refusal was silent because the call's
+  result was not read. Found when the first real user typed `/forge scan` and nothing happened.
+  Affected since 0.1.0: the guided steps of `/forge`, `/forge add`, `/forge scan`, and the explanation
+  after `/forge approve`.
+- Changed: those steps are now Markdown commands that Claude Code runs as a normal Claude turn:
+  `/forge:scan`, `/forge:add <rule>`, `/forge:explain`, `/forge:fix`, `/forge:build-setup`, `/forge:doctor`.
+  `/forge` itself keeps the deterministic parts (next step, check, approve, build, spec, status) and names
+  the `/forge:` command to type next.
+- Added: static tests that fail if `register.ts` calls `$.prompt.submit` or a command has no description.
+- Tested: headless Claude Code sessions with the plugin loaded: `/forge` (step text), `/forge:scan` on a small
+  project (a ranked table; it found two real input gaps; no file changed), `/forge:explain` on the example
+  (all clauses and all 4 decisions covered). 25 cases.
+- Not tested: `/forge:add` (it asks questions, which a headless session cannot answer), `/forge:fix`,
+  `/forge:build-setup`, `/forge:doctor`.
+
 ## 0.5.1 — 2026-11-22
 - Added: `/forge scan`. Claude surveys the codebase and ranks up to 7 rules worth proving (file, rule,
   cost of failure, provable or not, effort) and names what should not be proved. It changes no file. It is a

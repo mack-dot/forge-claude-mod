@@ -33,46 +33,25 @@ In the desktop app: click + next to the prompt box, then Plugins, Add marketplac
 
 ## Use
 
-Type `/forge` in any repository. Each time, it shows the next step and Claude walks you through it:
+Type `/forge` in any repository: it tells you the next step. The steps:
 
-1. Dafny (the proof checker) is set up for you: the `"dafny"` path in `.forge/forge.json` if set, else
-   `dafny` on PATH, else `FORGE_DAFNY`, else a pinned download (macOS arm64/x64, Linux x64, Windows x64).
-2. **Say the rule in your own words.** Claude does not guess it from your code. It tells you whether the
-   rule can be proved, confirms a few safe defaults with you, then asks about the edge cases with concrete
-   numbers ("cap $50.00, spent $40.00, spend $20.00: reject, or cut to $10.00?"), as many rounds as needed.
-   It also probes the spec with Dafny for cases nobody asked about and brings those back as questions.
-3. Claude writes three files: the spec, **your answers as Dafny checks** (`<Name>Examples.dfy`), and a
-   decision record (`.forge/decisions/<check>.md`). Type `/forge approve` to read all of it, then
-   `/forge approve yes`. Approval covers all three and `forge.json`.
-4. `/forge check` runs Dafny. Your answers are checked against the spec: if the spec says otherwise, or
-   leaves one of your answers open, the check gives `EXAMPLES_FAILED`. Then the code is checked against
-   the spec. The status line shows `forge ✓ VERIFIED n/n` or what failed.
-5. When a later edit touches a covered file, the status line says "code changed" until you check again.
-6. `/forge build` puts the proved code into your app. It compiles it to the languages you list
-   (`py`, `js`, `go`, `java`, `cs`, `rs`), runs a fuzz harness on the compiled code in every language and
-   requires identical output from all of them, and checks that your app imports the result.
+| Step | You type | What happens |
+| --- | --- | --- |
+| Find candidates (optional) | `/forge:scan` | Claude ranks up to 7 rules in your code worth proving, and names what should not be proved. Changes nothing. |
+| State a rule | `/forge:add <the rule in your own words>` | A conversation: Claude says whether the rule can be proved, confirms safe defaults, asks edge-case questions with concrete numbers (as many rounds as needed), probes the spec with Dafny for cases nobody asked about, then writes the spec, **your answers as Dafny checks**, a decision record and the implementation. |
+| Read it | `/forge:explain` | Claude explains every clause in plain words, checks that each of your answers is covered, and lists what is not guaranteed. |
+| Approve it | `/forge approve`, then `/forge approve yes` | Shows exactly what you approve (spec, your answers, decision record, `forge.json`); "yes" approves exactly that. Only you can do this. |
+| Prove it | `/forge check` | Your answers are checked against the spec (`EXAMPLES_FAILED` if the spec says otherwise or leaves one open), then the code against the spec. The status line shows `forge ✓ VERIFIED n/n` or what failed. |
+| Something failed | `/forge:fix` | Claude explains the verdict and proposes a fix to the code; it never weakens the spec without your word. |
+| Use it in your app | `/forge:build-setup`, then `/forge build` | Compiles the proved code to your languages (`py`, `js`, `go`, `java`, `cs`, `rs`), fuzzes the compiled code in every language (identical output required), and checks that your app imports it. |
+| It does not run | `/forge:doctor` | Claude checks Python, Dafny and the config, and explains the fix. |
 
-Other commands: `/forge scan` (Claude ranks the rules in your codebase worth proving; changes nothing), `/forge spec` (show the contract again), `/forge status`, `/forge add`.
+Dafny (the proof checker) is set up for you: the `"dafny"` path in `.forge/forge.json` if set, else `dafny`
+on PATH, else `FORGE_DAFNY`, else a pinned download (macOS arm64/x64, Linux x64, Windows x64).
 
-### Verdicts
-
-| Verdict | Meaning |
-| --- | --- |
-| `VERIFIED` | Dafny proved the files against the approved spec |
-| `FAILED` | Dafny found a proof failure |
-| `EXAMPLES_FAILED` | The spec contradicts one of your recorded answers, or leaves it open |
-| `NOT_APPROVED` | The spec was never approved |
-| `SPEC_CHANGED` | The spec, your answers or the decision record changed after approval |
-| `CONFIG_CHANGED` | `.forge/forge.json` changed after approval (a check, spec path, file list or binding) |
-| `BINDING_BROKEN` | The implementation no longer starts with the approved `include` and `refines` lines |
-| `UNSOUND_CONSTRUCT` | A file uses `assume`, `{:verify false}`, `{:axiom}`, `{:extern}` or `{:only}` (text scan) |
-| `APPROVAL_CHANGED` | CI only: the pull request changes `forge.json`, `approved.json` or a spec |
-| `ERROR` | Dafny did not run correctly |
-
-Why `binding`: in Dafny 4.11 an implementation can switch to refining a weaker spec while the approved spec
-file stays unchanged, and Dafny still reports success. A check's optional `"binding": {"file", "prefix"}`
-pins the exact first lines of the implementation, for example
-`include "../spec/LedgerSpec.dfy"\n\nmodule Ledger refines LedgerSpec {`.
+After that, let Claude (or any agent) change the covered code freely. When an edit touches a covered file,
+the status line says "code changed" until you run `/forge check` again. `/forge status` and `/forge spec`
+show the last verdicts and the approved contract.
 
 Files it keeps in your project: `.forge/forge.json` (checks), `.forge/approved.json` (your approvals),
 `.forge/last-check.json` (last verdicts).
@@ -137,7 +116,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mack-dot/forge-claude-mod@v0.5.1   # better: pin the commit hash, tags can move
+      - uses: mack-dot/forge-claude-mod@v0.6.0   # better: pin the commit hash, tags can move
 ```
 
 The job fails unless every check is `VERIFIED`. On a pull request, any change to `forge.json`,

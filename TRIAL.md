@@ -14,7 +14,8 @@ One sheet per person. Do not help unless the person is stuck for 5 minutes; writ
 
 ## Run
 
-Start a timer. Type `/forge` and follow it until `/forge check` shows VERIFIED.
+Start a timer. Optionally type `/forge:scan`. Then type `/forge:add` and your rule in your own words, and
+follow the steps until `/forge check` shows VERIFIED.
 Optional second part: `/forge build` until it shows BUILT and your app calls the built code.
 
 ## Record
