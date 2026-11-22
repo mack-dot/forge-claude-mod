@@ -25,11 +25,7 @@ runs:
   steps:
     - uses: dafny-lang/setup-dafny-action@be023fc606339d46ed6b077dcb8614d0279ded31 # v1.9.1
       with:
-        build:
-    description: "Also run `build --check`: fuzz the compiled code in every target and require the committed emitted code to equal a fresh build. The job must have each target's toolchain."
-    required: false
-    default: "false"
-  dafny-version: ${{ inputs.dafny-version }}
+        dafny-version: ${{ inputs.dafny-version }}
     - name: forge check
       shell: bash
       env:
