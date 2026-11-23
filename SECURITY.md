@@ -14,6 +14,19 @@
 - A pull request can change the workflow file. Protect `.github/` and `.forge/` with CODEOWNERS, and pin
   the Action to a commit hash, not a tag: tags can be moved.
 
+## The airlock (`airlock/`, `/forge:airlock`)
+
+- Container tier: the box shares the host kernel (on macOS, Docker Desktop's Linux VM). A kernel or
+  container-runtime escape defeats it. The airlock container has `CAP_SYS_ADMIN` and no AppArmor profile (for
+  the `nosymfollow` mount); the agent container has no capability.
+- `--pass-env NAME` exposes that value to the agent, which can send it to any host in `agent.egress_allow`.
+  Use a separate, spend-capped key. An allowed host can always receive data from the agent.
+- The startup canary is a finite test: a probe that passes shows only that those attempts failed.
+- Only the verifier's verdict on one gate log is proved (about the Dafny model); everything around it,
+  including the memo that makes it fast, is hand-written and tested, not proved.
+- Report a way to read a hidden path, reach an upstream key, pass a cap or change a hidden or read-only path
+  through the sync-back the same way as a soundness hole (below).
+
 ## Reporting a problem
 
 Report a way to get `VERIFIED` or `BUILT` for something that should not pass (a soundness hole) through

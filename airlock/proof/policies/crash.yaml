@@ -1,0 +1,13 @@
+# Domain: crash and timeout recovery of a gated call (gap 2). Cap 5 calls.
+version: 1
+upstreams:
+  - name: crashy
+    transport: stdio
+    command: [python3, -I, /forge/mocks/mock_crash_mcp.py]
+    user: 1000
+    timeout_s: 8
+tools:
+  gate:
+    - {tool: crashy_job, upstream: crashy, unit: count, cap: 5, expires_in_s: 86400}
+paths:
+  hidden_paths: ["src/proprietary/**", "**/algo.ts", ".env*"]
