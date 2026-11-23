@@ -182,11 +182,11 @@ docker image rm "forge-airlock-proof:$FORGEAIR_RUN" >/dev/null 2>&1 || true
 NEW=$(comm -13 <(echo "$BEFORE") <(docker_names) | grep -v '^$')
 OTHER=$(echo "$NEW" | grep -v "^forgeair-$FORGEAIR_RUN-" | grep -v '^$')
 MINE=$(echo "$NEW" | grep "^forgeair-$FORGEAIR_RUN-")
-echo "cleanup: run $FORGEAIR_RUN: $(echo "$NEW" | grep -c .) Docker object(s) left that did not exist at the start (forgeair*, forge-airlock*, llm-*)" | tee -a "$OUT/scoreboard.txt"
+echo "cleanup: run $FORGEAIR_RUN: $(echo "$MINE" | grep -c .) of this run's Docker objects left; $(echo "$OTHER" | grep -c .) new object(s) from other runs (forgeair*, forge-airlock*, llm-*)" | tee -a "$OUT/scoreboard.txt"
 [ -n "$NEW" ] && echo "$NEW" | sed 's/^/     left: /' | tee -a "$OUT/scoreboard.txt"
-[ -n "$OTHER" ] && [ -z "$MINE" ] && echo "     (names without this run's id may belong to another run on this host; rerun on a quiet host to tell)" | tee -a "$OUT/scoreboard.txt"
+[ -n "$OTHER" ] && echo "     names without this run's id ($FORGEAIR_RUN) belong to other runs on this host or are kept by design (forge-airlock-logs-<repo>); each tool above checks its own leftovers, so only this run's names fail the release" | tee -a "$OUT/scoreboard.txt"
 fail=0
 for e in "${G_EXIT[@]}"; do [ "$e" = 0 ] || fail=1; done
-[ -z "$NEW" ] || fail=1
+[ -z "$MINE" ] || fail=1
 echo "prove_release: $([ $fail = 0 ] && echo PASS || echo FAIL) total=$((SECONDS-T0))s out=${OUT#"$PWD"/}" | tee -a "$OUT/scoreboard.txt"
 exit $fail

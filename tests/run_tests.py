@@ -753,7 +753,9 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, 'p')
         shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
-        code, res = diff(root)
+        # a fixed input count, not the 1.5 s budget: under load the JVM got through too few inputs to
+        # reach the long wraparound (failed twice on a loaded machine, passed on rerun)
+        code, res = diff(root, '--budget-ms', '60000')
         py, js = res.get('wallet-cap:py', {}), res.get('wallet-cap:js', {})
         kinds_py = sorted({json.dumps(d['reference']['ok']) + '>' + json.dumps(d['got']['ok']) for d in py.get('disagreements', [])})
         failing_py = sorted(f['id'][:2] for f in (py.get('decisions') or {}).get('failing', []))
