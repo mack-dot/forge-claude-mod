@@ -152,11 +152,11 @@ PY
 gate G7 "README: unified workflow and honest labels" $g $((SECONDS-t))
 
 # ---------------------------------------------------------------- cleanup and result
-c=$(docker ps -aq --filter name=forgeair | wc -l | tr -d ' ')
+c=$(docker ps -aq --filter name=^forgeair | wc -l | tr -d ' ')
 vol=$(docker volume ls -q | grep -cE '^(forgeair|forge-airlock)' | tr -d ' ')
-net=$(docker network ls -q --filter name=forgeair | wc -l | tr -d ' ')
-c=$((c + $(docker ps -aq --filter name=llm- | wc -l))); vol=$((vol + $(docker volume ls -q | grep -c '^llm-')))
-net=$((net + $(docker network ls -q --filter name=llm- | wc -l)))
+net=$(docker network ls -q --filter name=^forgeair | wc -l | tr -d ' ')
+c=$((c + $(docker ps -aq --filter name=^llm- | wc -l))); vol=$((vol + $(docker volume ls -q | grep -c '^llm-')))
+net=$((net + $(docker network ls -q --filter name=^llm- | wc -l)))
 echo "cleanup: containers=$c volumes=$vol networks=$net (forgeair*, forge-airlock*, llm-*)" | tee -a "$OUT/scoreboard.txt"
 fail=0
 for e in "${G_EXIT[@]}"; do [ "$e" = 0 ] || fail=1; done
