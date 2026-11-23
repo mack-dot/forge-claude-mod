@@ -109,10 +109,12 @@ vfk_vm() {  # vfk_vm [run options] <agent-side service> [command...]: the servic
   dc_raw exec -T airlock python3 -I -c "import json; d=json.load(open('/state/workspace.json')); print(json.dumps({'closed_dirs': d.get('closed_dirs', []), 'readonly_files': d.get('readonly_files', [])}))" >"$OUT/vm-ro.json" 2>/dev/null \
     || { echo "vfk: no read-only list from the airlock (fail closed)" >&2; return 2; }
   a=(--config "$OUT/vm-config.json" --service "$svc" --volume "ws=$VMWS" --net "agentnet=8700:127.0.0.1:${p_air:-0}:airlock")
-  # control-root-writes in a VM: guest root alone cannot write read-only entries (guest read-only binds
-  # AND the host immutable flag; measured: the canary PASSES as guest root). The planted breach for the
-  # VM is therefore "root AND no read-only protection"; the canary must report it.
-  [ "$svc" = control-root-writes ] || a+=(--ro-list "$OUT/vm-ro.json" --lock)
+  # control-root-writes in a VM: guest root alone cannot write read-only entries (guest read-only binds,
+  # the host immutable flag and the airlock's 0444/0555 modes, enforced by macOS on the vfkit process;
+  # the canary PASSES as guest root: checked as its own case below). The planted breach for the VM is
+  # therefore "root AND the host protection removed"; the canary must report it.
+  a+=(--ro-list "$OUT/vm-ro.json")
+  if [ "$svc" = control-root-writes ] && [ -z "${VFK_ROOT_PROTECTED:-}" ]; then a+=(--plant-unprotected); else a+=(--lock); fi
   [ -n "$p_mock" ] && a+=(--net "upstream=9100:127.0.0.1:$p_mock:mock-http")
   if [ -n "$detach" ]; then
     python3 -I ../backends/vfkit_compose.py "${a[@]}" ${envs[@]+"${envs[@]}"} -- "$@" >/dev/null 2>&1 &
@@ -190,6 +192,11 @@ for DOM in ${DOMAINS:-codebase visible quota concurrency crash}; do
     echo "info $DOM: CONTROL swap attack WITHOUT nosymfollow (not gated): exit=$? (20 = the attack won)" | tee -a "$OUT/summary.txt"
     grep -E "^\[swap\]" "$OUT/$DOM-swap-control.log" | head -3 | cut -c1-240 | sed 's/^/     /'
     dc stop airlock >/dev/null 2>&1; OVR=$OVR_SAVE; dc up -d --wait airlock >/dev/null 2>&1
+    if [ -n "$VFK" ]; then  # vfkit: guest root with the read-only protection in place must NOT get through
+      t=$SECONDS; restart_airlock
+      VFK_ROOT_PROTECTED=1 dc run --rm control-root-writes >"$OUT/$DOM-vm-root-protected.log" 2>&1
+      rec "$DOM: vfkit: guest root, read-only protection on -> canary PASS (cannot write)" $? 0 $((SECONDS-t))
+    fi
     for c in control-env-secret control-hidden-mount control-root-writes; do
       t=$SECONDS; restart_airlock
       dc run --rm "$c" >"$OUT/$DOM-$c.log" 2>&1

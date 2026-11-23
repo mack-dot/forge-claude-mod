@@ -121,6 +121,26 @@ def job(svc, volume_dirs, net_forwards, work, extra_env=(), command=None, enviro
             "gid": int(gid or uid), "cwd": svc.get("working_dir") or "/", "ro_paths": list(ro_paths)}
 
 
+def _chmod_tree(ws, rels, writable):
+    """Read-only entries (and everything in a closed dir): writable -> u+w; else the airlock's modes
+    (files 0444, dirs 0555). Never follows a symlink."""
+    import stat as st
+    n = 0
+    for rel in rels:
+        full = os.path.join(ws, rel)
+        todo = [full]
+        if os.path.isdir(full) and not os.path.islink(full):
+            for d, dirs, files in os.walk(full):
+                todo += [os.path.join(d, x) for x in dirs + files]
+        for p in todo:
+            if not os.path.lexists(p) or os.path.islink(p):
+                continue
+            is_dir = st.S_ISDIR(os.lstat(p).st_mode)
+            os.chmod(p, (0o755 if is_dir else 0o644) if writable else (0o555 if is_dir else 0o444))
+            n += 1
+    return n
+
+
 def main(argv):
     import argparse
     cmd = None
@@ -141,6 +161,9 @@ def main(argv):
     p.add_argument("--nat-control", action="store_true")
     p.add_argument("--lock", action="store_true",
                    help="also set the host immutable flag on the --ro-list entries of the ws volume folder")
+    p.add_argument("--plant-unprotected", action="store_true",
+                   help="NEGATIVE CONTROL ONLY: clear the host flags and make the --ro-list entries writable for "
+                        "this run (no guest read-only binds either); restored afterwards")
     a = p.parse_args(argv)
     doc = json.load(open(a.config))
     svc = doc["services"].get(a.service)
@@ -160,7 +183,11 @@ def main(argv):
         d = json.load(open(a.ro_list))
         rels = d.get("closed_dirs", []) + d.get("readonly_files", [])
         ro = [f"{a.root.rstrip('/')}/{r}" for r in rels]
-        if a.lock and "ws" in vols:
+        if a.plant_unprotected and "ws" in vols:
+            vfkit_vm.unlock_tree(vols["ws"])
+            planted = _chmod_tree(vols["ws"], rels, writable=True)
+            ro = []
+        elif a.lock and "ws" in vols:
             vfkit_vm.lock_readonly(vols["ws"], rels)
     work = tempfile.mkdtemp(prefix="fvc-")
     try:
@@ -180,6 +207,9 @@ def main(argv):
             return 2
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        if a.plant_unprotected and a.ro_list and "ws" in vols:  # back to the airlock's modes, then locked
+            _chmod_tree(vols["ws"], rels, writable=False)
+            vfkit_vm.lock_readonly(vols["ws"], rels)
 
 
 if __name__ == "__main__":
