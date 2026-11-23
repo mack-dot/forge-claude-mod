@@ -23,8 +23,10 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
   repository from the example (Python only; only the correct wrapper fuzzed) and runs the Action with no inputs.
   Unchanged: pass, 50,000 inputs, `DIFF_OK`. Spec clause W1 removed: `APPROVAL_CHANGED` (with `base: none`:
   `SPEC_CHANGED`). A new `refund.py` comparing `spent + amount <= cap`: `UNAPPROVED_BYPASS`. A hand edit of
-  `INVARIANTS.md`: `INVARIANTS_STALE`. A rare wrapper bug (exact-cap spend rejected when the cap ends in 777):
-  `DISAGREE` in the 50,000-input sweep; 1,500 inputs found it in 2 of 20 seeds, 50,000 in 10 of 10. Base
+  `INVARIANTS.md`: `INVARIANTS_STALE`. A rare wrapper bug (exact-cap spend rejected when `cap % 250 == 27`):
+  `DISAGREE` in the 50,000-input sweep (detection numbers: see docs/ci.md). A first version of that bug (cap ends
+  in 777, about 0.9 hits in 10,000 inputs) was missed by the 50,000-input sweep in run 45113930328 (seed
+  2164257368): a flaky control, replaced. Base
   detection per event and the subfolder fix have their own steps in `checker-tests` (the old code fails the
   subfolder step: checked on one machine).
 - Measured (that run): the 50,000-input Python sweep took 1,500–4,054 ms per job; the example's five languages,

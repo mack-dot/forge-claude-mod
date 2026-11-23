@@ -24,14 +24,16 @@ PY
     printf '\n- W5: refunds are always allowed (edited by hand, not generated)\n' >> INVARIANTS.md
     ;;
   logic-bug)
-    # A rare bug in the unproved wrapper: an exact-cap spend is rejected when the cap ends in 777.
-    # About 1 input in 7,000 hits it, so a 1,500-input run usually misses it and a 50,000-input sweep finds it.
+    # A rare bug in the unproved wrapper: an exact-cap spend is rejected when cap % 250 == 27.
+    # About 4 inputs in 10,000 hit it (counted over 2,000,000 generated inputs): a 1,500-input run misses it about
+    # half the time; a 50,000-input run misses it with probability about 2e-9. (A first version, cap % 1000 == 777,
+    # hit 0.9 in 10,000 and was missed by one 50,000-input CI run: run 45113930328.)
     python3 - <<'PY'
 p = 'app.py'
 s = open(p).read()
 anchor = "    state, outcome = Wallet.default__.Spend("
 assert anchor in s
-bug = ("    if cap_cents % 1000 == 777 and amount_cents == cap_cents - spent_cents:\n"
+bug = ("    if cap_cents % 250 == 27 and amount_cents == cap_cents - spent_cents:\n"
        "        return False, spent_cents\n")
 open(p, 'w').write(s.replace(anchor, bug + anchor, 1))
 PY

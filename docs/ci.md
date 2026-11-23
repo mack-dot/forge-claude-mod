@@ -55,14 +55,16 @@ inputs, and `.github/ci-fixture/expect.py` requires the outcome and verdict:
 | `spec-weakened-nobase` | same, with `base: none` | fail, `SPEC_CHANGED` |
 | `bypass` | a new `refund.py` that compares `spent + amount <= cap` itself | fail, `UNAPPROVED_BYPASS` |
 | `stale-invariants` | a hand edit of `INVARIANTS.md` | fail, `INVARIANTS_STALE` |
-| `logic-bug` | `app.py` rejects an exact-cap spend when the cap ends in 777 | fail, `DISAGREE` |
+| `logic-bug` | `app.py` rejects an exact-cap spend when `cap % 250 == 27` | fail, `DISAGREE` |
 
 Measured on GitHub-hosted `ubuntu-latest`, selftest run 45113316698 (one run):
 
 - Python fixture, 50,000 inputs per run: 2,049 ms (`clean`), 1,500 ms (`logic-bug`), 3,958 ms (`bypass`), 4,054 ms
   (`stale-invariants`). The whole Action step for `clean` (Dafny proof, build fuzz, invariants, sweep): 15 s.
-- `logic-bug`: 1,500 inputs found the planted bug in 2 of 20 seeded runs (seeds 1–20); 50,000 inputs in 10 of 10
-  (seeds 1–10).
+- `logic-bug`, first version (cap ends in 777): 1,500 inputs found it in 2 of 20 seeded runs, 50,000 inputs in 10
+  of 10. In the next run (45113930328, seed 2164257368) the 50,000-input sweep missed it: about 0.9 inputs in
+  10,000 hit it, a miss chance near 1% per run. It was replaced by `cap % 250 == 27` (about 4 in 10,000; counted
+  over 2,000,000 generated inputs on one machine); its CI numbers: PENDING_NEXT_RUN.
 - The example, 50,000 inputs in each of its five languages (its legacy code disagrees, so this includes grouping
   and shrinking): py 2,813 ms, js 2,418 ms, go 2,204 ms, rs 2,192 ms, java 1,901 ms; 17 s wall time for the step,
   evaluator builds included.
@@ -72,9 +74,8 @@ Job `checker-tests` also tests the base detection per event and `--base` with th
 ## Limits
 
 - The diff sweep is a FINITE TEST. A bug that 50,000 inputs of the inputs module do not reach is not found. The
-  `logic-bug` control is one rare bug: on the runner, 1,500-input runs found it in 2 of 20 seeds and 50,000-input
-  runs in 10 of 10 (below). That says nothing about other bugs. With the seed taken from the run ID, a run of this
-  control can miss the bug; none of the measured runs did.
+  `logic-bug` control is one rare bug; the numbers below are about that bug only. With the seed taken from the run
+  ID, a run can miss it: the first version of the bug was missed once (below).
 - The bypass gate is a text search (see the README), not a data-flow analysis.
 - Java, Rust and .NET toolchains are the runner's own; their versions are not pinned by the Action.
 - Only GitHub-hosted Ubuntu runners are tested. macOS and Windows runners are not tested with this Action.
