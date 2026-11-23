@@ -166,6 +166,44 @@ agent:
 
 `forge.yaml` is always read-only in the box and is never synced back.
 
+## Isolation backends (`--isolation`, forge.yaml `isolation:`)
+
+The default box is a Docker container on runc: it shares the kernel of the Docker host with the
+airlock. A kernel escape defeats it. Two other backends change ONLY the agent container's runtime
+(the airlock, egress proxy and exporter stay on runc; code: `backends/__init__.py`):
+
+| `isolation:` | Agent runs under | Needs |
+| --- | --- | --- |
+| `docker` (default) | runc, the host kernel | Docker with Compose v2 |
+| `gvisor` | gVisor `runsc`: the agent's system calls go to gVisor's user-space kernel | Linux Docker host, runsc registered: `runsc install -- --reproduce-nat` |
+| `microvm` | a Kata Containers VM per agent container (own guest kernel, KVM) | Linux Docker host with `/dev/kvm`, Kata registered as runtime `kata` |
+
+```
+./forge-airlock up --isolation gvisor -- claude     # or in forge.yaml:  isolation: gvisor
+```
+
+Fail closed, never a silent fall back to docker:
+- If the runtime is not registered with the Docker daemon (`docker info`), `up` refuses (exit 2).
+  A `--isolation` that differs from forge.yaml `isolation:` is refused too (exit 2).
+- Before the canary, a probe in the agent container compares its `/proc/version` with the airlock's
+  (runc: the host kernel). Equal, or for gvisor no "gVisor" in `dmesg`: the command does not run
+  (exit 10). The probe is a finite check of "which kernel answers", not a proof that the runtime has no escape.
+- gVisor's netstack and a Kata guest do not reach Docker's embedded DNS (a NAT rule in the network
+  namespace). For these backends `up` writes the airlock's (and egress proxy's) address into the
+  agent's `/etc/hosts`; the canary still treats any other resolvable name as a breach.
+
+macOS: Docker Desktop has no runsc and no Kata runtime, so `gvisor` and `microvm` are refused there
+(tested). The macOS microvm design is Apple Virtualization.framework: `backends/vz_boot_check.sh`
+boots a minimal Linux microVM through vfkit (pinned, SHA-256 checked, no sudo) as the positive
+control of that design. Running the agent itself in such a VM is NOT built (see "Not tested").
+
+Tests: `tests/run_tests.py` (choice and refusal rules, compose output, probe negative control),
+`tests/run_up_e2e.py` (missing backend refused; runc posing as gvisor caught by the probe; with
+`FORGE_E2E_ISOLATION=<backend>` the whole e2e under that backend), and `proof/validate.sh` with
+`FORGE_ISOLATION=<backend>` (the G2-G4 battery with every agent-side container under that runtime,
+plus probe checks). CI: `.github/workflows/isolation.yml` runs all three on ubuntu-latest and
+measures container start overhead (`proof/startup_bench.py`).
+
 ## Faster gates, same proved verifier
 
 #97 started a new verifier subprocess for every gated call and re-verified the whole log

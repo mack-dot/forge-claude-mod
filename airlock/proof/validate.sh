@@ -43,10 +43,12 @@ if [ -n "$RT" ]; then  # the agent side only; airlock, mock-http, bench-direct s
     for s in agent control-env-secret control-hidden-mount control-egress control-root-writes agent-bench; do
       printf '  %s: {runtime: %s, extra_hosts: %s}\n' "$s" "$RT" "$([ "$s" = control-egress ] && echo "$HE" || echo "$H")"
     done; } >"$RT_OVR"
+  # a SECOND airlock (the lock test) must not take the live airlock's fixed address
+  printf 'services:\n  airlock: {networks: !override [upstream]}\n' >"$OUT/compose.second-airlock.yml"
 fi
 echo "== isolation $ISO (agent runtime: ${RT:-runc})" | tee -a "$OUT/summary.txt"
 
-dc() { docker compose -p "forgeair-$DOM" -f docker-compose.yml ${OVR:+-f "$OVR"} ${RT_OVR:+-f "$RT_OVR"} "$@"; }
+dc() { docker compose -p "forgeair-$DOM" -f docker-compose.yml ${OVR:+-f "$OVR"} ${RT_OVR:+-f "$RT_OVR"} ${XOVR:+-f "$XOVR"} "$@"; }
 
 json_check() {  # json_check <file> <python expression over d>
   python3 -c "import json,sys; d=json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]); sys.exit(0 if ($2) else 1)" "$1"
@@ -133,7 +135,7 @@ for DOM in ${DOMAINS:-codebase visible quota concurrency crash}; do
     dc run --rm control-egress >"$OUT/$DOM-control-egress.log" 2>&1
     rec "quota: planted breach control-egress (agent on upstream net) -> BREACH" $? 10 $((SECONDS-t))
     grep -E "\[canary\] BREACH:" "$OUT/$DOM-control-egress.log" | head -3 | sed 's/^/     /'
-    t=$SECONDS; dc run --rm --no-deps airlock >"$OUT/$DOM-second-writer.log" 2>&1; rc=$?
+    t=$SECONDS; XOVR=${RT_OVR:+$OUT/compose.second-airlock.yml} dc run --rm --no-deps airlock >"$OUT/$DOM-second-writer.log" 2>&1; rc=$?
     grep -q "another airlock holds the data volume lock" "$OUT/$DOM-second-writer.log" || rc="$rc/no-reason"
     rec "quota: second airlock on the same log volume refuses to start" "$rc" 2 $((SECONDS-t))
     dc stop airlock >/dev/null 2>&1  # the live airlock holds the lock; stop it for the next cases
