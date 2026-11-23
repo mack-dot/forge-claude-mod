@@ -617,8 +617,13 @@ def test_vfkit():
     old = dict(os.environ)
     try:
         os.environ["FORGE_VFKIT"] = os.path.join(work, "no-such-vfkit")
+        hv = subprocess.run(["sysctl", "-n", "kern.hv_support"], capture_output=True, text=True).stdout.strip() \
+            if sys.platform == "darwin" else ""
+        # the checks run in order: macOS, Apple silicon, hardware virtualization, vfkit, image (a CI
+        # runner has no virtualization, so it stops one check earlier: still Unavailable, still exit 2)
+        want = "macOS" if sys.platform != "darwin" else ("not installed" if hv == "1" else "virtualization")
         case("vfkit: negative control: vfkit missing -> Unavailable (exit 2 in up)",
-             raises(VM.preflight, VM.Unavailable, "not installed" if sys.platform == "darwin" else "macOS"))
+             raises(VM.preflight, VM.Unavailable, want))
         os.environ.pop("FORGE_VFKIT")
         os.environ["FORGE_VFKIT_TEST_NO_HV"] = "1"
         case("vfkit: negative control: no hardware virtualization -> Unavailable",
