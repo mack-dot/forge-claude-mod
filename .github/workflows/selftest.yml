@@ -100,7 +100,9 @@ jobs:
         uses: ./forge-src
         continue-on-error: true
         with:
-          base: ${{ matrix.kind == 'spec-weakened-nobase' && 'none' || (github.event_name != 'pull_request' && 'main' || '') }}
+          # The fixture's base branch is "main": a pull request into another branch (a stacked pull request) passes
+          # it explicitly, as push events do; a pull request into main tests the base found from the event.
+          base: ${{ matrix.kind == 'spec-weakened-nobase' && 'none' || ((github.event_name == 'pull_request' && github.base_ref == 'main') && '' || 'main') }}
       - name: expect the planted verdict
         run: python3 forge-src/.github/ci-fixture/expect.py "${{ matrix.kind }}" "${{ steps.forge.outcome }}" "$RUNNER_TEMP/forge-ci-report.json"
       - name: measure how often 1,500 and 50,000 inputs find the planted bug (not a gate)
