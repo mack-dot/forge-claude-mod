@@ -215,6 +215,63 @@ class ToolPolicy:
         return names
 
 
+LLM_KEYS = ("provider_url", "key_env", "auth_header", "unit", "session_cap", "daily_cap", "per_request_max",
+            "allowed_models", "prices", "bytes_per_input_token", "free_paths")
+MODEL_RE = re.compile(r"[A-Za-z0-9._:@/-]{1,128}")
+
+
+def parse_llm(spec):
+    """forge.yaml `llm`: the airlock's model endpoint and its spending gate. None if absent.
+
+    The key is named (key_env), never written. Caps are integers in the chosen unit:
+    unit=tokens (input + cache + output tokens) or unit=cost (estimated cost units:
+    micro-USD from the prices table, USD per million tokens). Label: NATIVE CHECK."""
+    if spec is None:
+        return None
+    _keys(spec, "llm", required=("key_env", "session_cap", "allowed_models"), optional=LLM_KEYS)
+    out = dict(spec)
+    url = out.setdefault("provider_url", "https://api.anthropic.com")
+    m = re.fullmatch(r"(https?)://([A-Za-z0-9.-]{1,253})(?::([0-9]{1,5}))?/?", url) if isinstance(url, str) else None
+    if not m:
+        raise PolicyError("llm.provider_url must be http(s)://host[:port] (no path)")
+    out["scheme"], out["host"] = m.group(1), m.group(2).lower()
+    out["port"] = int(m.group(3) or (443 if m.group(1) == "https" else 80))
+    if not isinstance(out["key_env"], str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", out["key_env"]):
+        raise PolicyError("llm.key_env must be the NAME of an environment variable (not its value)")
+    if out.setdefault("auth_header", "x-api-key") not in ("x-api-key", "bearer"):
+        raise PolicyError("llm.auth_header must be x-api-key or bearer")
+    if out.setdefault("unit", "tokens") not in ("tokens", "cost"):
+        raise PolicyError("llm.unit must be tokens or cost")
+    _int(out["session_cap"], "llm.session_cap", 1, MONEY_MAX)
+    if out.get("daily_cap") is not None:
+        _int(out["daily_cap"], "llm.daily_cap", 1, MONEY_MAX)
+    out.setdefault("daily_cap", None)
+    out["per_request_max"] = _int(out.get("per_request_max", out["session_cap"]), "llm.per_request_max", 1, MONEY_MAX)
+    am = out["allowed_models"]
+    if not isinstance(am, list) or not am or not all(isinstance(x, str) and MODEL_RE.fullmatch(x) for x in am):
+        raise PolicyError("llm.allowed_models must be a non-empty list of model names")
+    bpt = out.setdefault("bytes_per_input_token", 1)
+    if type(bpt) is not int or not 1 <= bpt <= 8:
+        raise PolicyError("llm.bytes_per_input_token must be an integer in [1, 8] (1 = most conservative)")
+    prices = out.setdefault("prices", {})
+    _keys(prices, "llm.prices", optional=list(prices))
+    for mname, pr in prices.items():
+        _keys(pr, f"llm.prices.{mname}", required=("input_per_mtok", "output_per_mtok"))
+        for k, v in pr.items():
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 10 ** 6:
+                raise PolicyError(f"llm.prices.{mname}.{k} must be a number in [0, 1e6] (USD per million tokens)")
+    if out["unit"] == "cost":
+        missing = [x for x in am if x not in prices]
+        if missing:
+            raise PolicyError(f"llm.unit=cost: no price for allowed models {missing}")
+    fp = out.setdefault("free_paths", ["/v1/messages/count_tokens", "/v1/models"])
+    if not isinstance(fp, list) or not all(isinstance(x, str) and x.startswith("/v1/") for x in fp):
+        raise PolicyError("llm.free_paths must be a list of /v1/... paths")
+    if "/v1/messages" in fp:
+        raise PolicyError("llm.free_paths must not contain /v1/messages (that path is always gated)")
+    return out
+
+
 ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]{0,127})\}")
 
 
@@ -247,7 +304,7 @@ class Policy:
     def __init__(self, doc, environ=None, resolve=True):
         """resolve=True replaces ${NAME} in upstreams with the value from environ (the
         airlock side). resolve=False keeps the names (host side: no secret is read)."""
-        _keys(doc, "forge.yaml", required=("version", "upstreams", "tools"), optional=("paths", "canary", "agent"))
+        _keys(doc, "forge.yaml", required=("version", "upstreams", "tools"), optional=("paths", "canary", "agent", "llm"))
         if doc["version"] != 1:
             raise PolicyError("version must be 1")
         # upstreams
@@ -333,7 +390,14 @@ class Policy:
         for hp in self.egress_allow:
             if not isinstance(hp, str) or not re.fullmatch(r"[A-Za-z0-9.-]{1,253}:[0-9]{1,5}", hp):
                 raise PolicyError(f"agent.egress_allow entry {hp!r} must be host:port")
-        self.env_names = env_refs(doc)
+        self.llm = parse_llm(doc.get("llm"))
+        self.env_names = sorted(set(env_refs(doc)) | ({self.llm["key_env"]} if self.llm else set()))
+        self.llm_key = None
+        if self.llm and resolve:
+            env = os.environ if environ is None else environ
+            self.llm_key = env.get(self.llm["key_env"])
+            if not self.llm_key:
+                raise PolicyError(f"llm.key_env: environment variable {self.llm['key_env']} is not set (fail closed)")
         # The policy file itself is never writable by the agent and never synced back.
         self.protected = PathSet(["forge.yaml"], "protected")
 
@@ -353,7 +417,7 @@ class Policy:
 
     def secrets(self):
         """Every credential value held on the airlock side (for the canary)."""
-        out = list(self.extra_secrets)
+        out = list(self.extra_secrets) + ([self.llm_key] if self.llm_key else [])
         for u in self.upstreams.values():
             for d in (u.get("env") or {}, u.get("headers") or {}):
                 for v in d.values():

@@ -3,15 +3,22 @@
 # that opens a TCP tunnel to exactly the host:port pairs in forge.yaml `agent.egress_allow`
 # (for example the model API that `claude` needs). Every other request gets 403.
 # It never sees plaintext (TLS goes end to end) and holds no credential.
-# Usage: egress_proxy.py <port> <host:port> [<host:port> ...]
+# Usage: egress_proxy.py <port> [<host:port> ...] [--private <host:port> ...]
+# A --private target (the model provider of forge.yaml `llm`) is opened only for a CONNECT
+# that carries "Proxy-Authorization: Bearer $FORGE_EGRESS_TOKEN". Only the airlock holds that
+# per-run token; the agent does not, so the agent cannot reach a private target itself.
 # Label: NATIVE CHECK (hand-written, not proved). An allowed host can still carry data out:
 # the allowlist limits WHERE the agent can talk, not WHAT it says there.
+import hmac
+import os
 import select
 import socket
 import sys
 import threading
 
 ALLOW = set()
+PRIVATE = set()
+TOKEN = os.environ.get("FORGE_EGRESS_TOKEN", "")
 
 
 def pipe(a, b):
@@ -48,7 +55,14 @@ def handle(c):
         line = head.split(b"\r\n", 1)[0].decode("latin-1")
         parts = line.split()
         target = parts[1] if len(parts) == 3 and parts[0] == "CONNECT" else None
-        if target is None or target.lower() not in ALLOW:
+        auth = ""
+        for h in head.split(b"\r\n")[1:]:
+            k, _, v = h.decode("latin-1").partition(":")
+            if k.strip().lower() == "proxy-authorization":
+                auth = v.strip()
+        private_ok = (target is not None and target.lower() in PRIVATE and len(TOKEN) >= 32
+                      and hmac.compare_digest(auth.encode(), ("Bearer " + TOKEN).encode()))
+        if target is None or (target.lower() not in ALLOW and not private_ok):
             print(f"[egress] refuse {line[:120]!r}", flush=True)
             c.sendall(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n")
             return c.close()
@@ -69,12 +83,18 @@ def handle(c):
 
 def main():
     port = int(sys.argv[1])
-    ALLOW.update(x.lower() for x in sys.argv[2:])
+    args, private = sys.argv[2:], False
+    for x in args:
+        if x == "--private":
+            private = True
+            continue
+        (PRIVATE if private else ALLOW).add(x.lower())
+        private = False
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("0.0.0.0", port))
     s.listen(128)
-    print(f"[egress] up on :{port}; allow {sorted(ALLOW)}", flush=True)
+    print(f"[egress] up on :{port}; allow {sorted(ALLOW)}; airlock-only {sorted(PRIVATE)}", flush=True)
     while True:
         c, _ = s.accept()
         threading.Thread(target=handle, args=(c,), daemon=True).start()

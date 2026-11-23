@@ -40,17 +40,84 @@ plugin moves (an update), it says so; `forge_airlock.py wrapper --force` writes 
 ## Credentials of the program in the box
 
 `claude` in the box needs model access. Nothing from your shell is copied into the box
-implicitly. Two ways:
+implicitly. Three ways:
 
+- **`llm` in `forge.yaml` (recommended; see "Model access through the airlock").** The box holds
+  NO key. The airlock adds the key from your shell and caps the spending. No `--pass-env`.
 - log in inside the box (Claude Code asks on first start; the login lives in the box's
   temporary `/tmp` and is gone afterwards), or
-- `./forge-airlock up --pass-env ANTHROPIC_API_KEY -- claude`. This prints a warning: **the
-  agent CAN read that value** and can send it to any host it can reach (here only the hosts in
-  `agent.egress_allow`). The clean answer is a separate, spend-capped key for the box. With
-  `--pass-env`, do not say that the agent "holds zero keys": it holds that one.
+- `./forge-airlock up --pass-env ANTHROPIC_API_KEY -- claude` (without `llm`). This prints a
+  warning: **the agent CAN read that value** and can send it to any host it can reach (here only
+  the hosts in `agent.egress_allow`). With `--pass-env`, do not say that the agent "holds zero
+  keys": it holds that one. `--pass-env` still works for other values, with the same warning.
 
-An upstream secret named in `forge.yaml` cannot be passed with `--pass-env` (refused), and if
-its value reaches the agent anyway, the canary reports BREACH and nothing runs.
+An upstream secret named in `forge.yaml`, or the `llm.key_env` key, cannot be passed with
+`--pass-env` (refused), and if its value reaches the agent anyway, the canary reports BREACH and
+nothing runs.
+
+## Model access through the airlock (`llm`)
+
+```yaml
+llm:
+  provider_url: https://api.anthropic.com   # default
+  key_env: ANTHROPIC_API_KEY                # the NAME of the variable in your shell; never the value
+  unit: cost                                # cost: estimated cost units (micro-USD); or tokens
+  session_cap: 10000000                     # per `forge up` run (10 USD in cost units)
+  daily_cap: 30000000                       # optional: per UTC day, all runs of this repository
+  per_request_max: 5000000                  # one request may reserve at most this much
+  allowed_models: [claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5]
+  prices:                                   # USD per million tokens; needed for unit: cost
+    claude-opus-5-5: {input_per_mtok: 4, output_per_mtok: 20}
+  bytes_per_input_token: 2                  # 1 = most conservative estimate (see below)
+```
+
+- The agent container gets `ANTHROPIC_BASE_URL=http://airlock:8701` and
+  `ANTHROPIC_AUTH_TOKEN=forge-airlock-no-key` (a dummy for clients that insist on a key). The
+  airlock drops every credential header the agent sends, adds the real key, and forwards only
+  `POST /v1/messages` (gated) and the free `llm.free_paths` (default `count_tokens`, `models`) to
+  the provider, through the egress proxy. The provider is an airlock-only egress target: the proxy
+  opens it only for a CONNECT with a per-run token that the agent does not have (the canary checks
+  that the agent's own CONNECT is refused). Responses, also Server-Sent Events streams, go back
+  chunk by chunk.
+- **Reserve.** Before forwarding: amount = `max_tokens` + estimated input (request bytes /
+  `bytes_per_input_token` + 256); in cost units, input at 2x the input price (the worst cache-write
+  price) and output at the output price. The compiled #91 verifier checks the session log (and the
+  day log) PLUS every reservation in flight PLUS this one. On ACCEPT the reservation is journaled
+  PENDING (fsync) and the request is forwarded; else HTTP 400 `FORGE_LLM_CAP_REACHED` (or
+  `FORGE_LLM_PER_REQUEST_MAX`, `FORGE_LLM_MODEL`) and nothing leaves the airlock.
+- **Settle.** After the response, the usage the provider reported (input + cache write + cache
+  read + output tokens, or their cost) is appended to the log as one step (COMMITTED), again only
+  after the verifier ACCEPTs. If the usage is unknown (provider error, a cut stream, the agent
+  closing the stream, a crash or a restart), the FULL reservation is appended (ABORTED: the
+  reservation is kept). If the reported usage is larger than the reservation and passes the cap
+  (the estimate was wrong), the log is filled to the cap exactly and the journal says OVERRUN
+  with the true amount; every later request is refused.
+- The logs live in the logs volume, so the session cap survives an airlock restart and the day
+  cap counts across runs. A changed `daily_cap` applies from the next UTC day (the stored log
+  keeps its cap; the airlock refuses to start on a mismatch) or after `forge reset-logs`.
+- The estimate is an upper bound only IF the provider counts at most one input token per
+  `bytes_per_input_token` request bytes, and outputs at most `max_tokens`. With 1 that holds for
+  byte-level tokenizers on text; server-side tools (web search results), fallback models and
+  per-search fees are NOT in the estimate or the settlement. The provider's own token count is
+  trusted (it is what you are billed for).
+
+| Part | Label |
+| --- | --- |
+| Verdict of the verifier on each llm log (gross never above cap, chain, seq, duplicate id, expiry), incl. log + open reservations | PROVED (about the Dafny model only) |
+| The request estimate, the reading of usage (JSON and SSE), settlement, OVERRUN clamp, the reservation journal and its restart recovery | NATIVE CHECK |
+| The proxy, the header filter, the egress token, the key staying out of the box | NATIVE CHECK, plus the FINITE TEST below |
+| "spending stays under the cap" for real money | NOT PROVED: holds only if the provider's usage report is correct and complete |
+
+Test: `python3 airlock/tests/run_llm_gate.py` (gate G8 of `prove_release.sh`): a FAKE provider
+in Docker that speaks the Messages API (JSON and SSE with usage fields) and a FAKE key. It
+checks: no key in the agent's environment, any `/proc/<pid>/environ` or `cmdline`, or any file
+(by fingerprint); no route from the agent to the provider; the provider saw the real key on every
+request and never the dummy; settlement equals the reported usage (JSON and SSE, with cache
+fields); a provider error, a cut stream and a SIGKILL of the airlock while PENDING keep the full
+reservation; 20 concurrent streams: exactly floor(room / reservation) forwarded, the rest refused,
+and the provider received exactly those; the gross and the cap survive a restart; the model key
+planted in the agent gives canary BREACH and the endpoint then refuses; `forge up` works without
+`--pass-env`, and refuses `--pass-env` of the model key.
 
 ## What `up` does
 
@@ -126,7 +193,8 @@ cost; the compiled SHA-256 over every record was. The cost still grows with the 
 python3 airlock/tests/run_tests.py      # no Docker: policy, paths, sync filter, verifier, draft
 python3 airlock/tests/run_up_e2e.py     # Docker: forge up end to end (y, n, breach)
 airlock/proof/prove_airlock.sh          # Docker: the battery (5 domains) + benchmark
-./prove_release.sh                      # all 7 release gates of the plugin (see the top-level README)
+python3 airlock/tests/run_llm_gate.py   # Docker: the model proxy and its spending gate (fake provider)
+./prove_release.sh                      # all 8 release gates of the plugin (see the top-level README)
 ```
 
 `run_tests.py`: policy validation, `${NAME}` handling, path rules (hidden, visible, read-only,
@@ -169,10 +237,18 @@ exactly the allowed files; a passed upstream secret gives canary BREACH, exit 10
 | Isolation | container tier: the box shares the host kernel (on macOS, Docker Desktop's Linux VM) |
 | Hosts in `agent.egress_allow` | reachable: the box can send data there |
 | `--pass-env NAME` | the agent can read that value |
+| `llm`: spending caps | the verifier's verdict on the log is PROVED; estimate, settlement and proxy are NATIVE CHECK |
 
 ## Not tested
 
-- `claude` doing real work in the box with a model key (no key was used). Tested: Claude Code
+- The `llm` model proxy with real Claude Code work in the box. The gate test uses a fake provider.
+  Against the real API, ONE smoke request only (`run_llm_gate.py --real-smoke`, 2026-11-23,
+  `claude-opus-5-5`, `max_tokens` 20, cap 3000 tokens, through the egress proxy with TLS): HTTP 200,
+  usage 13 input + 6 output, 19 tokens settled = the reported usage, no key variable in the box.
+  Not tested beyond that: streaming against the real API, Claude Code's own request mix (its models,
+  `count_tokens`, retries) and TLS under load, provider-side features that bill outside
+  the usage fields (server tools, fallbacks), and a model price change.
+- `claude` doing real work in the box with a model key. Tested: Claude Code
   2.1.330 in the box reports the airlock as "✔ Connected" (`claude mcp list`), and the proxy
   tunnels to `api.anthropic.com:443` and refuses `github.com:443` (403).
 - Interactive TTY on Linux and Windows hosts (tested on macOS through a pseudo-terminal only);

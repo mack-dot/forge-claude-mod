@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# prove_release.sh - the release battery of the forge plugin: 7 gates, exit 0 only if all pass.
+# prove_release.sh - the release battery of the forge plugin: 8 gates, exit 0 only if all pass.
 #   ./prove_release.sh [out_dir]          (default: .forge/cache/release/<time>)
 # Needs: python3, git, Dafny 4.11 or the pinned download, node 22.18+, go + goimports, cargo,
 # java (the checker tests), Claude Code (`claude plugin validate`), Docker with Compose v2.
@@ -12,6 +12,8 @@
 #   G5 diff sync-back: allowed edits applied on y, none on n, hidden and read-only edits rejected
 #   G6 gated-call latency before (subprocess per call) and after (persistent verifier), >= 100 calls
 #   G7 README: the unified workflow and its honest labels
+#   G8 llm model proxy (fake provider, fake key): no key in the box, SSE, settlement = reported usage,
+#      error / cut stream / kill keep the reservation, 20 concurrent stop at the cap, restart, forge up
 # Label: FINITE TEST (one machine, the listed inputs). Container tier: shares the host kernel.
 set -u
 cd "$(dirname "$0")"
@@ -129,6 +131,12 @@ sys.exit(0 if ok else 1)
 PY
 gate G6 "gated-call latency before (subprocess) vs after (persistent), median and p95" $g $((SECONDS-t))
 
+# ---------------------------------------------------------------- G8
+t=$SECONDS; g=0
+python3 airlock/tests/run_llm_gate.py >"$OUT/g8-llm-gate.txt" 2>&1 || g=1
+grep -E "^(FAIL|llm gate:|timings)" "$OUT/g8-llm-gate.txt" | sed 's/^/     /'
+gate G8 "llm proxy: no key in box, SSE, settle, error/cut/kill keep, 20 parallel at cap, restart" $g $((SECONDS-t))
+
 # ---------------------------------------------------------------- G7
 t=$SECONDS
 python3 - <<'PY'; g=$?
@@ -147,7 +155,9 @@ gate G7 "README: unified workflow and honest labels" $g $((SECONDS-t))
 c=$(docker ps -aq --filter name=forgeair | wc -l | tr -d ' ')
 vol=$(docker volume ls -q | grep -cE '^(forgeair|forge-airlock)' | tr -d ' ')
 net=$(docker network ls -q --filter name=forgeair | wc -l | tr -d ' ')
-echo "cleanup: containers=$c volumes=$vol networks=$net" | tee -a "$OUT/scoreboard.txt"
+c=$((c + $(docker ps -aq --filter name=llm- | wc -l))); vol=$((vol + $(docker volume ls -q | grep -c '^llm-')))
+net=$((net + $(docker network ls -q --filter name=llm- | wc -l)))
+echo "cleanup: containers=$c volumes=$vol networks=$net (forgeair*, forge-airlock*, llm-*)" | tee -a "$OUT/scoreboard.txt"
 fail=0
 for e in "${G_EXIT[@]}"; do [ "$e" = 0 ] || fail=1; done
 [ "$c$vol$net" = 000 ] || fail=1

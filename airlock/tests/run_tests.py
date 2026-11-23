@@ -338,7 +338,9 @@ def test_draft():
          "frobnicate" not in allow | set(gate) | set(doc["tools"]["deny"])
          and any(q.get("tool") == "frobnicate" and q["proposal"] == "ask" for q in questions))
     pol = Policy(doc, resolve=False)
-    case("draft: the draft is a valid policy", set(pol.env_names) == {"GITHUB_PERSONAL_ACCESS_TOKEN", "STRIPE_KEY"})
+    case("draft: the draft is a valid policy", set(pol.env_names) == {"GITHUB_PERSONAL_ACCESS_TOKEN", "STRIPE_KEY", "ANTHROPIC_API_KEY"})
+    case("draft: claude gets an llm section (key by NAME, cost caps) and no egress for the model",
+         doc["llm"]["key_env"] == "ANTHROPIC_API_KEY" and pol.llm["unit"] == "cost" and not pol.egress_allow)
     r = subprocess.run([sys.executable, os.path.join(PKG, "forge_airlock.py"), "init", "--repo", repo, "--json"],
                        capture_output=True, text=True)
     case("draft: `forge init --json` runs without Docker and leaks no value",
@@ -368,8 +370,66 @@ def test_static():
     case("static: no absolute host home path in the package", not bad, bad)
 
 
+def test_llm():
+    import llm_proxy as L
+    env = {"PAY_KEY": "FAKE_pay_key_not_real_1234", "MODEL_KEY": "FAKE_model_key_not_real_5678"}
+    llm = {"key_env": "MODEL_KEY", "session_cap": 1000, "allowed_models": ["m1"]}
+    p = Policy(base_doc(llm=llm), environ=env)
+    case("llm: defaults (provider api.anthropic.com:443, x-api-key, tokens, per_request_max = session_cap)",
+         (p.llm["host"], p.llm["port"], p.llm["auth_header"], p.llm["unit"], p.llm["per_request_max"])
+         == ("api.anthropic.com", 443, "x-api-key", "tokens", 1000))
+    case("llm: the key is a secret of the airlock (canary) and its NAME is passed to the airlock only",
+         "FAKE_model_key_not_real_5678" in p.secrets() and "MODEL_KEY" in p.env_names
+         and Policy(base_doc(llm=llm), resolve=False).llm_key is None)
+    case("llm: key_env unset on the airlock side -> fail closed",
+         raises(lambda: Policy(base_doc(llm=llm), environ={"PAY_KEY": "FAKE_pay_key_not_real_1234"}), contains="MODEL_KEY"))
+    for bad, why in ((dict(llm, key_env="sk-ant-value"), "NAME"), (dict(llm, provider_url="https://x/v1"), "no path"),
+                     (dict(llm, unit="cost"), "no price"), (dict(llm, allowed_models=[]), "allowed_models"),
+                     (dict(llm, extra=1), "unknown keys"), (dict(llm, free_paths=["/v1/messages"]), "always gated")):
+        case(f"llm: invalid section refused ({why})", raises(lambda: Policy(base_doc(llm=bad), environ=env), contains=why))
+    d = tempfile.mkdtemp()
+    try:
+        cfg = dict(p.llm, session_cap=100)
+        g = L.LLMGate(cfg, d, "unit")
+        a, b = os.urandom(16), os.urandom(16)
+        la, _ = g.reserve(a, 60, {})
+        lb, why = g.reserve(b, 60, {})
+        case("llm gate: a reservation counts while in flight (60 + 60 > 100 refused by the verifier)",
+             la and lb is None and why["verdict"] == "REJECT_OVER_CAP")
+        g.settle(la, a, 10, "usage")
+        lb, _ = g.reserve(b, 60, {})
+        case("llm gate: settlement to reported usage frees the rest (10 settled, then 60 fits)",
+             lb is not None and g.session.gross() == 10)
+        g2 = L.LLMGate(cfg, d, "unit")  # restart while b is PENDING
+        case("llm gate: PENDING at restart -> full reservation spent (ABORTED)",
+             g2.session.gross() == 70 and g2.status()["session"]["reservations"].get("ABORTED") == 1)
+        c = os.urandom(16)
+        lc, _ = g2.reserve(c, 30, {})
+        case("llm gate: usage above the reservation and the cap -> log clamped at the cap, OVERRUN",
+             g2.settle(lc, c, 45, "usage") == ["OVERRUN"] and g2.session.gross() == 100
+             and g2.status()["session"]["proved_verdict"] == "ACCEPT")
+        cc = dict(cfg, unit="cost", prices={"m1": {"input_per_mtok": 4, "output_per_mtok": 20}})
+        gc = L.LLMGate(cc, d, "cost")
+        est, _ = gc.estimate({"model": "m1", "max_tokens": 10}, 100)
+        act = gc.actual("m1", {"input_tokens": 100, "output_tokens": 10, "cache_read_input_tokens": 1000,
+                               "cache_creation_input_tokens": 50,
+                               "cache_creation": {"ephemeral_5m_input_tokens": 50, "ephemeral_1h_input_tokens": 0}})
+        case(f"llm cost units: estimate {est} = (100+256)*4*2 + 10*20; actual {act} = 400+250+400+200",
+             est == 3048 and act == 1250)
+        case("llm: usage without input_tokens/output_tokens is unknown (None)", gc.actual("m1", {"output_tokens": 3}) is None)
+        sse = L.SSEUsage()
+        for part in (b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":5,',
+                     b'"output_tokens":1}}}\n\nevent: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":9}}',
+                     b'\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n'):
+            sse.feed(part)
+        case("llm SSE reader: usage across chunk borders, complete after message_stop",
+             sse.complete() and sse.usage["input_tokens"] == 5 and sse.usage["output_tokens"] == 9)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
-    for t in (test_policy, test_paths, test_sync, test_verifier, test_draft, test_static):
+    for t in (test_policy, test_paths, test_sync, test_verifier, test_draft, test_llm, test_static):
         try:
             t()
         except Exception as e:  # noqa: BLE001

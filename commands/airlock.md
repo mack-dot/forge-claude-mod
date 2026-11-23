@@ -16,12 +16,12 @@ Steps:
    - hidden_paths: "Hide these from the agent completely (absent, also from git history)?" with the exact patterns and 1–3 example files each (`.env*`, secrets, `infra/**`, proprietary code);
    - readonly_paths: "Let the agent read but never change these?" (`tests/**`, `spec/**`, `.forge/**`, `INVARIANTS.md`, `.github/**`);
    - per MCP server: read-like tools allowed, destructive tools denied, tools that spend money or act on the world gated with a cap. Ask for each cap as a number with its unit (for example "refunds: at most 5000 cents in total for 24 hours?" or "create_pull_request: at most 10 calls?");
-   - whether the agent may reach the model API (`agent.egress_allow: ["api.anthropic.com:443"]`, needed for `claude` in the box; nothing else is reachable).
+   - model access for `claude` in the box (the draft's `llm` section): the NAME of the shell variable that holds the key (`key_env`, usually `ANTHROPIC_API_KEY`; the key never enters the box, the airlock adds it), the caps per session and per UTC day and per request (estimated cost units: 1000000 = 1 USD from the `prices` table, or `unit: tokens`), and the allowed models. Say that the prices are a snapshot to check. The box needs no `agent.egress_allow` for the model.
    A tool you cannot classify stays out (default deny) unless the person allows it.
 5. Write `forge.yaml` in the repository root from the draft and the answers (keep the draft's header comment). Then run `python3 "${CLAUDE_PLUGIN_ROOT}/airlock/forge_airlock.py" check` if Docker is available, and fix any error it reports.
 6. Write the project wrapper: `python3 "${CLAUDE_PLUGIN_ROOT}/airlock/forge_airlock.py" wrapper` (it refuses to replace a different `./forge-airlock`; ask before passing `--force`).
 7. End with exactly what to type in a terminal (not here), for example:
    `./forge-airlock up -- claude`
-   and, only if the person wants `claude` in the box to use an API key: `./forge-airlock up --pass-env ANTHROPIC_API_KEY -- claude`. Say plainly: with `--pass-env` the agent CAN read that value; use a separate, spend-capped key. Also say: when the program exits, the airlock shows the diff and changes the real repository only after they type y; hidden and read-only paths are never changed.
+   With `llm` in forge.yaml, `claude` in the box uses the key from the person's shell through the airlock, capped, and the box holds no key: no `--pass-env` is needed. Without `llm`, they log in inside the box, or pass a key with `--pass-env ANTHROPIC_API_KEY`; say plainly that with `--pass-env` the agent CAN read that value. Also say: when the program exits, the airlock shows the diff and changes the real repository only after they type y; hidden and read-only paths are never changed.
 
 Focus, if the person gave one: $ARGUMENTS
