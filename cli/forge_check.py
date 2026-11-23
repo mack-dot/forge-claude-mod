@@ -1064,6 +1064,10 @@ def write_json(root, rel, value):
 
 
 def main(argv=None):
+    # Dafny's bundled .NET runtime stops on Linux systems without the ICU library (minimal images, many servers):
+    # "Couldn't find a valid ICU package". Dafny does not need culture data, so run it without (found in a clean
+    # python:3.12-slim container).
+    os.environ.setdefault('DOTNET_SYSTEM_GLOBALIZATION_INVARIANT', '1')
     p = argparse.ArgumentParser(prog='forge_check.py', description='Forge proof check')
     p.add_argument('command', choices=['check', 'approve', 'spec', 'build', 'setup', 'mutate', 'diff', 'invariants'])
     p.add_argument('--root', default='.', help='project folder (default: current folder)')

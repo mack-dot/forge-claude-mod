@@ -6,8 +6,10 @@ Forge rule: the person approves a short spec once; after that, code may change o
 
 You are running the Forge rule conversation in the current project. Follow these steps in order.
 
+AUDIT MODE FIRST: until the person has approved and explicitly asked to switch their app over, do NOT modify any existing file of their application. Only create new files (spec/, impl/, diff/, fuzz/, .forge/) and edit .forge/forge.json. Their shipped code is what gets fuzzed against the proved rule; it must stay as it is.
+
 0. SET UP. Run `python3 "${CLAUDE_PLUGIN_ROOT}/cli/forge_check.py" setup --json` and note the "dafny" path (it downloads Dafny once if needed). If it fails, explain the error in two lines and stop.
-1. ASK FIRST. The person's rule, if they already gave it: "$ARGUMENTS". If that is empty, ask them to say, in their own words, one rule their software must never break. Do not suggest a rule and do not read the code before they answer. Only if they say they do not know, look at the code and offer up to three candidates (or suggest `/forge:scan`), and let them pick or rephrase.
+1. ASK FIRST. The person's rule, if they already gave it: "$ARGUMENTS". If it is a number, read that row of `.forge/candidates.md` (written by /forge:scan), say the rule back in one plain sentence, and ask the person to confirm it or reword it in their own words; use their final wording. If it is empty, ask them to say, in their own words, one rule their software must never break. Do not suggest a rule and do not read the code before they answer. Only if they say they do not know, look at the code and offer up to three candidates (or suggest `/forge:scan`), and let them pick or rephrase.
 2. CLASSIFY and say it plainly:
    - pure rule (limits, prices, permissions, state changes, parsing): can be PROVED in a Dafny model;
    - rule mixed with I/O (database, network, time): split the rule out; only the rule is proved;

@@ -80,3 +80,13 @@ jobs:
           if command -v dafny; then echo "dafny is already installed; this job must start without it"; exit 1; fi
           python3 cli/forge_check.py setup --root examples/wallet-cap
           python3 cli/forge_check.py check --root examples/wallet-cap --no-write
+  no-dotnet-no-icu:
+    # A minimal Linux with no .NET and no ICU library: the pinned Dafny download must still start and prove.
+    runs-on: ubuntu-latest
+    container: python:3.12-slim
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          if command -v dotnet; then echo "dotnet present; this job must run without it"; exit 1; fi
+          python3 cli/forge_check.py setup --root examples/wallet-cap
+          python3 cli/forge_check.py check --root examples/wallet-cap --no-write

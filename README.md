@@ -1,8 +1,26 @@
 # Forge for Claude Code
 
-A Claude Code mod that brings the Forge proof gate into your session. (Forge's research record is a separate,
-private repository; this plugin needs nothing from it.)
-You approve a short spec once. After that, code may change only if Dafny proves it still meets the spec.
+**Approve the rules your code must never break, in plain words; Forge proves them and fuzzes your real code
+against them, in Python, TypeScript, Go, Rust, Java and C#.**
+
+```
+/plugin install forge --marketplace mack-dot/forge-claude-mod
+/forge
+```
+
+That is all you need to remember: `/forge` runs whatever comes next (a read-only scan, your approval, the proof,
+the fuzz). Nothing in your app changes until you approve. What it looks like on the included example:
+
+```
+forge ✓ VERIFIED 1/1
+✗ wallet-cap:py: 3 failing decision(s) in 1500 random inputs (177 ms)
+  your recorded decisions: 1 of 4 agree; failing: D1 exact cap allowed, D3 zero rejected, D4 negative rejected
+✗ wallet-cap:java: … legacy-java says {"ok": true, "spent": -9223372036854775808}   (a long overflow, found by itself)
+Every disagreement above is a bug in your shipped code or a gap in the rule. Your app files are unchanged.
+```
+
+Proved means: the rule's Dafny model is proved. Compiled code, your wrapper and the fuzz are tested, not proved.
+Details, limits and every command are below.
 
 ## Install
 
@@ -177,7 +195,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mack-dot/forge-claude-mod@v0.11.0   # better: pin the commit hash, tags can move
+      - uses: mack-dot/forge-claude-mod@v0.12.0   # better: pin the commit hash, tags can move
 ```
 
 The job fails unless every check is `VERIFIED`. On a pull request, any change to `forge.json`,

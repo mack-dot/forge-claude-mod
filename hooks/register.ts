@@ -210,38 +210,35 @@ async function approve($: Api, isConfirmed: boolean): Promise<string> {
 // /forge:add, /forge:explain, /forge:fix, /forge:build-setup, /forge:doctor). A command.run hook cannot
 // start a Claude turn: the host refuses $.prompt.submit there.
 
-async function wizard($: Api): Promise<string> {
+// Bare /forge runs whatever comes next, so a beginner needs only this one command.
+async function wizard($: Api): Promise<{ text: string; fill?: string }> {
   const root: string = await $.session.root()
   const cfg = await readJson<Config>($, join(root, CONFIG))
   const dafny = await findDafny($, root, cfg?.dafny)
   const approved = (await readJson<Record<string, string>>($, join(root, APPROVED))) ?? {}
-  const last = await readJson<LastCheck>($, join(root, LAST))
 
   if (!dafny)
-    return 'Forge · step 1 of 5: Dafny (the proof checker) could not be set up automatically.\nType /forge:doctor and Claude will find out why.'
-  if (!cfg?.checks?.length)
-    return (
-      'Forge · step 2 of 5: pick one rule your software must never break.\n' +
-      'Type /forge:add followed by the rule in your own words, for example:\n' +
-      '  /forge:add a wallet must never spend more than its cap\n' +
-      'Claude will ask about the edge cases. Not sure which rule? Type /forge:scan first.'
-    )
+    return { text: 'Forge: Dafny (the proof checker) could not be set up automatically.', fill: '/forge:doctor ' }
+  if (!cfg?.checks?.length) {
+    const hasCandidates = await $.fs.exists(join(root, '.forge/candidates.md'))
+    return hasCandidates
+      ? { text: 'Forge: pick a rule from your last scan (.forge/candidates.md) by its number. Nothing in your code changes until you approve.', fill: '/forge:add ' }
+      : { text: 'Forge: first, a read-only scan of this codebase for the rules worth protecting (nothing is changed).', fill: '/forge:scan ' }
+  }
   const unapproved = cfg.checks.filter(c => [c.spec, c.examples, c.decisions].some(f => f && !approved[f]))
   if (unapproved.length || !approved[CONFIG])
-    return `Forge · step 3 of 5: read what you are about to approve (${unapproved.map(c => c.name).join(', ') || 'forge.json'}).\nType /forge:explain for a plain-words explanation, then /forge approve, then /forge approve yes.`
-  if (!last || isStale) return 'Forge · step 4 of 5: prove it. Running /forge check now…\n\n' + (await runChecks($))
-  const bad = Object.entries(last.verdicts).filter(([, v]) => v !== 'VERIFIED')
-  if (bad.length)
-    return `Forge · step 4 of 5: ${bad.length} check(s) not verified (${bad.map(([n, v]) => `${n}: ${v}`).join(', ')}).\nType /forge:fix and Claude will explain and propose a fix.`
-  return (
-    'Forge · step 5 of 5: done. Every check is VERIFIED.\n' +
-    'Now let Claude (or any agent) change that code freely. After each turn that touches a covered file, the status line says "code changed"; run /forge check.\n' +
-    'If a spec file changes, the check says SPEC_CHANGED until you approve again.\n' +
-    'To fuzz your real code against the proved rule: /forge fuzz (automatic after that).\n' +
-    'To see how many planted bugs the proof catches: /forge mutate.\n' +
-    'To use the proved code in your app: /forge:build-setup, then /forge build.\n' +
-    'Add another rule: /forge:add <the rule in your own words>.'
-  )
+    return { text: await showForApproval($, 'Forge: read what you are about to approve (only you can):') }
+  // Approved: prove it, then fuzz the untouched shipped code against the proved rule (if set up).
+  const proof = await runChecks($)
+  const last = await readJson<LastCheck>($, join(root, LAST))
+  const bad = Object.entries(last?.verdicts ?? {}).filter(([, v]) => v !== 'VERIFIED')
+  if (bad.length) return { text: `${proof}\n\nForge: something is not verified. Claude can explain and propose a fix:`, fill: '/forge:fix ' }
+  const hasDiff = cfg.checks.some(c => c.diff)
+  const fuzz = hasDiff ? await runDiff($) : ''
+  const next = hasDiff
+    ? 'Every disagreement above is a bug in your shipped code or a gap in the rule. Your app files are unchanged.\nOptional next steps: switch your app to the proved code (ask Claude: "switch my app to the proved rule"); /forge add for another rule; /forge mutate; /forge invariants.'
+    : 'Next: fuzz your shipped code against the proved rule. Claude sets it up without changing your app files:'
+  return { text: `${proof}${fuzz ? '\n\n' + fuzz : ''}\n\n${next}`, fill: hasDiff ? undefined : '/forge:fuzz ' }
 }
 
 // Files whose change should trigger the differential fuzz: the proved code, the files that import it, the
@@ -375,7 +372,12 @@ export const register: Register = on => {
       )
       return { text: isFilled ? `Press Enter to run ${line.trim()}.` : `Type ${line.trim()} (Claude runs it as a conversation).` }
     }
-    return { text: await wizard($) }
+    const step = await wizard($)
+    if (step.fill) {
+      const isFilled = await $.prompt.fill({ text: step.fill }).then(() => true, () => false)
+      return { text: `${step.text}\n${isFilled ? 'Press Enter to run ' : 'Type '}${step.fill.trim()}` }
+    }
+    return { text: step.text }
   })
 
   // End of a Claude turn: if an edit touched a file the differential fuzz covers, run it (well under two
