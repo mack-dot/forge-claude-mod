@@ -762,8 +762,8 @@ def main():
             ('diff: shipped Python bugs found (exact cap, zero, negative)', code == 1 and py.get('verdict') == 'DISAGREE'
              and failing_py == ['D1', 'D3', 'D4']),
             ('diff: the wrapper agrees with the proved rule', (py.get('per_candidate') or {}).get('app-wrapper') == 0),
-            ('diff: shipped TypeScript bugs found (zero, negative)', js.get('verdict') == 'DISAGREE'
-             and failing_js == ['D3', 'D4']),
+            ('diff: shipped TypeScript bugs found (exact cap, zero, negative)', js.get('verdict') == 'DISAGREE'
+             and failing_js == ['D1', 'D3', 'D4']),
             ('diff: each run under 2 seconds', py.get('ms', 9999) < 2000 and js.get('ms', 9999) < 2000),
             ('diff: at most 3 differently shaped examples per kind of wrong answer, never a decision input again',
              all(n <= 3 for n in __import__('collections').Counter((d['candidate'], d.get('group')) for d in py.get('disagreements', [])).values())
@@ -793,13 +793,13 @@ def main():
         go_res, rs_res = res.get('wallet-cap:go', {}), res.get('wallet-cap:rs', {})
         cases.append(('diff: Go evaluator finds the shipped Go bugs (exact cap, zero, negative)',
                       sorted(f['id'][:2] for f in (go_res.get('decisions') or {}).get('failing', [])) == ['D1', 'D3', 'D4']))
-        cases.append(('diff: Rust evaluator finds zero accepted and the overflow panic',
-                      [f['id'][:2] for f in (rs_res.get('decisions') or {}).get('failing', [])] == ['D3']
+        cases.append(('diff: Rust evaluator finds exact cap, zero accepted and the overflow panic',
+                      sorted(f['id'][:2] for f in (rs_res.get('decisions') or {}).get('failing', [])) == ['D1', 'D3']
                       and any('overflow' in json.dumps(d['got']) for d in rs_res.get('disagreements', []))))
         cases.append(('diff: Go and Rust runs under 2 seconds once built', go_res.get('ms', 9999) < 2000 and rs_res.get('ms', 9999) < 2000))
         java_res = res.get('wallet-cap:java', {})
-        cases.append(('diff: Java evaluator finds the exact-cap bug and the long wraparound',
-                      [f['id'][:2] for f in (java_res.get('decisions') or {}).get('failing', [])] == ['D1']
+        cases.append(('diff: Java evaluator finds exact cap, zero accepted and the long wraparound',
+                      sorted(f['id'][:2] for f in (java_res.get('decisions') or {}).get('failing', [])) == ['D1', 'D3']
                       and any(isinstance(d.get('got'), dict) and d['got'].get('ok') is True
                               and isinstance(d['got'].get('spent'), int) and d['got']['spent'] < 0
                               for d in java_res.get('disagreements', []))))
