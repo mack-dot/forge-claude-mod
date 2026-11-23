@@ -28,6 +28,14 @@ OUT="${1:-.forge/cache/release/$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
 T0=$SECONDS
+# Per-run names for the proof battery (validate.sh, bench.sh): containers, volumes and the image tag
+# carry this id, so another run on the same Docker host cannot remove or replace them mid-run.
+export FORGEAIR_RUN="${FORGEAIR_RUN:-r$(python3 -c 'import secrets; print(secrets.token_hex(3))')}"
+# Docker objects of other tools (forge up, the llm gate) have their own random names; the cleanup
+# check below counts only objects that did not exist when this run started.
+docker_names() { { docker ps -a --format '{{.Names}}'; docker volume ls -q; docker network ls --format '{{.Name}}'; } 2>/dev/null \
+  | grep -E '^(forgeair|forge-airlock|llm-)' | sort -u; }
+BEFORE=$(docker_names)
 : > "$OUT/scoreboard.txt"
 declare -a G_NAME G_EXIT G_SEC
 
@@ -191,14 +199,16 @@ PY
 gate G7 "README: unified workflow and honest labels" $g $((SECONDS-t))
 
 # ---------------------------------------------------------------- cleanup and result
-c=$(docker ps -aq --filter name=^forgeair | wc -l | tr -d ' ')
-vol=$(docker volume ls -q | grep -cE '^(forgeair|forge-airlock)' | tr -d ' ')
-net=$(docker network ls -q --filter name=^forgeair | wc -l | tr -d ' ')
-c=$((c + $(docker ps -aq --filter name=^llm- | wc -l))); vol=$((vol + $(docker volume ls -q | grep -c '^llm-')))
-net=$((net + $(docker network ls -q --filter name=^llm- | wc -l)))
-echo "cleanup: containers=$c volumes=$vol networks=$net (forgeair*, forge-airlock*, llm-*)" | tee -a "$OUT/scoreboard.txt"
+docker image rm "forge-airlock-proof:$FORGEAIR_RUN" >/dev/null 2>&1 || true
+docker image rm "forge-airlock-inbox:$FORGEAIR_RUN" >/dev/null 2>&1 || true   # G9 harness image of this run
+NEW=$(comm -13 <(echo "$BEFORE") <(docker_names) | grep -v '^$')
+OTHER=$(echo "$NEW" | grep -v "^forgeair-$FORGEAIR_RUN-" | grep -v '^$')
+MINE=$(echo "$NEW" | grep "^forgeair-$FORGEAIR_RUN-")
+echo "cleanup: run $FORGEAIR_RUN: $(echo "$NEW" | grep -c .) Docker object(s) left that did not exist at the start (forgeair*, forge-airlock*, llm-*)" | tee -a "$OUT/scoreboard.txt"
+[ -n "$NEW" ] && echo "$NEW" | sed 's/^/     left: /' | tee -a "$OUT/scoreboard.txt"
+[ -n "$OTHER" ] && [ -z "$MINE" ] && echo "     (names without this run's id may belong to another run on this host; rerun on a quiet host to tell)" | tee -a "$OUT/scoreboard.txt"
 fail=0
 for e in "${G_EXIT[@]}"; do [ "$e" = 0 ] || fail=1; done
-[ "$c$vol$net" = 000 ] || fail=1
+[ -z "$NEW" ] || fail=1
 echo "prove_release: $([ $fail = 0 ] && echo PASS || echo FAIL) total=$((SECONDS-T0))s out=${OUT#"$PWD"/}" | tee -a "$OUT/scoreboard.txt"
 exit $fail

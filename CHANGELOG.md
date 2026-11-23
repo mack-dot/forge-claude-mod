@@ -2,6 +2,107 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## Unreleased
+
+- New (diff, M1.1b): messy-input fuzz in the Go, Rust, Java and C# evaluators, as in JavaScript/TypeScript and
+  Python. An adapter may name raw-value `wrappers` (or one `wrapper`) and a fail-closed answer: Go
+  `json.RawMessage` (`failClosed`), Rust `serde_json::Value` (`fail_closed`), Java the evaluator's parsed value
+  (`failClosed`), C# `JsonElement` (`FailClosed`). Go and Rust bind them at build time (an adapter without them still
+  builds); Java and C# find them by reflection. A panic or exception is `THROWS_ON_MESSY_INPUT`. `undefined` is
+  JavaScript only; Rust does not get the lone surrogate (serde_json rejects it while it parses), announced in the
+  protocol hello as `"skip"` and reported as `skipped_kinds`.
+- Example: three planted wrappers per language (`messygo/`, `messy_wrappers.rs`, `messyjava/`, `messycs/`, adapters
+  `diff/wallet_messy.{go,rs,java,cs}`): one that crashes on a null, missing or wrong-typed amount, one that coerces
+  `"5"`, and a fail-closed one (negative control).
+- Tested: `tests/run_tests.py` 115 cases, 0 failed (16 new for Go, Rust, Java: messy off finds nothing; the crash and
+  the coercion are found on `amount` only and shrunk to cap 0, spent 0; the fail-closed wrapper has 0 messy
+  disagreements over about 1,525 messy inputs; every kind is tried and judged; saved cases replay).
+  `tests/run_cs_diff.py`: the same for C#, plus the warm speed of a 1,500-input run (CI only: no .NET locally).
+- Not tested: C# on a local machine; wrappers that take a typed struct (the adapter passes raw JSON).
+- New: `diff --coverage` (off by default): per watched file of a py or js diff entry, the lines and branches the
+  run reached, and every unreached branch by `file:line` and source line. coverage.py when importable, else a
+  standard-library tracer (`cli/eval/py_cover.py`); JS/TS through Node's built-in `NODE_V8_COVERAGE` (blocks never
+  run; V8 gives no branch total). Not measured: Go, Rust, Java, C#, cmd. Code: `cli/forge_coverage.py`, small hooks
+  in `run_diff`/`diff_report`.
+- New: `mutate --app`: mutants of the shipped code (the diff entries' watch files) in a temporary copy, one diff
+  run each (fixed seed and input count); caught / survived / not run, survivors marked as on a line the fuzz
+  reached or never reached; equivalent mutants are possible and said so. py and js by default, `--langs all` for
+  the compiled languages. Code: `cli/forge_mutate_app.py`.
+- Tested (`tests/coverage_mutate_cases.py`, 10 cases, 11 with coverage.py installed): on the example with the
+  planted bugs fixed, the example's inputs reach 4/4 lines and 2/2 branches of `legacy_wallet.py` and catch every
+  mutant of the cap comparison (Python and TypeScript; 19 of 21 caught overall); a deliberately weak inputs module
+  (negative control) drops to 1/2 branches, names the unreached reject path in both languages, and lets the
+  cap-comparison mutants survive (8 of 21). Project files unchanged after `mutate --app`. coverage.py 7.16 and the
+  stdlib tracer give the same counts on the example (checked by hand on one machine; the CI runner has no
+  coverage.py, so CI tests the tracer only).
+- Measured (one machine): `--coverage` adds about 85 ms to a 1,500-input Python or TypeScript diff (about 195 ms
+  with coverage.py); `mutate --app` costs one diff run per mutant (0.15–0.4 s py/js; 0.4–1.4 s Go/Rust/Java).
+- Not tested: coverage of Go, Rust, Java, C# (not built); `mutate --app` on C# (no .NET SDK here); JS regular
+  expression literals are not masked, so a mutation inside one may be planted (it then shows as caught, survived
+  or not run like any other).
+- **Zero-config CI** (M1.3): `examples/workflows/forge.yml` plus the Action with no inputs runs every gate the
+  project's `.forge/forge.json` makes possible: `check` with `--base` taken from the event (pull_request base
+  branch, merge_group base commit, the commit before a push; other events: not compared, and the summary says so),
+  the bypass gate, `build --check` when a check has a build, `invariants --check`, and a diff sweep when checks
+  have diff entries (`diff-inputs` 50,000, `diff-budget-seconds` 600 per entry, `diff-seed` = the run ID by
+  default). Node and Go are installed only when a check uses them. New driver `cli/forge_ci.py`; every verdict
+  still comes from `forge_check.py`. Outputs `result` and `report` (JSON). See `docs/ci.md`.
+- Job summary: one scope-honest status line per rule, a table of every gate's verdicts, the bypass count, the fuzz
+  counts and times, and the exact commands (base commit and seed) that reproduce the run.
+- Fixed: `check --base` with the project in a subfolder compared a decision record's whole file instead of its
+  binding part (`git show ref:path` reads from the repository top; now `ref:./path`), so a notes-only edit gave
+  `APPROVAL_CHANGED`.
+- **Upgrade note:** the defaults change. `build` was off and is now `auto`; `invariants` was off and is now on
+  (commit `INVARIANTS.md`, or set `invariants: "false"`); the diff sweep is new and on (`diff: "false"` turns it
+  off). `build: "true"` still works.
+- Tested on GitHub-hosted `ubuntu-latest` (selftest run 45113316698): job `action-controls` makes a fixture
+  repository from the example (Python only; only the correct wrapper fuzzed) and runs the Action with no inputs.
+  Unchanged: pass, 50,000 inputs, `DIFF_OK`. Spec clause W1 removed: `APPROVAL_CHANGED` (with `base: none`:
+  `SPEC_CHANGED`). A new `refund.py` comparing `spent + amount <= cap`: `UNAPPROVED_BYPASS`. A hand edit of
+  `INVARIANTS.md`: `INVARIANTS_STALE`. A rare wrapper bug (exact-cap spend rejected when `cap % 250 == 27`):
+  `DISAGREE` in the 50,000-input sweep (detection numbers: see docs/ci.md). A first version of that bug (cap ends
+  in 777, about 0.9 hits in 10,000 inputs) was missed by the 50,000-input sweep in run 45113930328 (seed
+  2164257368): a flaky control, replaced. Base
+  detection per event and the subfolder fix have their own steps in `checker-tests` (the old code fails the
+  subfolder step: checked on one machine).
+- Measured on the runner: the 50,000-input Python sweep took 1,500–4,054 ms per job (run 45113316698) and
+  2,158–2,198 ms (run 45114616292); the example's five languages, 50,000 inputs each, 1,901–2,813 ms per language
+  (run 45113316698) and 3,829–5,389 ms (run 45114616292). The replaced bug in run 45114616292: 1,500 inputs found
+  it in 8 of 20 seeds, 50,000 in 10 of 10.
+- Not tested: macOS and Windows runners with the Action; `pull_request_target` and `merge_group` events on GitHub
+  (only the detection from a stored event file); Java, Rust and .NET versions other than the runner's own.
+## Unreleased — signed approvals (S1: an approval only a person with a hardware key can make)
+
+- New (optional): `"require_signed_approval": true` in forge.json. `approve --hardware [--key KEY]` (and
+  `/forge approve yes --hardware`) signs the canonical approved.json with `ssh-keygen -Y sign -n forge-approval`
+  into `.forge/approved.json.sig`. approved.json then also covers `.forge/allowed_signers` and `"signed_files"`
+  (for example `forge.yaml`, `INVARIANTS.md`). `check` verifies against a trust anchor outside the working tree
+  (`--allowed-signers`, `FORGE_ALLOWED_SIGNERS`, or `.forge/allowed_signers` at `--base`); else verdict
+  `APPROVAL_UNSIGNED`, exit 2. Optional `"signer_key_types"` (for example only `sk-` FIDO2 types). New
+  `cli/forge_sign.py`.
+- New (airlock): `require_human_approval: hardware` per tool and `human_approval.allowed_signers` in forge.yaml. The
+  call is held until a signature over the exact call (run, call id, step id, tool, argument hash) verifies;
+  `forge_sign.py call` signs on the host. The airlock image now has `openssh-client`.
+- The mod's guard also blocks Claude's Edit and Write tools on `.forge/approved.json.sig` and
+  `.forge/allowed_signers`.
+- Tested (FINITE TEST, software ed25519 keys made at test time, no hardware): `tests/run_signed_approval.py`, 27
+  cases: a rogue agent (`tests/rogue_agent.py`) that rewrites spec, forge.yaml, INVARIANTS.md, approved.json and the
+  .sig, switches the requirement off, or adds its own key and re-signs gets `APPROVAL_UNSIGNED`/exit 2 in every case,
+  with the anchor outside the project and at `--base`; owner-signed gives `VERIFIED`/0. Airlock: 16 unit cases and a
+  Docker `forge up` end-to-end test (6 cases). Mutation controls: an accept-all verifier fails 8 signed-approval
+  cases; removing the hash coverage check fails 7; an accept-all call verifier fails 6 airlock cases; skipping the
+  hold fails 8.
+- Not tested: a real FIDO2 key or a Secure Enclave key (needs the owner's hardware; commands in the pull request);
+  the Action on a signed project (no workflow change here); PIN (`verify-required`) through the mod.
+- **Airlock isolation backends** (`forge up --isolation docker|gvisor|microvm`, forge.yaml `isolation:`):
+  the agent container runs on runc (default), gVisor `runsc`, or a Kata Containers VM. Fail closed: a
+  backend whose runtime Docker does not have is refused (exit 2, no fall back), and a probe in the box
+  checks that the agent's kernel is not the host kernel before the canary (exit 10). Tested: unit cases,
+  `run_up_e2e.py` (missing backend refused; runc posing as gVisor caught), and on GitHub ubuntu-latest
+  (workflow `isolation.yml`, runs 45116333410 and 45121073630) the G2-G4 battery 34/34 (docker), 35/35 (gvisor), 35/35
+  (microvm) and the `up` e2e 12/12 under each. Not tested: macOS `microvm` beyond a VM boot (see the
+  airlock README).
+
 ## 0.13.0 — 2026-11-23
 
 One release with the owner's chronicle feedback and the airlock:

@@ -22,25 +22,79 @@ jobs:
           go-version: "1.22"
       - run: go install golang.org/x/tools/cmd/goimports@v0.24.0 && echo "$HOME/go/bin" >> "$GITHUB_PATH"
       - run: node --version && go version && cargo --version && python3 tests/run_tests.py
+      - name: forge_ci base detection from the event
+        run: |
+          ev="$RUNNER_TEMP/event.json"
+          t() { got=$(GITHUB_EVENT_NAME=$1 GITHUB_BASE_REF=$2 GITHUB_EVENT_PATH="$ev" python3 cli/forge_ci.py base | python3 -c 'import json,sys; print(json.load(sys.stdin)["ref"])'); [ "$got" = "$3" ] || { echo "FAIL: $1 gave $got, expected $3"; exit 1; }; echo "ok: $1 -> $got"; }
+          echo '{"before": "1111111111111111111111111111111111111111"}' > "$ev"; t push "" 1111111111111111111111111111111111111111
+          echo '{"before": "0000000000000000000000000000000000000000"}' > "$ev"; t push "" None
+          echo '{"pull_request": {"base": {"ref": "main"}}}' > "$ev"; t pull_request main main
+          echo '{"merge_group": {"base_sha": "2222222222222222222222222222222222222222"}}' > "$ev"; t merge_group "" 2222222222222222222222222222222222222222
+          echo '{}' > "$ev"; t workflow_dispatch "" None
+      - name: --base with the project in a subfolder (notes edit passes, binding edit is APPROVAL_CHANGED)
+        run: bash .github/ci-fixture/subfolder_base.sh . "$RUNNER_TEMP/subfolder-base"
   action-on-example:
+    # No toolchain set up here: the Action must install Node and Go itself for the example's js and go targets.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
-      - run: go install golang.org/x/tools/cmd/goimports@v0.24.0 && echo "$HOME/go/bin" >> "$GITHUB_PATH"
       - uses: ./
         with:
           root: examples/wallet-cap
-          build: "true"
-          invariants: "true"
           # The example's approvals change in this repository's own pull requests; the APPROVAL_CHANGED gate
-          # has its own test cases in checker-tests.
+          # has its own test cases in checker-tests and action-controls.
           base: none
+          # The example's legacy code keeps planted bugs on purpose, so its diff sweep must disagree; the sweep
+          # is tested in action-controls on a fixture that fuzzes only the correct wrapper.
+          diff: "false"
+      - name: measure a 50,000-input sweep over the example's five languages (legacy bugs expected; not a gate)
+        run: |
+          start=$(date +%s)
+          python3 cli/forge_check.py diff --root examples/wallet-cap --no-write --json --inputs 50000 \
+            --budget-ms 600000 --seed "$GITHUB_RUN_ID" > "$RUNNER_TEMP/example-diff.json" || true
+          echo "wall time: $(( $(date +%s) - start )) s"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); [print(k, r["verdict"], r.get("inputs"), "inputs", r.get("ms"), "ms") for k, r in d["checks"].items()]' "$RUNNER_TEMP/example-diff.json"
+  action-controls:
+    # Negative controls for the zero-config Action: a stand-alone fixture repository made from the example (only
+    # the correct wrapper is fuzzed, Python only) is the workspace, its base commit is "main" on a local origin,
+    # and each matrix entry changes it the way a pull request would. The Action runs with no inputs (base: none
+    # only for the SPEC_CHANGED case, and an explicit base on push events, whose "before" commit the fixture
+    # does not have) and must fail with the planted verdict; the unchanged fixture must pass.
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [clean, spec-weakened, spec-weakened-nobase, bypass, stale-invariants, logic-bug]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: forge-src
+      - uses: dafny-lang/setup-dafny-action@be023fc606339d46ed6b077dcb8614d0279ded31 # v1.9.1
+        with:
+          dafny-version: "4.11.0"
+      - name: make the fixture and plant the change
+        run: |
+          bash forge-src/.github/ci-fixture/make.sh forge-src "$GITHUB_WORKSPACE"
+          kind="${{ matrix.kind }}"
+          bash forge-src/.github/ci-fixture/plant.sh "${kind%-nobase}" "$GITHUB_WORKSPACE"
+      - id: forge
+        uses: ./forge-src
+        continue-on-error: true
+        with:
+          base: ${{ matrix.kind == 'spec-weakened-nobase' && 'none' || (github.event_name != 'pull_request' && 'main' || '') }}
+      - name: expect the planted verdict
+        run: python3 forge-src/.github/ci-fixture/expect.py "${{ matrix.kind }}" "${{ steps.forge.outcome }}" "$RUNNER_TEMP/forge-ci-report.json"
+      - name: measure how often 1,500 and 50,000 inputs find the planted bug (not a gate)
+        if: matrix.kind == 'logic-bug'
+        run: |
+          for n in 1500 50000; do
+            found=0; runs=$([ $n = 1500 ] && echo 20 || echo 10); start=$(date +%s)
+            for s in $(seq 1 $runs); do
+              rm -rf .forge/regressions
+              python3 forge-src/cli/forge_check.py diff --no-write --inputs $n --budget-ms 600000 --seed $s > /dev/null || found=$((found+1))
+            done
+            echo "$n inputs: found in $found of $runs seeded runs ($(( $(date +%s) - start )) s in all)"
+          done
   all-targets:
     # Fuzz and emit the example in all six targets on Linux.
     runs-on: ubuntu-latest

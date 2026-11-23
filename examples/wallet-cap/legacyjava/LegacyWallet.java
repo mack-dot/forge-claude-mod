@@ -7,8 +7,9 @@ public final class LegacyWallet {
 
     /** Returns {1 or 0 for accepted, new total spent}. */
     public static long[] spend(long cap, long spent, long amount) {
-        // bug 1: reaching the cap exactly is rejected; bug 2: near 2^63 the long sum overflows and wraps around
-        if (amount > 0 && spent + amount < cap) return new long[] {1, spent + amount};
+        // bug 1: reaching the cap exactly is rejected; bug 2: near 2^63 the long sum overflows and wraps around;
+        // bug 3: a zero amount is accepted (>= instead of >)
+        if (amount >= 0 && spent + amount < cap) return new long[] {1, spent + amount};
         return new long[] {0, spent};
     }
 }
