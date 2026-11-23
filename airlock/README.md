@@ -166,6 +166,44 @@ agent:
 
 `forge.yaml` is always read-only in the box and is never synced back.
 
+## Held calls: `require_human_approval: hardware`
+
+A tool with `require_human_approval: hardware` (in `tools.allow` or `tools.gate`) is held in the airlock until a
+person signs that exact call on the host with a key only a person can use (a FIDO2 security key: touch it; see
+"Signed approvals" in the top-level README for keys and the macOS notes).
+
+```yaml
+tools:
+  allow:
+    - {tool: push_branch, upstream: github, require_human_approval: hardware}
+human_approval:
+  timeout_s: 120            # default 300; a call that is not signed in time is refused
+  allowed_signers:          # allowed-signers lines (OpenSSH format); forge.yaml is read-only in the box
+    - 'you@example.com namespaces="forge-call-approval" sk-ssh-ed25519@openssh.com AAAA...'
+```
+
+On the host, while the box runs: `python3 <plugin>/cli/forge_sign.py call --key ~/.ssh/forge_approval_sk`. It
+lists each held call (tool, step id, the exact arguments the upstream will receive, and their SHA-256), asks
+`yes`, signs with `ssh-keygen -Y sign -n forge-call-approval` and hands the signature to the airlock through
+`docker compose exec` (the folder is on the airlock's state volume; the agent container does not mount it).
+
+- **Signed bytes:** canonical JSON of `{v, run, call, step, tool, args_sha256}`: `run` is fresh per airlock start,
+  `call` is a fresh random id per held call, `step` is the gate's step id (gated tools) or the call id. A signature
+  is good for one call only.
+- **Order:** canary, policy and argument checks first; then the hold; then (gated tools) the verifier's reservation;
+  then the upstream. A held call is not forwarded and spends nothing before the signature verifies.
+- **Refusals:** a key not in `allowed_signers`, a signature over other arguments or another step, a replayed
+  signature, another namespace or garbage: `FORGE_HUMAN_APPROVAL_REFUSED`. No signature in `timeout_s`:
+  `FORGE_HUMAN_APPROVAL_TIMEOUT`. A tool that asks for it without `human_approval.allowed_signers`: the policy is
+  invalid (fail closed).
+- **Client timeouts:** the agent's MCP client waits too. `mcp_cli.py` waits 60 s; keep `timeout_s` below your
+  client's limit.
+
+Tests: `tests/human_approval_test.py` (in `run_tests.py`, no Docker: 16 cases through `Airlock.tools_call` with a
+fake upstream) and `tests/run_human_approval_e2e.py` (Docker, `forge up`: owner-signed call forwarded, rogue-signed
+call refused, unsigned call timed out, none forwarded except the first). LABEL: FINITE TEST with software ed25519
+keys made at test time; a FIDO2 key uses the same `ssh-keygen -Y` path, its touch is not tested. The hold, the
+folder hand-off and the host CLI are NATIVE CHECK; the signature check is OpenSSH's, not proved.
 ## Isolation backends (`--isolation`, forge.yaml `isolation:`)
 
 The default box is a Docker container on runc: it shares the kernel of the Docker host with the
@@ -336,6 +374,7 @@ against other code) and `agent/protocol_regress.py` in `validate.sh` (domain con
 | Hosts in `agent.egress_allow` | reachable: the box can send data there |
 | `--pass-env NAME` | the agent can read that value |
 | `llm`: spending caps | the verifier's verdict on the log is PROVED; estimate, settlement and proxy are NATIVE CHECK |
+| `require_human_approval: hardware` | NATIVE CHECK (hold, hand-off, host CLI); signature check by OpenSSH `ssh-keygen -Y verify`; FINITE TEST with software keys |
 
 ## Not tested
 

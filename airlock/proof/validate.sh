@@ -11,6 +11,10 @@ set -u
 cd "$(dirname "$0")"
 # F7: one token for the canary endpoints of this run (airlock + canary only)
 export FORGE_CANARY_TOKEN="${FORGE_CANARY_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_hex(24))')}"
+# Per-run names: two runs on one Docker host must not share containers, volumes or the image.
+OWN_RUN=0; [ -n "${FORGEAIR_RUN:-}" ] || OWN_RUN=1  # an id we made ourselves: we remove its image at the end
+export FORGEAIR_RUN="${FORGEAIR_RUN:-r$(python3 -c 'import secrets; print(secrets.token_hex(3))')}"
+trap '[ "$OWN_RUN" = 1 ] && docker image rm "forge-airlock-proof:$FORGEAIR_RUN" >/dev/null 2>&1' EXIT
 OUT="${1:-results/latest}"
 mkdir -p "$OUT"
 : > "$OUT/summary.txt"
@@ -53,24 +57,28 @@ if [ -n "$RT" ]; then  # the agent side only; airlock, mock-http, bench-direct s
   # gVisor's netstack and a Kata guest do not reach Docker's embedded DNS (a NAT rule in the netns):
   # fixed addresses for airlock and mock-http, written into the agent side's /etc/hosts.
   RT_OVR="$OUT/compose.runtime.yml"
+  # two /24s picked from the run id, so parallel gvisor/microvm runs do not ask for the same subnet
+  NA=$(( $(python3 -c 'import hashlib,sys; print(int(hashlib.sha256(sys.argv[1].encode()).hexdigest(), 16) % 120)' "$FORGEAIR_RUN") * 2 ))
+  NB=$(( NA + 1 ))
   # mock-http only for control-egress (the agent on the upstream network): the canary of a normal agent
   # counts a resolvable upstream name as a breach.
-  H='["airlock:172.30.250.10"]'; HE='["airlock:172.30.250.10", "mock-http:172.30.251.20"]'
+  H="[\"airlock:172.30.$NA.10\"]"; HE="[\"airlock:172.30.$NA.10\", \"mock-http:172.30.$NB.20\"]"
   { echo "networks:"
-    echo "  agentnet: {ipam: {config: [{subnet: 172.30.250.0/24}]}}"
-    echo "  upstream: {ipam: {config: [{subnet: 172.30.251.0/24}]}}"
+    echo "  agentnet: {ipam: {config: [{subnet: 172.30.$NA.0/24}]}}"
+    echo "  upstream: {ipam: {config: [{subnet: 172.30.$NB.0/24}]}}"
     echo "services:"
-    echo "  airlock: {networks: {agentnet: {ipv4_address: 172.30.250.10}, upstream: {ipv4_address: 172.30.251.10}}}"
-    echo "  mock-http: {networks: {upstream: {ipv4_address: 172.30.251.20}}}"
+    echo "  airlock: {networks: {agentnet: {ipv4_address: 172.30.$NA.10}, upstream: {ipv4_address: 172.30.$NB.10}}}"
+    echo "  mock-http: {networks: {upstream: {ipv4_address: 172.30.$NB.20}}}"
     for s in agent control-env-secret control-hidden-mount control-egress control-root-writes agent-bench; do
       printf '  %s: {runtime: %s, extra_hosts: %s}\n' "$s" "$RT" "$([ "$s" = control-egress ] && echo "$HE" || echo "$H")"
     done; } >"$RT_OVR"
   # a SECOND airlock (the lock test) must not take the live airlock's fixed address
   printf 'services:\n  airlock: {networks: !override [upstream]}\n' >"$OUT/compose.second-airlock.yml"
 fi
+echo "== run $FORGEAIR_RUN" | tee -a "$OUT/summary.txt"
 echo "== isolation $ISO (agent runtime: ${RT:-runc}$([ -n "$VFK" ] && echo '; vfkit VM, not a container'))" | tee -a "$OUT/summary.txt"
 
-dc_raw() { docker compose -p "forgeair-$DOM" -f docker-compose.yml ${OVR:+-f "$OVR"} ${RT_OVR:+-f "$RT_OVR"} ${VFK_OVR:+-f "$VFK_OVR"} ${XOVR:+-f "$XOVR"} "$@"; }
+dc_raw() { docker compose -p "forgeair-$FORGEAIR_RUN-$DOM" -f docker-compose.yml ${OVR:+-f "$OVR"} ${RT_OVR:+-f "$RT_OVR"} ${VFK_OVR:+-f "$VFK_OVR"} ${XOVR:+-f "$XOVR"} "$@"; }
 dc() {  # under a runtime override, `run` without --interactive: under Kata a `run -T` never ended in CI (run 45115365474); stdin is the suspect
   if [ -n "$RT" ] && [ "$1" = run ]; then shift; set -- run --interactive=false "$@"; fi
   if [ -n "$VFK" ]; then vfk_dc "$@"; return; fi
@@ -99,7 +107,7 @@ vfk_vm() {  # vfk_vm [run options] <agent-side service> [command...]: the servic
   [ -n "$p_mock" ] && a+=(--net "upstream=9100:127.0.0.1:$p_mock:mock-http")
   if [ -n "$detach" ]; then
     python3 -I ../backends/vfkit_compose.py "${a[@]}" ${envs[@]+"${envs[@]}"} -- "$@" >/dev/null 2>&1 &
-    echo $! >>"$OUT/vm.pids"; return 0
+    echo $! >>"$OUT/vm.pids"; echo $! >>"$OUT/vm.allpids"; return 0
   fi
   python3 -I ../backends/vfkit_compose.py "${a[@]}" ${envs[@]+"${envs[@]}"} -- "$@"; }
 vfk_dc() {
@@ -127,7 +135,7 @@ json_check() {  # json_check <file> <python expression over d>
 restart_airlock() { dc restart airlock >/dev/null 2>&1; dc up -d --wait airlock >/dev/null 2>&1; }
 
 echo "== build (one image for every domain)"
-t=$SECONDS; docker compose -p forgeair-build build -q >"$OUT/build.log" 2>&1; rec "image build" $? 0 $((SECONDS-t))
+t=$SECONDS; docker compose -p "forgeair-$FORGEAIR_RUN-build" build -q >"$OUT/build.log" 2>&1; rec "image build" $? 0 $((SECONDS-t))
 
 # ---- isolation probe (airlock/backends.probe_sh), with a negative control on every host
 DOM=iso; export FORGE_DOMAIN=codebase
@@ -144,7 +152,7 @@ if [ "$ISO" = docker ]; then
 else
   rec "isolation: $ISO agent passes the probe (own kernel$([ "$ISO" = gvisor ] && echo ', gVisor in dmesg'))" "$rc" 0 $((SECONDS-t))
   t=$SECONDS
-  docker run --rm --runtime runc -e FORGE_HOST_KERNEL forge-airlock-proof:local sh -c "$PROBE true" >"$OUT/iso-probe-control.log" 2>&1
+  docker run --rm --runtime runc -e FORGE_HOST_KERNEL "forge-airlock-proof:$FORGEAIR_RUN" sh -c "$PROBE true" >"$OUT/iso-probe-control.log" 2>&1
   rec "isolation: negative control: the same probe in a runc container -> exit 87" $? 87 $((SECONDS-t))
 fi
 unset FORGE_HOST_KERNEL
@@ -153,7 +161,7 @@ dc --profile controls down -v --remove-orphans >/dev/null 2>&1
 for DOM in ${DOMAINS:-codebase visible quota concurrency crash}; do
   export FORGE_DOMAIN=$DOM FORGE_PHASE=1
   OVR="$OUT/compose.mounts.$DOM.yml"
-  docker run --rm -v "$PWD/policies:/p:ro" forge-airlock-proof:local \
+  docker run --rm -v "$PWD/policies:/p:ro" "forge-airlock-proof:$FORGEAIR_RUN" \
     python3 -I /forge/airlock/render_mounts.py "/p/$DOM.yaml" >"$OVR"
   echo "== domain $DOM (forge.yaml = policies/$DOM.yaml)"
   dc --profile controls down -v --remove-orphans >/dev/null 2>&1
@@ -269,12 +277,13 @@ for DOM in ${DOMAINS:-codebase visible quota concurrency crash}; do
 done
 
 echo "== total $((SECONDS-T_ALL))s" | tee -a "$OUT/summary.txt"
-left=$(docker ps -a --filter "name=forgeair-" -q | wc -l | tr -d ' ')
-vols=$(docker volume ls -q --filter "name=forgeair-" | wc -l | tr -d ' ')
+left=$(docker ps -a --filter "name=forgeair-$FORGEAIR_RUN-" -q | wc -l | tr -d ' ')
+vols=$(docker volume ls -q --filter "name=forgeair-$FORGEAIR_RUN-" | wc -l | tr -d ' ')
 [ "$left" = 0 ] && [ "$vols" = 0 ]; rec "cleanup: 0 containers and 0 volumes left (c=$left v=$vols)" $? 0 0
 if [ -n "$VFK" ]; then
   vfk_stop_vms; rmdir "$VMWS" 2>/dev/null
-  n=$(pgrep -f "fvm-.*/ctl" | wc -l | tr -d ' '); [ "$n" = 0 ]; rec "cleanup: 0 vfkit VMs left (n=$n)" $? 0 0
+  n=0; for p in $(cat "$OUT/vm.allpids" 2>/dev/null); do kill -0 "$p" 2>/dev/null && n=$((n+1)); done  # only VMs of this run
+  [ "$n" = 0 ]; rec "cleanup: 0 vfkit VMs of this run left (n=$n)" $? 0 0
 fi
 [ "$FAIL" = 0 ] && echo "VALIDATE: PASS" | tee -a "$OUT/summary.txt" || echo "VALIDATE: FAIL" | tee -a "$OUT/summary.txt"
 exit "$FAIL"

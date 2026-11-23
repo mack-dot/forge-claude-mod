@@ -8,6 +8,12 @@
 // forgeDafnyInt(v) for a Dafny integer, forgeInt64(v) for code that takes int64 (it panics when the value does
 // not fit, as a real caller would fail). Return plain values; *big.Int, json.Number and Dafny integers are
 // written with all their digits. A panic is reported as {"__throws__": "panic: <message>"}.
+//
+// Messy inputs (the unproved wrapper that turns raw JSON into Dafny values): the adapter may also define
+//   var wrappers = map[string]func(json.RawMessage) any{ "name": ... }   (or func wrapper(raw json.RawMessage) any)
+//   func failClosed(raw json.RawMessage) any  // the spec's fail-closed answer; nil when the proved rule takes it
+// Each wrapper gets the RAW JSON bytes of the input and calls the app's real wrapper with them. Forge generates
+// forge_messy.go, which binds these names (or empty defaults) to forgeWrappers / forgeFailClosed.
 // Test code: NOT proved.
 package main
 
@@ -75,15 +81,29 @@ func forgeCall(fn func(Input) any, in Input) (out any) {
 	return forgePlain(fn(in))
 }
 
+func forgeCallRaw(fn func(json.RawMessage) any, raw json.RawMessage) (out any) {
+	defer func() {
+		if r := recover(); r != nil {
+			out = map[string]any{"__throws__": fmt.Sprintf("panic: %v", r)}
+		}
+	}()
+	return forgePlain(fn(append(json.RawMessage(nil), raw...))) // a fresh copy per call
+}
+
 func main() {
 	names := make([]string, 0, len(candidates))
 	for n := range candidates {
 		names = append(names, n)
 	}
 	sort.Strings(names)
+	wnames := make([]string, 0, len(forgeWrappers))
+	for n := range forgeWrappers {
+		wnames = append(wnames, n)
+	}
+	sort.Strings(wnames)
 	w := bufio.NewWriter(os.Stdout)
 	enc := json.NewEncoder(w)
-	enc.Encode(map[string]any{"candidates": names})
+	enc.Encode(map[string]any{"candidates": append(append([]string{}, names...), wnames...), "messy": wnames})
 	w.Flush()
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 1<<20), 1<<26)
@@ -91,7 +111,10 @@ func main() {
 		if len(sc.Bytes()) == 0 {
 			continue
 		}
-		var msg struct{ Input json.RawMessage }
+		var msg struct {
+			Input json.RawMessage
+			Messy bool
+		}
 		json.Unmarshal(sc.Bytes(), &msg)
 		decode := func() Input {
 			var in Input
@@ -100,10 +123,29 @@ func main() {
 			d.Decode(&in)
 			return in
 		}
+		if msg.Messy {
+			var ref any
+			if forgeFailClosed != nil {
+				ref = forgeCallRaw(forgeFailClosed, msg.Input)
+			}
+			if ref == nil {
+				ref = forgeCall(reference, decode())
+			}
+			cands := map[string]any{}
+			for _, n := range wnames {
+				cands[n] = forgeCallRaw(forgeWrappers[n], msg.Input)
+			}
+			enc.Encode(map[string]any{"reference": ref, "candidates": cands})
+			w.Flush()
+			continue
+		}
 		out := map[string]any{"reference": forgeCall(reference, decode())}
 		cands := map[string]any{}
 		for _, n := range names {
 			cands[n] = forgeCall(candidates[n], decode())
+		}
+		for _, n := range wnames {
+			cands[n] = forgeCallRaw(forgeWrappers[n], msg.Input)
 		}
 		out["candidates"] = cands
 		enc.Encode(out)
