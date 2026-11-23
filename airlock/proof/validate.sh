@@ -2,7 +2,11 @@
 # validate.sh - run the three domains through the SAME airlock image, each from a clean
 # state (docker compose down -v), with only a different forge.yaml. Exit 0 only if every
 # check below has its expected exit code. Logs go to ${1:-results/latest}/.
-# Label: FINITE TEST. Container tier: the agent shares the host kernel.
+# Label: FINITE TEST. Container tier: the agent shares the host kernel, unless
+# FORGE_ISOLATION=gvisor|microvm: then every agent-side container (agent, planted-breach controls,
+# bench agent) runs under that backend's Docker runtime (airlock/backends) and the run starts with
+# the isolation probe checks (positive: the agent's kernel is not the host kernel; negative: a runc
+# container fails the same probe). Default FORGE_ISOLATION=docker (runc, the probe must fail).
 set -u
 cd "$(dirname "$0")"
 # F7: one token for the canary endpoints of this run (airlock + canary only)
@@ -19,7 +23,34 @@ rec() {  # rec <check> <actual> <expected> <seconds>
   printf '%-4s %-62s exit=%-3s expect=%-3s %4ss\n' "$mark" "$1" "$2" "$3" "$4" | tee -a "$OUT/summary.txt"
 }
 
-dc() { docker compose -p "forgeair-$DOM" -f docker-compose.yml ${OVR:+-f "$OVR"} "$@"; }
+ISO="${FORGE_ISOLATION:-docker}"
+RT=$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import backends as B; print(B.runtime_for(sys.argv[2], B.docker_runtimes()) or "")' .. "$ISO") \
+  || { echo "VALIDATE: isolation $ISO not available on this Docker host (fail closed)" | tee -a "$OUT/summary.txt"; exit 2; }
+RT_OVR=""
+if [ -n "$RT" ]; then  # the agent side only; airlock, mock-http, bench-direct stay on runc
+  # gVisor's netstack and a Kata guest do not reach Docker's embedded DNS (a NAT rule in the netns):
+  # fixed addresses for airlock and mock-http, written into the agent side's /etc/hosts.
+  RT_OVR="$OUT/compose.runtime.yml"
+  # mock-http only for control-egress (the agent on the upstream network): the canary of a normal agent
+  # counts a resolvable upstream name as a breach.
+  H='["airlock:172.30.250.10"]'; HE='["airlock:172.30.250.10", "mock-http:172.30.251.20"]'
+  { echo "networks:"
+    echo "  agentnet: {ipam: {config: [{subnet: 172.30.250.0/24}]}}"
+    echo "  upstream: {ipam: {config: [{subnet: 172.30.251.0/24}]}}"
+    echo "services:"
+    echo "  airlock: {networks: {agentnet: {ipv4_address: 172.30.250.10}, upstream: {ipv4_address: 172.30.251.10}}}"
+    echo "  mock-http: {networks: {upstream: {ipv4_address: 172.30.251.20}}}"
+    for s in agent control-env-secret control-hidden-mount control-egress control-root-writes agent-bench; do
+      printf '  %s: {runtime: %s, extra_hosts: %s}\n' "$s" "$RT" "$([ "$s" = control-egress ] && echo "$HE" || echo "$H")"
+    done; } >"$RT_OVR"
+  # a SECOND airlock (the lock test) must not take the live airlock's fixed address
+  printf 'services:\n  airlock: {networks: !override [upstream]}\n' >"$OUT/compose.second-airlock.yml"
+fi
+echo "== isolation $ISO (agent runtime: ${RT:-runc})" | tee -a "$OUT/summary.txt"
+
+dc() {  # under a runtime override, `run` without --interactive: under Kata a `run -T` never ended in CI (run 45115365474); stdin is the suspect
+  if [ -n "$RT" ] && [ "$1" = run ]; then shift; set -- run --interactive=false "$@"; fi
+  docker compose -p "forgeair-$DOM" -f docker-compose.yml ${OVR:+-f "$OVR"} ${RT_OVR:+-f "$RT_OVR"} ${XOVR:+-f "$XOVR"} "$@"; }
 
 json_check() {  # json_check <file> <python expression over d>
   python3 -c "import json,sys; d=json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]); sys.exit(0 if ($2) else 1)" "$1"
@@ -29,6 +60,27 @@ restart_airlock() { dc restart airlock >/dev/null 2>&1; dc up -d --wait airlock 
 
 echo "== build (one image for every domain)"
 t=$SECONDS; docker compose -p forgeair-build build -q >"$OUT/build.log" 2>&1; rec "image build" $? 0 $((SECONDS-t))
+
+# ---- isolation probe (airlock/backends.probe_sh), with a negative control on every host
+DOM=iso; export FORGE_DOMAIN=codebase
+PROBE_NAME=$([ "$ISO" = docker ] && echo gvisor || echo "$ISO")   # docker: run the gvisor probe; it MUST fail
+PROBE=$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import backends as B; print(B.probe_sh(sys.argv[2]))' .. "$PROBE_NAME")
+dc --profile controls down -v --remove-orphans >/dev/null 2>&1
+t=$SECONDS; dc up -d --wait airlock >/dev/null 2>&1
+export FORGE_HOST_KERNEL=$(dc exec -T airlock cat /proc/version 2>/dev/null)
+dc run --rm --no-deps -T -e FORGE_HOST_KERNEL agent sh -c "$PROBE cat /proc/version" </dev/null >"$OUT/iso-probe.log" 2>&1; rc=$?
+echo "     host (airlock) kernel: $FORGE_HOST_KERNEL" | cut -c1-160 | tee -a "$OUT/summary.txt"
+sed 's/^/     agent: /' "$OUT/iso-probe.log" | head -4 | cut -c1-160 | tee -a "$OUT/summary.txt"
+if [ "$ISO" = docker ]; then
+  rec "isolation: negative control: runc agent fails the gvisor probe (shares the host kernel)" "$rc" 87 $((SECONDS-t))
+else
+  rec "isolation: $ISO agent passes the probe (own kernel$([ "$ISO" = gvisor ] && echo ', gVisor in dmesg'))" "$rc" 0 $((SECONDS-t))
+  t=$SECONDS
+  docker run --rm --runtime runc -e FORGE_HOST_KERNEL forge-airlock-proof:local sh -c "$PROBE true" >"$OUT/iso-probe-control.log" 2>&1
+  rec "isolation: negative control: the same probe in a runc container -> exit 87" $? 87 $((SECONDS-t))
+fi
+unset FORGE_HOST_KERNEL
+dc --profile controls down -v --remove-orphans >/dev/null 2>&1
 
 for DOM in ${DOMAINS:-codebase visible quota concurrency crash}; do
   export FORGE_DOMAIN=$DOM FORGE_PHASE=1
@@ -85,7 +137,7 @@ for DOM in ${DOMAINS:-codebase visible quota concurrency crash}; do
     dc run --rm control-egress >"$OUT/$DOM-control-egress.log" 2>&1
     rec "quota: planted breach control-egress (agent on upstream net) -> BREACH" $? 10 $((SECONDS-t))
     grep -E "\[canary\] BREACH:" "$OUT/$DOM-control-egress.log" | head -3 | sed 's/^/     /'
-    t=$SECONDS; dc run --rm --no-deps airlock >"$OUT/$DOM-second-writer.log" 2>&1; rc=$?
+    t=$SECONDS; XOVR=${RT_OVR:+$OUT/compose.second-airlock.yml} dc run --rm --no-deps airlock >"$OUT/$DOM-second-writer.log" 2>&1; rc=$?
     grep -q "another airlock holds the data volume lock" "$OUT/$DOM-second-writer.log" || rc="$rc/no-reason"
     rec "quota: second airlock on the same log volume refuses to start" "$rc" 2 $((SECONDS-t))
     dc stop airlock >/dev/null 2>&1  # the live airlock holds the lock; stop it for the next cases

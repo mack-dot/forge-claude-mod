@@ -94,6 +94,14 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
   hold fails 8.
 - Not tested: a real FIDO2 key or a Secure Enclave key (needs the owner's hardware; commands in the pull request);
   the Action on a signed project (no workflow change here); PIN (`verify-required`) through the mod.
+- **Airlock isolation backends** (`forge up --isolation docker|gvisor|microvm`, forge.yaml `isolation:`):
+  the agent container runs on runc (default), gVisor `runsc`, or a Kata Containers VM. Fail closed: a
+  backend whose runtime Docker does not have is refused (exit 2, no fall back), and a probe in the box
+  checks that the agent's kernel is not the host kernel before the canary (exit 10). Tested: unit cases,
+  `run_up_e2e.py` (missing backend refused; runc posing as gVisor caught), and on GitHub ubuntu-latest
+  (workflow `isolation.yml`, runs 45116333410 and 45121073630) the G2-G4 battery 34/34 (docker), 35/35 (gvisor), 35/35
+  (microvm) and the `up` e2e 12/12 under each. Not tested: macOS `microvm` beyond a VM boot (see the
+  airlock README).
 
 ## 0.13.0 — 2026-11-23
 
