@@ -125,6 +125,9 @@ def main():
                 breach(f"hidden path readable through a symlink: {h}")
         except OSError:
             pass
+        finally:  # M2.3: the link target names a hidden path; the agent must not find it later
+            if os.path.lexists(link):
+                os.remove(link)
     revs = subprocess.run(GIT + ["-C", root, "rev-list", "--all", "--reflog"], capture_output=True, env=GENV)
     commits = revs.stdout.decode().split()
     if revs.returncode != 0:
@@ -289,6 +292,10 @@ def main():
                     breach(f"MCP {tool}({rev}:{h}) was not refused by policy (got {code})")
     if made_link:
         os.remove(link)
+    try:
+        os.rmdir("/tmp/forge-canary")
+    except OSError:
+        pass
 
     result = "PASS" if not BREACHES else "BREACH"
     dt = round(time.time() - T0, 2)

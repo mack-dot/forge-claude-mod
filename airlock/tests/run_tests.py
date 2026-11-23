@@ -478,6 +478,13 @@ def test_redteam():
     redteam_regress.run(lambda name, ok, detail="": case("redteam: " + name, bool(ok), detail))
 
 
+def test_inbox():
+    """Red team M2.3 (in-box probes): the unit-testable fixes and helpers (tests/inbox_probes/unit.py)."""
+    sys.path.insert(0, os.path.join(HERE, "inbox_probes"))
+    import unit as inbox_unit
+    inbox_unit.run(lambda name, ok, detail="": case(name, bool(ok), detail))
+
+
 def test_llm():
     import llm_proxy as L
     env = {"PAY_KEY": "FAKE_pay_key_not_real_1234", "MODEL_KEY": "FAKE_model_key_not_real_5678"}
@@ -537,7 +544,8 @@ def test_llm():
 
 
 def main():
-    for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static, test_redteam):
+    for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static, test_redteam,
+              test_inbox):
         try:
             t()
         except Exception as e:  # noqa: BLE001
