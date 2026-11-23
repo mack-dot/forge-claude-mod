@@ -79,15 +79,17 @@ jobs:
       - name: registered runtimes
         run: docker info --format '{{json .Runtimes}}' | python3 -c 'import json,sys; print(sorted(json.load(sys.stdin)))'
       - name: startup overhead (cold and warm container start, this runner)
+        timeout-minutes: 15
         run: |
-          docker compose -p forgeair-build -f airlock/proof/docker-compose.yml build -q
+          timeout 600 docker compose -p forgeair-build -f airlock/proof/docker-compose.yml build -q
           rts=runc
           [ "${{ matrix.backend }}" = gvisor ] && rts=runc,runsc
           [ "${{ matrix.backend }}" = microvm ] && rts=runc,kata
           # cold = the first start after a Docker restart and a page-cache drop, for EACH runtime separately
           for rt in ${rts//,/ }; do
-            sudo systemctl restart docker && sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
-            until docker info >/dev/null 2>&1; do sleep 1; done
+            echo "restart docker for a cold $rt start"
+            sudo timeout 180 systemctl restart docker && sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+            timeout 120 sh -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
             timeout 300 python3 airlock/proof/startup_bench.py forge-airlock-proof:local "$rt" 10 > "$RUNNER_TEMP/startup-$rt.json"
           done
           cat "$RUNNER_TEMP"/startup-*.json
