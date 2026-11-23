@@ -8,7 +8,7 @@ G6  gated-call latency before (subprocess) vs after (persistent), median and p95
 G8  llm proxy: no key in box, SSE, settle, error/cut/kill keep, 20 parallel at cap, restart exit=0     159s
 G7  README: unified workflow and honest labels                                 exit=0       1s
 cleanup: containers=3 volumes=0 networks=2 (forgeair*, forge-airlock*, llm-*)
-prove_release: FAIL total=843s out=/private/tmp/claude-501/-Users-mackianni-forge/5a728f74-c7fc-4a0c-a5e5-40316e413e9c/scratchpad/release-llm-1
+prove_release: FAIL total=843s out=<scratch>/release-llm-1
 ok    compose: agent env has ANTHROPIC_BASE_URL and only the dummy key; airlock env names the key
 ok    airlock, egress proxy and fake provider start (6.7 s)
 ok    airlock log: llm endpoint up, provider http://fakeprov:9000
