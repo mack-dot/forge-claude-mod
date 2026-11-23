@@ -10,7 +10,6 @@
 // digits. Adapters therefore see small integers as numbers and big ones as BigInt.
 import { createRequire, Module } from 'node:module'
 import { readFileSync } from 'node:fs'
-import { createInterface } from 'node:readline'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -54,7 +53,21 @@ const call = (fn, input) => {
   }
 }
 process.stdout.write(JSON.stringify({ candidates: names }) + '\n')
-for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
+// Split on "\n" only: readline also splits at U+2028 and U+2029, which may appear inside JSON strings.
+async function* lines(stream) {
+  let buf = ''
+  for await (const chunk of stream) {
+    buf += chunk
+    let i
+    while ((i = buf.indexOf('\n')) >= 0) {
+      yield buf.slice(0, i)
+      buf = buf.slice(i + 1)
+    }
+  }
+  if (buf) yield buf
+}
+process.stdin.setEncoding('utf8')
+for await (const line of lines(process.stdin)) {
   if (!line.trim()) continue
   const { input } = parse(line)
   const out = { reference: call(adapter.reference, input), candidates: {} }

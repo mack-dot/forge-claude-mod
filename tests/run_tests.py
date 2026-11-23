@@ -345,7 +345,10 @@ def main():
             ('diff: shipped TypeScript bugs found (zero, negative)', js.get('verdict') == 'DISAGREE'
              and failing_js == ['D3', 'D4']),
             ('diff: each run under 2 seconds', py.get('ms', 9999) < 2000 and js.get('ms', 9999) < 2000),
-            ('diff: random search adds no duplicate of a failing decision', len(py.get('disagreements', [])) == 0),
+            ('diff: at most 3 differently shaped examples per kind of wrong answer, never a decision input again',
+             all(n <= 3 for n in __import__('collections').Counter((d['candidate'], d.get('group')) for d in py.get('disagreements', [])).values())
+             and not any(d['input'] in [{'cap': 5000, 'spent': 2000, 'amount': 3000}, {'cap': 5000, 'spent': 0, 'amount': 0},
+                                        {'cap': 5000, 'spent': 3000, 'amount': -1000}] for d in py.get('disagreements', []))),
             ('diff: recorded decisions run as fixed inputs (legacy fails D1, D3, D4; the wrapper agrees)',
              (py.get('decisions') or {}).get('total') == 4
              and sorted(f['id'][:2] for f in (py.get('decisions') or {}).get('failing', [])) == ['D1', 'D3', 'D4']
@@ -422,6 +425,27 @@ def main():
             if not ok:
                 print('      ' + json.dumps({k: {kk: v.get(kk) for kk in ('verdict', 'per_candidate', 'ms', 'error')} if isinstance(v, dict) else v
                                              for k, v in res.items()})[:500])
+    # Two different bugs that give the SAME wrong answer must both be reported (a tester's run hid three bugs behind
+    # one kind of wrong answer before 0.12.2).
+    sys.path.insert(0, os.path.join(HERE, '..', 'cli'))
+    import forge_diff
+    with tempfile.TemporaryDirectory() as tmp:
+        open(os.path.join(tmp, 'inputs.py'), 'w').write(
+            'def generate(rng):\n    return {"x": rng.pick([0, 1, 5, -3, "", "a", None])}\n')
+        open(os.path.join(tmp, 'adapter.py'), 'w').write(
+            'def reference(i):\n    return {"allowed": isinstance(i["x"], int) and i["x"] > 0}\n'
+            'def buggy(i):\n    x = i["x"]\n    if x == 0 or x == "":\n        return {"allowed": True}\n'
+            '    return {"allowed": isinstance(x, int) and x > 0}\n'
+            'candidates = {"buggy": buggy}\n')
+        res = forge_diff.run_entry([sys.executable, os.path.join(HERE, '..', 'cli', 'eval', 'py_eval.py'),
+                                    os.path.join(tmp, 'adapter.py')], tmp, dict(os.environ), os.path.join(tmp, 'inputs.py'),
+                                   7, 500, 5000, os.path.join(tmp, 'reg'))
+        found = sorted(json.dumps(d['input']['x']) for d in res.get('disagreements', []))
+        ok = found == ['""', '0'] and len({d['group'] for d in res['disagreements']}) == 1
+        failed += not ok
+        extra += 1
+        print('%s  diff: two bugs with the same wrong answer (zero and empty text) are both reported  %s' % ('ok  ' if ok else 'FAIL', found))
+
     # INVARIANTS.md: generated from the approved rules; CI catches a stale copy
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, 'p')

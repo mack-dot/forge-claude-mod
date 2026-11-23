@@ -907,7 +907,12 @@ def diff_report(out):
                          'per candidate: %s'
                          % (name, len(dec.get('failing', [])), len(r['disagreements']), r['inputs'], r['ms'], r['seed'],
                             ', '.join('%s %d' % kv for kv in (r.get('per_candidate') or {}).items())))
+            groups = {}
             for d in r['disagreements']:
+                groups.setdefault((d['candidate'], d.get('group', '')), []).append(d)
+            if len(groups) < len(r['disagreements']):
+                lines.append('  %d kind(s) of wrong answer; examples of different shape under each:' % len(groups))
+            for d in sorted(r['disagreements'], key=lambda x: (x['candidate'], x.get('group', ''))):
                 lines.append('  %s%s: input %s → proved rule says %s, %s says %s  [%s]' % (
                     'NEW ' if d.get('new') else '', d['candidate'], json.dumps(d['input'], ensure_ascii=False)[:200],
                     json.dumps(d['reference'], ensure_ascii=False)[:120], d['candidate'],

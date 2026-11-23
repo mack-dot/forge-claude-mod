@@ -2,6 +2,17 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## 0.12.2 — 2026-11-22
+- Fixed (fuzzer): different bugs that give the same wrong answer were reported as one. The fuzzer kept one example
+  per kind of wrong answer and stopped at 5 per candidate, so on chronicle's original code three real fail-open bugs
+  (an unknown visibility treated as shared; consent limits whose child or area is not text covering nothing) stayed
+  hidden behind already-known ones until they were masked by hand. Now each kind of wrong answer keeps up to 3
+  examples of different input shape (empty, zero, null, unknown text, list sizes), up to 40 per candidate, grouped in
+  the report. Re-run on chronicle at 9550d43 without masking: the two gate bugs appear in the random search and the
+  visibility bug as failing decision D5.
+- Fixed: the JavaScript evaluator split input lines at U+2028 and U+2029 (Node's readline); it now splits at "\n" only.
+- Tested: 50 cases (1 new: two bugs with the same wrong answer, zero and empty text, are both reported).
+
 ## 0.12.1 — 2026-11-22
 - Fixed: `/forge approve` (and bare `/forge`, `/forge spec`) showed each spec shortened to its clause lines, so some
   multi-line clauses were cut off, while the approval covers the complete file by hash. It now shows every file in

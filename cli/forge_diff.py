@@ -33,6 +33,8 @@ import sys
 import time
 
 CALL_TIMEOUT_S = 2.0
+MAX_PER_CANDIDATE = 40  # examples kept per candidate per run
+MAX_PER_GROUP = 3  # differently shaped examples kept per kind of wrong answer
 
 
 class Rng:
@@ -72,6 +74,32 @@ def signature(a, b):
         return ','.join('%s:%s' % (k, signature(a.get(k), b.get(k))) for k in sorted(set(a) | set(b))
                         if canon(a.get(k)) != canon(b.get(k)))
     return '%s>%s' % (leaf(a), leaf(b))
+
+
+def shape(v):
+    """The input's shape without its exact values: which fields are empty, zero, negative, null, unusual text, big,
+    and how many elements lists have. Two disagreements with the same output pattern but different input shapes
+    are different kinds of failure (for example a missing tag versus an unknown tag)."""
+    if v is None:
+        return 'null'
+    if isinstance(v, bool):
+        return 'bool:%s' % v
+    if isinstance(v, int):
+        return 'zero' if v == 0 else ('neg' if v < 0 else ('big' if v > 2 ** 53 else 'pos'))
+    if isinstance(v, float):
+        return 'float'
+    if isinstance(v, str):
+        if v == '':
+            return 'empty'
+        if not v.strip():
+            return 'space'
+        return 'text' if v == v.strip() else 'padded'
+    if isinstance(v, list):
+        n = 'n0' if not v else ('n1' if len(v) == 1 else 'n+')
+        return 'list:%s[%s]' % (n, ','.join(sorted({shape(x) for x in v})))
+    if isinstance(v, dict):
+        return '{%s}' % ','.join('%s:%s' % (k, shape(v[k])) for k in sorted(v))
+    return type(v).__name__
 
 
 def shrinks(v):
@@ -210,7 +238,22 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir):
                         break
             return best
 
-        seen, kinds = set(), set()
+        seen = set()
+        groups = {}  # group -> set of input shapes already kept
+
+        def known(k):
+            return k is not None and (k[1] in groups.get(k[0], set()) or len(groups.get(k[0], set())) >= MAX_PER_GROUP)
+
+        def remember(k):
+            if k is not None:
+                groups.setdefault(k[0], set()).add(k[1])
+
+        def kind_of(name, inp):
+            """Group = the kind of wrong answer (which output fields differ, and how); within a group, inputs of a
+            different shape (empty, zero, missing, unknown text, ...) are kept as separate examples, up to
+            MAX_PER_GROUP, because different bugs can give the same wrong answer."""
+            d = disagrees(name, inp)
+            return ('%s|%s' % (name, signature(*d)), shape(inp)) if d else None
 
         def record(name, inp, is_new):
             d = disagrees(name, inp)
@@ -220,7 +263,7 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir):
             if key in seen:
                 return
             seen.add(key)
-            kinds.add(name + '|' + signature(*d))
+            remember(kind_of(name, inp))
             fname = '%s-%s.json' % (name, hashlib.sha256(key.encode()).hexdigest()[:10])
             path = os.path.join(reg_dir, fname)
             if is_new and not os.path.exists(path):
@@ -230,7 +273,7 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir):
                                         'found_at': datetime.datetime.now(datetime.timezone.utc).isoformat(
                                             timespec='seconds')}, indent=2, ensure_ascii=False) + '\n')
             result['disagreements'].append({'candidate': name, 'input': inp, 'reference': d[0], 'got': d[1],
-                                            'file': fname, 'new': is_new})
+                                            'file': fname, 'new': is_new, 'group': signature(*d)})
 
         # 1. Saved cases.
         if os.path.isdir(reg_dir):
@@ -248,10 +291,11 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir):
                 result['decisions']['failing'].append({'id': dec['id'], 'candidates': bad})
             else:
                 result['decisions']['agree'] += 1
-            for n in bad:
-                kinds.add(n + '|' + signature(*disagrees(n, dec['input'])))
+            for n in bad:  # a failing decision counts as one example of its group
+                remember(kind_of(n, shrink(n, dec['input'])))
         # 3. Fresh random inputs within the input and time budget.
         rng = Rng(seed)
+        raw_kinds = set()
         while result['inputs'] < max_inputs and (time.time() - started) * 1000 < budget_ms:
             inp = gen.generate(rng)
             result['inputs'] += 1
@@ -259,12 +303,19 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir):
                 result['out_of_domain'] += 1
                 continue
             for name in names:
-                if sum(d['candidate'] == name for d in result['disagreements']) >= 5:
+                if sum(d['candidate'] == name for d in result['disagreements']) >= MAX_PER_CANDIDATE:
                     continue
-                d = disagrees(name, inp)
-                if not d or (name + '|' + signature(*d)) in kinds:
+                d0 = disagrees(name, inp)
+                if not d0:
                     continue
-                record(name, shrink(name, inp), True)
+                raw = '%s|%s|%s' % (name, signature(*d0), shape(inp))
+                if raw in raw_kinds:
+                    continue
+                raw_kinds.add(raw)  # skip shrinking this exact pattern again
+                small = shrink(name, inp)
+                if known(kind_of(name, small)):
+                    continue
+                record(name, small, True)
         result['per_candidate'] = {n: sum(d['candidate'] == n for d in result['disagreements']) for n in names}
     except EvaluatorError as e:
         result['error'] = str(e)
