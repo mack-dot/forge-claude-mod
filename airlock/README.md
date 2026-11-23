@@ -204,23 +204,25 @@ Tests: `tests/run_tests.py` (choice and refusal rules, compose output, probe neg
 plus probe checks). CI: `.github/workflows/isolation.yml` runs all three on ubuntu-latest and
 measures container start overhead (`proof/startup_bench.py`).
 
-Measured (FINITE TEST, GitHub ubuntu-latest, kernel 7.0.0-1020-azure, run 45116333410; gVisor
-20261102.0, Kata 4.3.1 with QEMU, Firecracker v1.17.0):
+Measured (FINITE TEST, GitHub ubuntu-latest, kernel 7.0.0-1020-azure, two green runs 45116333410 and
+45121073630; gVisor 20261102.0, Kata 4.3.1 with QEMU, Firecracker v1.17.0; values are run 1 / run 2):
 
 | | docker (runc) | gvisor (runsc) | microvm (kata) |
 | --- | --- | --- | --- |
-| validate.sh (G2-G4 battery) | 34 of 34 ok, 195 s | 35 of 35 ok, 242 s | 35 of 35 ok, 312 s |
-| `run_up_e2e.py` | 12 of 12 ok | 12 of 12 ok | 12 of 12 ok |
+| validate.sh (G2-G4 battery) | 34 of 34 ok, 195 / 257 s | 35 of 35 ok, 242 / 280 s | 35 of 35 ok, 312 / 289 s |
+| `run_up_e2e.py` | 12 of 12 ok (both runs) | 12 of 12 ok (both) | 12 of 12 ok (both) |
 | agent `/proc/version` | the host kernel | `4.19.0-gvisor` | guest `6.18.56` |
-| container start, cold (first after a Docker restart and cache drop) | 226-281 ms | 940 ms (runc on that runner: 239 ms) | 2849 ms (runc on that runner: 281 ms) |
-| container start, warm median of 10 | 147-164 ms | 159 ms (runc: 151 ms) | 2078 ms (runc: 164 ms) |
-| `up` wall time, one run (answer n) | 10.0 s | 12.8 s | 17.0 s |
+| container start, cold (first after a Docker restart and cache drop) | 226 / 300 ms | 940 / 371 ms (runc on that runner: 239 / 279 ms) | 2849 / 2306 ms (runc: 281 / 418 ms) |
+| container start, warm median of 10 | 147 / 179 ms | 159 / 188 ms (runc: 151 / 176 ms) | 2078 / 2137 ms (runc: 164 / 110 ms) |
+| `up` wall time, one run (answer n) | 10.0 / 13.8 s | 12.8 / 15.3 s | 17.0 / 15.9 s |
 
 The start numbers are `docker run --rm ... python3 -c pass` from the host; each backend ran on its own
-runner, so compare a backend with the runc row of the same runner. A minimal Firecracker v1.17.0 boot
-(Kata's guest kernel, busybox initramfs, 1 vCPU) on the same runner: 426-450 ms over 6 boots, process
-start to guest reboot. On this Mac (macOS 27, Apple silicon), `vz_boot_check.sh` (Alpine 6.12.115 guest):
-1187 ms first boot, 293-380 ms the next 4.
+runner, so compare a backend with the runc row of the same runner: gVisor adds about 8-13 ms warm and
+90-700 ms cold; Kata adds about 1.9-2.0 s warm and 1.9-2.6 s cold. A minimal Firecracker v1.17.0 boot
+(Kata's guest kernel, busybox initramfs, 1 vCPU) on the same runner: 426-450 / 644-712 ms over 6 boots,
+process start to guest reboot. One Kata job hung for 29 minutes in the start benchmark right after a
+Docker restart (run 45117987521, cancelled; the step now has time limits). On this Mac (macOS 27,
+Apple silicon), `vz_boot_check.sh` (Alpine 6.12.115 guest): 1187 ms first boot, 293-380 ms the next 4.
 
 ## Faster gates, same proved verifier
 
