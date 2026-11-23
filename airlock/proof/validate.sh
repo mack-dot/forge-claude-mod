@@ -48,7 +48,9 @@ if [ -n "$RT" ]; then  # the agent side only; airlock, mock-http, bench-direct s
 fi
 echo "== isolation $ISO (agent runtime: ${RT:-runc})" | tee -a "$OUT/summary.txt"
 
-dc() { docker compose -p "forgeair-$DOM" -f docker-compose.yml ${OVR:+-f "$OVR"} ${RT_OVR:+-f "$RT_OVR"} ${XOVR:+-f "$XOVR"} "$@"; }
+dc() {  # under a runtime override, `run` without --interactive: under Kata a `run -T` never ended in CI (run 45115365474); stdin is the suspect
+  if [ -n "$RT" ] && [ "$1" = run ]; then shift; set -- run --interactive=false "$@"; fi
+  docker compose -p "forgeair-$DOM" -f docker-compose.yml ${OVR:+-f "$OVR"} ${RT_OVR:+-f "$RT_OVR"} ${XOVR:+-f "$XOVR"} "$@"; }
 
 json_check() {  # json_check <file> <python expression over d>
   python3 -c "import json,sys; d=json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]); sys.exit(0 if ($2) else 1)" "$1"

@@ -37,8 +37,7 @@ RUNTIMES = {
 }
 
 HINT = {
-    "gvisor": "install gVisor on a Linux Docker host and register it: `runsc install -- --reproduce-nat && systemctl restart docker` "
-              "(--reproduce-nat lets Docker's embedded DNS answer in the sandbox) "
+    "gvisor": "install gVisor on a Linux Docker host and register it: `runsc install && systemctl restart docker` "
               "(https://gvisor.dev/docs/user_guide/install/). Docker Desktop on macOS or Windows has no runsc.",
     "microvm": "needs a Linux Docker host with /dev/kvm and Kata Containers registered as a Docker runtime named "
                "`kata` (https://github.com/kata-containers/kata-containers). Docker Desktop on macOS has no Kata "

@@ -175,7 +175,7 @@ airlock. A kernel escape defeats it. Two other backends change ONLY the agent co
 | `isolation:` | Agent runs under | Needs |
 | --- | --- | --- |
 | `docker` (default) | runc, the host kernel | Docker with Compose v2 |
-| `gvisor` | gVisor `runsc`: the agent's system calls go to gVisor's user-space kernel | Linux Docker host, runsc registered: `runsc install -- --reproduce-nat` |
+| `gvisor` | gVisor `runsc`: the agent's system calls go to gVisor's user-space kernel | Linux Docker host, runsc registered: `runsc install` |
 | `microvm` | a Kata Containers VM per agent container (own guest kernel, KVM) | Linux Docker host with `/dev/kvm`, Kata registered as runtime `kata` |
 
 ```
