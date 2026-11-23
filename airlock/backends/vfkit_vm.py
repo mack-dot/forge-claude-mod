@@ -102,13 +102,19 @@ def lock_readonly(ws, rels):
 
 
 def unlock_tree(ws):
-    """Clear the flags of every entry under ws (before the run folder is deleted)."""
-    if not os.path.isdir(ws) or not hasattr(os, "lchflags"):
+    """Clear the flags of every entry under ws and make its folders writable for their owner
+    (closed dirs are 0555), so that the run folder can be deleted. Never follows a symlink."""
+    import stat as st
+    if not os.path.isdir(ws) or os.path.islink(ws):
         return
     for d, dirs, files in os.walk(ws):
         for x in [d] + [os.path.join(d, y) for y in dirs + files]:
             try:
-                os.lchflags(x, 0)
+                if hasattr(os, "lchflags"):
+                    os.lchflags(x, 0)
+                m = os.lstat(x).st_mode
+                if st.S_ISDIR(m):
+                    os.chmod(x, st.S_IMODE(m) | 0o700)
             except OSError:
                 pass
 
