@@ -574,8 +574,69 @@ def test_isolation():
              r.returncode == B.PROBE_EXIT and "RAN" not in r.stdout, (r.returncode, r.stdout, r.stderr))
 
 
+def test_vfkit():
+    """macOS microvm (vfkit): the compose -> VM translation, preflight refusals, the image build is deterministic.
+    Host-independent (no VM is started here)."""
+    import tempfile
+    sys.path.insert(0, os.path.join(PKG, "backends"))
+    import vfkit_compose as VC
+    import vfkit_image as VI
+    import vfkit_vm as VM
+    work = tempfile.mkdtemp()
+    bind = os.path.join(work, "src")
+    os.makedirs(bind)
+    open(os.path.join(bind, "f"), "w").write("x")
+    svc = {"user": "1000:1000", "working_dir": "/workspace", "environment": ["A=1", "PASSED", "UNSET"],
+           "volumes": ["ws:/workspace", f"{bind}:/forge-run:ro",
+                       {"type": "volume", "source": "ws", "target": "/workspace/tests", "read_only": True,
+                        "volume": {"subpath": "tests"}}],
+           "networks": ["agentnet"], "command": ["true"], "read_only": True, "cap_drop": ["ALL"]}
+    fw = {"agentnet": [(8700, ("127.0.0.1", 1234), ["airlock"])]}
+    j = VC.job(svc, {"ws": "/H/ws"}, fw, work, environ={"PASSED": "p"})
+    case("vfkit: service env -> VM env (NAME from this process; an unset NAME is left out)",
+         j["env"] == {"A": "1", "PASSED": "p"}, j["env"])
+    case("vfkit: the ws volume is shared rw, its subpath read-only, a bind is a read-only COPY",
+         [(h, g, ro) for _t, h, g, ro in j["shares"]][:1] == [("/H/ws", "/workspace", False)]
+         and ("/H/ws/tests", "/workspace/tests", True) in [(h, g, ro) for _t, h, g, ro in j["shares"]]
+         and any(g == "/forge-run" and ro and h.startswith(work) for _t, h, g, ro in j["shares"]), j["shares"])
+    case("vfkit: network agentnet -> only its vsock forwards", j["forwards"] == fw["agentnet"], j["forwards"])
+    for k, v in (("privileged", True), ("cap_add", ["SYS_ADMIN"]), ("network_mode", "host"), ("devices", ["/dev/kvm"])):
+        case(f"vfkit: negative control: service option {k} is refused (it would widen the box)",
+             raises(lambda: VC.job(dict(svc, **{k: v}), {"ws": "/H"}, fw, work), VC.Refused, k))
+    case("vfkit: negative control: a network without a vsock mapping is refused",
+         raises(lambda: VC.job(dict(svc, networks=["agentnet", "upstream"]), {"ws": "/H"}, fw, work), VC.Refused, "upstream"))
+    case("vfkit: negative control: a named volume without a host folder is refused",
+         raises(lambda: VC.job(dict(svc, volumes=["logs:/data"]), {"ws": "/H"}, fw, work), VC.Refused, "logs"))
+    old = dict(os.environ)
+    try:
+        os.environ["FORGE_VFKIT"] = os.path.join(work, "no-such-vfkit")
+        case("vfkit: negative control: vfkit missing -> Unavailable (exit 2 in up)",
+             raises(VM.preflight, VM.Unavailable, "not installed" if sys.platform == "darwin" else "macOS"))
+        os.environ.pop("FORGE_VFKIT")
+        os.environ["FORGE_VFKIT_TEST_NO_HV"] = "1"
+        case("vfkit: negative control: no hardware virtualization -> Unavailable",
+             raises(VM.preflight, VM.Unavailable, "virtualization" if sys.platform == "darwin" else "macOS"))
+    finally:
+        os.environ.clear()
+        os.environ.update(old)
+    t = VI.Tree()
+    t.file("b", b"2")
+    t.file("a/x", b"1", 0o755)
+    t.link("l", "/a/x")
+    t2 = VI.Tree()
+    t2.link("l", "/a/x")
+    t2.file("a/x", b"1", 0o755)
+    t2.file("b", b"2")
+    case("vfkit: initrd cpio is deterministic (insertion order, time and owner do not change the bytes)",
+         t.cpio() == t2.cpio() and t.cpio().startswith(b"070701"))
+    lock = json.load(open(VI.LOCK))
+    case("vfkit: every pinned package and the kernel have a SHA-256",
+         all(len(p["sha256"]) == 64 for p in lock["packages"] + [lock["kernel"]]) and len(lock["packages"]) > 10)
+    shutil.rmtree(work, ignore_errors=True)
+
+
 def main():
-    for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static, test_redteam, test_isolation):
+    for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static, test_redteam, test_isolation, test_vfkit):
         try:
             t()
         except Exception as e:  # noqa: BLE001

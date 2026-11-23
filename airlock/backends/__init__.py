@@ -5,9 +5,15 @@
   gvisor   the agent container runs under gVisor (`runtime: runsc`): its system calls go to the
            gVisor user-space kernel (the Sentry), not to the host kernel. Needs a Linux Docker host
            with runsc registered as a Docker runtime.
-  microvm  the agent container runs in its own lightweight VM with its own guest kernel, through
-           the Kata Containers runtime (QEMU / Cloud Hypervisor / Firecracker behind it). Needs a
-           Linux Docker host with /dev/kvm and a Kata runtime registered with Docker.
+  microvm  the agent runs in its own lightweight VM with its own guest kernel:
+           - Linux: the agent container runs under the Kata Containers runtime (QEMU / Cloud
+             Hypervisor / Firecracker behind it). Needs /dev/kvm and Kata registered with Docker.
+           - macOS: the agent is not a container: it runs in a vfkit VM (Apple Virtualization.framework;
+             vfkit_vm.py, image vfkit_image.py). The airlock stays in Docker Desktop; the VM reaches
+             only the airlock's (and egress proxy's) ports over vsock, and sees the workspace as a
+             virtio-fs share of a case-sensitive host volume. Needs vfkit (`brew install vfkit`, no
+             sudo), the built image and hardware virtualization; else exit 2.
+             FORGE_AIRLOCK_MICROVM_RUNTIME set = use a Kata runtime of that name instead.
 
 Only the AGENT container changes. The airlock, the egress proxy and the exporter stay on runc:
 they are the trusted side and the airlock needs its nosymfollow bind mount.
@@ -24,6 +30,7 @@ not a proof that the runtime has no escape)."""
 import json
 import os
 import subprocess
+import sys
 
 NAMES = ("docker", "gvisor", "microvm")
 DEFAULT = "docker"
@@ -40,13 +47,40 @@ HINT = {
     "gvisor": "install gVisor on a Linux Docker host and register it: `runsc install && systemctl restart docker` "
               "(https://gvisor.dev/docs/user_guide/install/). Docker Desktop on macOS or Windows has no runsc.",
     "microvm": "needs a Linux Docker host with /dev/kvm and Kata Containers registered as a Docker runtime named "
-               "`kata` (https://github.com/kata-containers/kata-containers). Docker Desktop on macOS has no Kata "
-               "runtime; see the section Isolation backends in airlock/README.md for the macOS status.",
+               "`kata` (https://github.com/kata-containers/kata-containers). On macOS, microvm uses vfkit instead "
+               "(see the section Isolation backends in airlock/README.md).",
 }
 
 
 class BackendError(Exception):
     pass
+
+
+def microvm_impl():
+    """How `microvm` is built on this host: "vfkit" (macOS: the agent in a vfkit VM) or "kata"."""
+    if os.environ.get("FORGE_AIRLOCK_MICROVM_RUNTIME"):
+        return "kata"
+    return "vfkit" if sys.platform == "darwin" else "kata"
+
+
+def available(name, registered=None):
+    """True if backend name can start here (no side effects; for tests and messages)."""
+    if name == "docker":
+        return True
+    if name == "microvm" and microvm_impl() == "vfkit":
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import vfkit_vm
+        try:
+            vfkit_vm.preflight()
+            return True
+        except vfkit_vm.Unavailable:
+            return False
+    registered = docker_runtimes() if registered is None else registered
+    try:
+        runtime_for(name, registered or set())
+        return True
+    except BackendError:
+        return False
 
 
 def resolve(cli_value, policy_value):
