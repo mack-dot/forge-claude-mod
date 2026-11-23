@@ -232,7 +232,7 @@ def main():
 
     # 6b. the egress proxy (only when the box has one): a host that forge.yaml does not
     #     allow must be refused with 403
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or plan.get("egress_proxy")
     if proxy:
         phost, pport = proxy.split("//", 1)[-1].rstrip("/").rsplit(":", 1)
         for hp in plan.get("egress_proxy_refuse", []):

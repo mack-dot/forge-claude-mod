@@ -188,8 +188,28 @@ def draft(repo, tools_by_upstream=None, with_fs=True, claude=True):
     doc = {"version": 1, "upstreams": ups, "tools": {"allow": allow, "deny": sorted(set(deny)), "gate": gate},
            "paths": {"hidden_paths": hidden, "readonly_paths": readonly}}
     if claude:
-        doc["agent"] = {"egress_allow": ["api.anthropic.com:443"]}
+        # The model is reached THROUGH the airlock (forge.yaml `llm`): the box holds no key, the
+        # airlock adds it, and spending is capped. The box itself needs no egress.
+        doc["llm"] = dict(LLM_DRAFT)
+        questions.append({"kind": "llm", "why": "model access for `claude` in the box: the key stays outside "
+                          "(named by key_env); caps in estimated cost units (micro-USD)",
+                          "proposal": {k: LLM_DRAFT[k] for k in ("key_env", "session_cap", "daily_cap",
+                                                                  "per_request_max", "allowed_models")}})
+        notes.append("llm: prices in the draft are a snapshot; check them, and set the caps you accept "
+                     "(1000000 cost units = 1 USD)")
     return doc, notes, questions
+
+
+# Estimated cost units: micro-USD from these prices (USD per million tokens). A snapshot; check it.
+LLM_DRAFT = {
+    "provider_url": "https://api.anthropic.com", "key_env": "ANTHROPIC_API_KEY", "unit": "cost",
+    "session_cap": 10000000, "daily_cap": 30000000, "per_request_max": 5000000, "bytes_per_input_token": 2,
+    "allowed_models": ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-haiku-4-5"],
+    "prices": {"claude-opus-5-5": {"input_per_mtok": 4, "output_per_mtok": 20},
+               "claude-sonnet-5-5": {"input_per_mtok": 2, "output_per_mtok": 10},
+               "claude-haiku-5-5": {"input_per_mtok": 0.5, "output_per_mtok": 2.5},
+               "claude-haiku-4-5": {"input_per_mtok": 1, "output_per_mtok": 5}},
+}
 
 
 # ---------------------------------------------------------------- YAML out (block style)

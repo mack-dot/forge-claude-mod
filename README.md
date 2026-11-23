@@ -99,8 +99,9 @@ box's workspace with the hidden paths absent (also from git history), starts the
 (they hold the keys; secrets are named in `forge.yaml` as `${NAME}` only), runs a breach canary in the box (fail
 closed), and runs the command interactively. MCP tools are default deny; tools that spend money or act on the
 world can be gated with a cap, decided by the compiled escrow verifier of Forge's #91 (its model is PROVED in
-Dafny), kept running as one process. The box reaches only the airlock and the hosts in `agent.egress_allow`
-(for `claude`: the model API).
+Dafny), kept running as one process. The box reaches only the airlock and the hosts in `agent.egress_allow`.
+With `llm` in `forge.yaml`, `claude` in the box needs NO key: it reaches the model through the airlock, which adds
+the key from your shell and caps the spending per session and per day (no `--pass-env`; `airlock/README.md`).
 
 Honest labels:
 
@@ -112,12 +113,13 @@ Honest labels:
 | Policy engine, path checks, workspace filter, `nosymfollow` mount, canary, egress proxy, sync-back filter | NATIVE CHECK |
 | Every run of `prove_release.sh` | FINITE TEST (one machine, listed inputs) |
 | Isolation | container tier: the box shares the host kernel (on macOS, Docker Desktop's Linux VM); a kernel or runtime escape is out of scope |
+| `llm` model proxy: verifier's verdict on the spending log | PROVED (Dafny model); the token estimate, the reading of the provider's usage report and the proxy are NATIVE CHECK |
 | `--pass-env NAME` | the agent CAN READ that value (and can send it to the allowed hosts); use a separate, spend-capped key |
 | End to end | `end_to_end=false`: tested with mocks, fake keys and the real server-filesystem, not with a real paid service |
 
-`./prove_release.sh` runs all 7 release gates (checker tests, plugin validation and scans; hidden paths incl. a
+`./prove_release.sh` runs all 8 release gates (checker tests, plugin validation and scans; hidden paths incl. a
 concurrent symlink swap; gated MCP incl. crash, timeout and restart; planted breaches; diff sync-back; gate
-latency; this README) and exits 0 only if all pass. Not tested: see "Not tested" in `airlock/README.md`
+latency; this README; the `llm` model proxy against a fake provider) and exits 0 only if all pass. Not tested: see "Not tested" in `airlock/README.md`
 (no real model session in the box, no Linux or Windows host, no real paid upstream).
 
 ## Build: from proof to code your app runs

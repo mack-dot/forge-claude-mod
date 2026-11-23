@@ -14,7 +14,13 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
 - Fixed (airlock, the two known gaps of #97): symlink swap between the check and the open (the workspace is
   mounted `nosymfollow` for the airlock and every upstream); mid-call crash, timeout and airlock kill (steps end
   ABORTED and stay spent; the exact total survives restarts; a crashed stdio upstream is started again).
-- Added: `prove_release.sh`, 7 release gates, exit 0 only if all pass.
+- Added: `prove_release.sh`, 8 release gates, exit 0 only if all pass.
+- Added (airlock): `llm` in `forge.yaml`, the airlock's model endpoint. The box gets `ANTHROPIC_BASE_URL` and no
+  key; the airlock adds the key (named by `key_env`), forwards through the egress proxy (an airlock-only target),
+  streams SSE back, reserves `max_tokens` + estimated input before forwarding and settles to the reported usage
+  after (the full reservation stays spent when usage is unknown). Caps per session, per UTC day and per request,
+  decided by the same compiled #91 verifier (PROVED model); estimate, settlement and proxy are NATIVE CHECK.
+  `up` needs no `--pass-env` for the model key and refuses it. Tested: gate G8 (fake provider, fake key).
 - Not tested: a real model session in the box; Linux and Windows hosts; real paid upstreams.
 ## 0.12.1 — 2026-11-22
 - Fixed: `/forge approve` (and bare `/forge`, `/forge spec`) showed each spec shortened to its clause lines, so some

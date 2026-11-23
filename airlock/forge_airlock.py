@@ -36,7 +36,10 @@ from policy import Policy, PolicyError, env_refs  # noqa: E402
 
 IMAGE = os.environ.get("FORGE_AIRLOCK_IMAGE", "forge-airlock:local")
 CLAUDE_IMAGE = os.environ.get("FORGE_AIRLOCK_CLAUDE_IMAGE", "forge-airlock-claude:local")
+PREFIX = os.environ.get("FORGE_AIRLOCK_PREFIX", "forgeair")  # Docker project prefix (tests use their own)
 PORT = 8700
+LLM_PORT = 8701
+LLM_DUMMY_KEY = "forge-airlock-no-key"  # the airlock ignores it and adds the real key itself
 EXIT_POLICY, EXIT_BREACH = 2, 10
 
 
@@ -62,6 +65,11 @@ def git_root(path):
 
 def repo_key(repo):
     return hashlib.sha256(os.path.realpath(repo).encode()).hexdigest()[:12]
+
+
+def logs_volume_name(repo):
+    """forge-airlock-logs-<repo> by default; <prefix>-logs-<repo> with FORGE_AIRLOCK_PREFIX (tests)."""
+    return f"{PREFIX}-logs-{repo_key(repo)}" if PREFIX != "forgeair" else f"forge-airlock-logs-{repo_key(repo)}"
 
 
 def need_docker():
@@ -133,11 +141,21 @@ def stage_repo(repo, dest):
 
 # ---------------------------------------------------------------- compose generation
 def compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, pass_env, readonly_dirs,
-                own_agent_image=False):
+                own_agent_image=False, llm_session="default", egress_token=None):
     agent_env = {"FORGE_AIRLOCK": f"http://airlock:{PORT}", "HOME": "/tmp"}
     if pol.egress_allow:
         agent_env.update(HTTPS_PROXY="http://egress:3128", HTTP_PROXY="http://egress:3128",
                          NO_PROXY="airlock,localhost,127.0.0.1")
+    airlock_env = []
+    if pol.llm:
+        # The model endpoint is the airlock. The agent gets NO key: only a dummy value for clients
+        # that insist on one; the airlock drops it and adds the real key (llm.key_env) itself.
+        agent_env.update(ANTHROPIC_BASE_URL=f"http://airlock:{LLM_PORT}", ANTHROPIC_AUTH_TOKEN=LLM_DUMMY_KEY,
+                         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1", NO_PROXY="airlock,localhost,127.0.0.1")
+        if not egress_token:
+            egress_token = secrets.token_hex(24)
+        airlock_env = [f"FORGE_LLM_SESSION={llm_session}", "FORGE_LLM_EGRESS=egress:3128",
+                       f"FORGE_EGRESS_TOKEN={egress_token}"]
     agent_env_list = [f"{k}={v}" for k, v in agent_env.items()] + list(pass_env)  # NAME only: value from your shell
     ro_mounts = [{"type": "volume", "source": "ws", "target": f"{pol.agent_root.rstrip('/')}/{d}", "read_only": True,
                   "volume": {"subpath": d}} for d in readonly_dirs]
@@ -147,7 +165,7 @@ def compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, pass
             "image": IMAGE, "command": ["python3", "-I", "/forge/airlock/gateway.py"],
             "environment": ["FORGE_SOURCE=/source", "FORGE_POLICY=/forge/forge.yaml", "FORGE_WS_RAW=/ws-raw",
                             "FORGE_CANARY_TOKEN"]  # F7: value from this process only (see cmd_up)
-            + list(pol.env_names),
+            + list(pol.env_names) + airlock_env,
             "volumes": [f"{os.path.abspath(policy_path)}:/forge/forge.yaml:ro", f"{stage}:/source:ro",
                         "logs:/data", "state:/state", "ws:/ws-raw"],
             # CAP_SYS_ADMIN only for the nosymfollow bind mount of the workspace (gap 1); AppArmor's
@@ -175,10 +193,12 @@ def compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, pass
                         "/state/filtered.git", "/out"],
         },
     }
-    if pol.egress_allow:
+    if pol.egress_allow or pol.llm:
+        private = ["--private", f"{pol.llm['host']}:{pol.llm['port']}"] if pol.llm else []
         svc["egress"] = dict(harden, **{
             "image": IMAGE, "user": "1000:1000", "networks": ["agentnet", "outnet"],
-            "command": ["python3", "-I", "/forge/airlock/egress_proxy.py", "3128"] + list(pol.egress_allow)})
+            "environment": [f"FORGE_EGRESS_TOKEN={egress_token}"] if pol.llm else [],
+            "command": ["python3", "-I", "/forge/airlock/egress_proxy.py", "3128"] + list(pol.egress_allow) + private})
         svc["agent"]["depends_on"]["egress"] = {"condition": "service_started"}
     # F2: bounded container logs (json-file rotation): an agent cannot fill the host disk
     for v in svc.values():
@@ -274,6 +294,9 @@ def cmd_up(a):
     for n in a.pass_env:
         if n not in os.environ:
             raise SystemExit(f"forge-airlock: --pass-env {n}: not set in your shell")
+        if pol.llm and n == pol.llm["key_env"]:
+            raise SystemExit(f"forge-airlock: --pass-env {n}: this is the model key of forge.yaml `llm`; it stays "
+                             "with the airlock, and the agent reaches the model through the airlock without it")
         if n in pol.env_names:
             raise SystemExit(f"forge-airlock: --pass-env {n}: this is an upstream secret of forge.yaml; it stays "
                              "with the airlock (passing it to the agent would defeat the airlock)")
@@ -281,8 +304,8 @@ def cmd_up(a):
             f"any host it can reach. Use a separate, spend-capped key for it.")
     agent_image = a.agent_image or (CLAUDE_IMAGE if wants_claude else IMAGE)
     run_dir = tempfile.mkdtemp(prefix="forge-airlock-")
-    project = f"forgeair-{repo_key(repo)}-{os.path.basename(run_dir)[-8:].lower()}"
-    logs_volume = f"forge-airlock-logs-{repo_key(repo)}"
+    project = f"{PREFIX}-{repo_key(repo)}-{os.path.basename(run_dir)[-8:].lower()}"
+    logs_volume = logs_volume_name(repo)
     dc = ["docker", "compose", "-p", project, "-f", os.path.join(run_dir, "compose.json")]
     # F7: a one-time token for the canary endpoints. Only the airlock and the canary process
     # get it; the agent's command runs after `unset FORGE_CANARY_TOKEN`.
@@ -296,12 +319,17 @@ def cmd_up(a):
         with open(os.path.join(run_dir, "agent", "mcp.json"), "w") as f:
             json.dump({"mcpServers": {"forge-airlock": {"type": "http", "url": f"http://airlock:{PORT}/mcp"}}}, f)
         doc = compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, a.pass_env,
-                          readonly_dirs(pol, stage), own_agent_image=bool(a.agent_image))
+                          readonly_dirs(pol, stage), own_agent_image=bool(a.agent_image), llm_session=project)
+        if pol.llm:
+            c = pol.llm
+            say(f"model access through the airlock: {c['scheme']}://{c['host']}:{c['port']} with the key from "
+                f"${c['key_env']} (the agent gets no key); cap {c['session_cap']} {c['unit']} per session"
+                + (f", {c['daily_cap']} per UTC day" if c["daily_cap"] is not None else ""))
         with open(os.path.join(run_dir, "compose.json"), "w") as f:
             json.dump(doc, f, indent=1)
         run(["docker", "volume", "create", logs_volume], stdout=subprocess.DEVNULL)
         say("starting the airlock (filtered workspace, upstream servers) ...")
-        services = ["airlock"] + (["egress"] if pol.egress_allow else [])
+        services = ["airlock"] + (["egress"] if pol.egress_allow or pol.llm else [])
         if run(dc + ["up", "-d", "--wait"] + services, stdout=subprocess.DEVNULL,
                stderr=subprocess.DEVNULL).returncode:
             run(dc + ["logs", "--no-log-prefix", "--tail", "30", "airlock"])
@@ -437,7 +465,7 @@ def cmd_check(a):
 
 def cmd_reset_logs(a):
     repo = git_root(a.repo)
-    v = f"forge-airlock-logs-{repo_key(repo)}"
+    v = logs_volume_name(repo)
     r = run(["docker", "volume", "rm", v], stdout=subprocess.DEVNULL)
     say(f"removed gate logs volume {v}" if r.returncode == 0 else f"no volume {v} removed")
     return r.returncode

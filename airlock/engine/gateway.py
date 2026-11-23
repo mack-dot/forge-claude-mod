@@ -124,6 +124,13 @@ class Airlock:
             if len(owners) != 1:
                 die(f"policy tool {tp.name!r}: offered by {len(owners)} matching upstreams (need exactly 1)")
             self.route[tp.name] = owners[0]
+        self.llm = None
+        if self.policy.llm:
+            import llm_proxy
+            try:
+                self.llm = llm_proxy.LLMGate(self.policy.llm, DATA, os.environ.get("FORGE_LLM_SESSION", "default"))
+            except (GateError, OSError, ValueError) as e:
+                die(f"llm gate log: {e}")
         self.restart_lock = threading.Lock()
         self.canary = "PENDING"  # PENDING -> PASSED | BREACH ; one report per airlock lifetime
         self.canary_lock = threading.Lock()
@@ -270,14 +277,15 @@ class Airlock:
             "agent_root": self.policy.agent_root,
             "fp_salt": self.fp_salt.hex(),
             "fingerprints": self.ws["fingerprints"],
-            "secret_fps": [workspace.fp(s.encode(), self.fp_salt) for s in self.policy.secrets()],
+            "secret_fps": [workspace.fp(s.encode(), self.fp_salt) for s in self.policy.secrets() + self._run_tokens()],
             "hidden_names": self.ws["hidden_names"],
             "readonly_files": self.ws.get("readonly_files", [])[:8],
             "closed_dirs": self.ws.get("closed_dirs", [])[:8],
             "airlock_paths": [STATE, SOURCE, DATA, POLICY_FILE, self.policy.mcp_root, "/source", "/ws-raw",
                               os.environ.get("FORGE_DEMO_FIXTURES", "/forge-fixtures")],
             "egress_targets": self.policy.egress_targets + self._upstream_hostports(),
-            "egress_proxy_refuse": ["example.com:443", "1.1.1.1:443"],
+            "egress_proxy_refuse": ["example.com:443", "1.1.1.1:443"] + self._llm_hostport(),
+            "egress_proxy": "http://egress:3128" if self.policy.llm else None,
             "deny": self.policy.deny,
             "unlisted": unlisted + ["forge_canary_no_such_tool"],
             "mcp_read": [(n, [k for k, m in self.policy.tools[n].path_args.items() if m == "read"][0]) for n in reads],
@@ -286,6 +294,16 @@ class Airlock:
             "mcp_rev": [(n, [k for k, m in self.policy.tools[n].path_args.items() if m == "git_revpath"][0])
                         for n in revs],
         }
+
+    def _llm_hostport(self):
+        """The model provider is airlock-only: the agent's own CONNECT to it must be refused."""
+        c = self.policy.llm
+        hp = f"{c['host']}:{c['port']}" if c else None
+        return [hp] if hp and hp not in [x.lower() for x in self.policy.egress_allow] else []
+
+    def _run_tokens(self):
+        t = os.environ.get("FORGE_EGRESS_TOKEN", "")
+        return [t] if len(t) >= 8 else []
 
     def _upstream_hostports(self):
         out = []
@@ -489,6 +507,10 @@ class Server(ThreadingHTTPServer):
 def main():
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))  # logs are fsynced per step; exit at once
     Handler.A = Airlock()
+    if Handler.A.llm is not None:
+        import llm_proxy
+        llm_proxy.serve(Handler.A, Handler.A.llm, Handler.A.policy.llm, Handler.A.policy.llm_key,
+                        int(os.environ.get("FORGE_LLM_PORT", "8701")))
     Server(("0.0.0.0", PORT), Handler).serve_forever()
 
 
