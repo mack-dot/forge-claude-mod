@@ -203,7 +203,7 @@ def draft(repo, tools_by_upstream=None, with_fs=True, claude=True):
 # Estimated cost units: micro-USD from these prices (USD per million tokens). A snapshot; check it.
 LLM_DRAFT = {
     "provider_url": "https://api.anthropic.com", "key_env": "ANTHROPIC_API_KEY", "unit": "cost",
-    "session_cap": 10000000, "daily_cap": 30000000, "per_request_max": 5000000, "bytes_per_input_token": 2,
+    "session_cap": 10000000, "daily_cap": 30000000, "per_request_max": 5000000, "bytes_per_input_token": 1,
     "allowed_models": ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-haiku-4-5"],
     "prices": {"claude-opus-5-5": {"input_per_mtok": 4, "output_per_mtok": 20},
                "claude-sonnet-5-5": {"input_per_mtok": 2, "output_per_mtok": 10},

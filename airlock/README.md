@@ -68,7 +68,7 @@ llm:
   allowed_models: [claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5]
   prices:                                   # USD per million tokens; needed for unit: cost
     claude-opus-5-5: {input_per_mtok: 4, output_per_mtok: 20}
-  bytes_per_input_token: 2                  # 1 = most conservative estimate (see below)
+  bytes_per_input_token: 1                  # default; 1 = strict upper bound, 0 overshoot (see below)
 ```
 
 - The agent container gets `ANTHROPIC_BASE_URL=http://airlock:8701` and

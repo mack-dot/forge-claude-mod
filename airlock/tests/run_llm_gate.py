@@ -46,6 +46,10 @@ def case(name, cond, detail=""):
     print(("ok    " if cond else "FAIL  ") + name + ("" if cond else f"   {str(detail)[-600:]}"), flush=True)
 
 
+# F7: one canary token per harness run, set before any airlock starts; only canary runs get it (-e NAME).
+os.environ.setdefault("FORGE_CANARY_TOKEN", secrets.token_hex(24))
+
+
 def sh(cmd, env=None, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, env=env, **kw)
 
@@ -116,7 +120,8 @@ def part1(tmp):
         e = sum((["-e", f"{k}={v}"] for k, v in (extra_env or {}).items()), [])
         pre = ('python3 -I /forge/agent/canary.py >/tmp/c.log 2>&1 || { c=$?; tail -n 5 /tmp/c.log; exit $c; }; '
                'tail -n 1 /tmp/c.log; ') if canary else ""
-        cmd = dc + ["run", "--rm", "-T"] + e + ["agent", "sh", "-c",
+        pre += 'unset FORGE_CANARY_TOKEN; '  # as forge up: the agent's own command never holds the token
+        cmd = dc + ["run", "--rm", "-T", "-e", "FORGE_CANARY_TOKEN"] + e + ["agent", "sh", "-c",
                                                 pre + f'exec python3 -I /forge/agent/llm_probe.py {phase}']
         t = time.time()
         r = sh(cmd, env=env, timeout=timeout)
@@ -219,7 +224,7 @@ def part1(tmp):
         # ---- planted breach: the model key in the agent (a fresh airlock: the canary runs once per lifetime)
         sh(dc + ["restart", "airlock"], env=env, timeout=120)
         up_airlock()
-        r = sh(dc + ["run", "--rm", "-T", "-e", "PLANTED_MODEL_KEY", "agent", "python3", "-I",
+        r = sh(dc + ["run", "--rm", "-T", "-e", "FORGE_CANARY_TOKEN", "-e", "PLANTED_MODEL_KEY", "agent", "python3", "-I",
                      "/forge/agent/canary.py"], env=dict(env, PLANTED_MODEL_KEY=KEY), timeout=600)
         case(f"breach: the model key planted in the agent's env -> canary exit {r.returncode} (expect 10)",
              r.returncode == 10 and "PLANTED_MODEL_KEY" in r.stdout, r.stdout[-600:])
@@ -337,8 +342,8 @@ def real_smoke():
         if sh(dc + ["up", "-d", "--wait", "airlock", "egress"], timeout=300).returncode:
             print("real smoke: the airlock did not start")
             return 1
-        r = sh(dc + ["run", "--rm", "-T", "agent", "sh", "-c", "python3 -I /forge/agent/canary.py >/tmp/c.log 2>&1 "
-                     "|| { tail -n 3 /tmp/c.log; exit 9; }; env | grep -c '^ANTHROPIC_API_KEY=' ; exec python3 -c \"$0\"",
+        r = sh(dc + ["run", "--rm", "-T", "-e", "FORGE_CANARY_TOKEN", "agent", "sh", "-c", "python3 -I /forge/agent/canary.py >/tmp/c.log 2>&1 "
+                     "|| { tail -n 3 /tmp/c.log; exit 9; }; unset FORGE_CANARY_TOKEN; env | grep -c '^ANTHROPIC_API_KEY=' ; exec python3 -c \"$0\"",
                      SMOKE], timeout=300)
         res = result_line(r.stdout, "SMOKE")
         print("real smoke: " + json.dumps(res))
