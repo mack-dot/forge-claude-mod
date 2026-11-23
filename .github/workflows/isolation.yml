@@ -179,6 +179,6 @@ jobs:
             echo "this runner can boot VMs: run the vfkit e2e"
             FORGE_E2E_ISOLATION=microvm python3 airlock/tests/run_up_e2e.py
           else
-            echo "::warning title=vfkit VM battery SKIPPED::$(tail -1 pre.err) - not run, not passed"
-            echo "SKIPPED (not passed): $(tail -1 pre.err)"
+            echo "::warning title=vfkit VM battery SKIPPED::$(tr "\n" " " < pre.err)- not run, not passed"
+            echo "SKIPPED (not passed): $(tr "\n" " " < pre.err)"
           fi
