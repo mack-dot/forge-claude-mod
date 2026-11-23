@@ -1,0 +1,58 @@
+prove_release: commit 8782301 dirty=0 docker 28.5.1 2026-11-23T02:21:25Z
+G1  checker tests + airlock unit tests + plugin validate + secret/home-path scans exit=0     212s
+G2  hidden/visible paths: cat, ../, symlinks, concurrent swap, git show (4 checks) exit=0     282s
+G3  real fs server + gates: deny, args, 20 parallel, dup ids, crash, timeout, restart (15) exit=0     282s
+G4  planted breaches caught; fail-closed boot (12 checks)                      exit=0     282s
+G5  diff sync-back: y applies allowed only, n applies nothing, hidden/read-only rejected exit=0      82s
+G6  gated-call latency before (subprocess) vs after (persistent), median and p95 exit=0     154s
+G8  llm proxy: no key in box, SSE, settle, error/cut/kill keep, 20 parallel at cap, restart exit=0      73s
+G7  README: unified workflow and honest labels                                 exit=0       0s
+cleanup: containers=0 volumes=0 networks=0 (forgeair*, forge-airlock*, llm-*)
+prove_release: PASS total=806s out=/private/tmp/claude-501/-Users-mackianni-forge/5a728f74-c7fc-4a0c-a5e5-40316e413e9c/scratchpad/release-llm-2
+ok    compose: agent env has ANTHROPIC_BASE_URL and only the dummy key; airlock env names the key
+ok    airlock, egress proxy and fake provider start (2.0 s)
+ok    airlock log: llm endpoint up, provider http://fakeprov:9000
+ok    env: ANTHROPIC_BASE_URL points at the airlock
+ok    env: no ANTHROPIC_API_KEY variable
+ok    env: ANTHROPIC_AUTH_TOKEN is only the dummy
+ok    key absent: env, /proc/*/environ+cmdline, 10843 files (5.7 s)
+ok    no direct route from the agent to the provider fakeprov:9000: refused (gaierror)
+ok    egress proxy refuses the agent's CONNECT to the provider: 'HTTP/1.1 403 Forbidden' / with a guessed token 'HTTP/1.1 403 Forbidden'
+ok    JSON: 200 through the airlock, dummy key replaced (status 200)
+ok    settlement = reported usage 100+7+20+30 = 157 (reserved 407, charged 157)
+ok    SSE: 9 events, content-type text/event-stream, ends with message_stop
+ok    SSE is streamed, not buffered: first bytes at 0.06 s, last at 1.69 s (9 reads)
+ok    SSE settlement = reported usage 21 (charged 21, reserved 438)
+ok    provider error 500 is passed on and the FULL reservation is kept (398 == 398)
+ok    cut stream keeps the FULL reservation (427 == 427) and the agent gets an error event
+ok    model not in allowed_models refused (400), nothing charged
+ok    request above per_request_max refused (400), nothing charged
+ok    free paths forwarded uncharged (count_tokens 200, models 200); batches 404 and other paths 404 refused (also ../ and %2e%2e forms)
+ok    session log: proved verdict ACCEPT, gross 1003 <= cap 12000, open 0
+ok    phase basic (in the agent container)
+ok    key on the wire: the fake provider saw the real key on all 6 requests, never the dummy, never an Authorization or Proxy-Authorization header
+ok    kill: the slow request reached the provider (True) and was PENDING (open=1) when the airlock got SIGKILL
+ok    kill: the airlock starts again on the same log volume (1.8 s)
+ok    kill: at restart the open reservation is settled as spent (log line)
+ok    after restart: gross 1485 == expected 1485, open 0, verdict ACCEPT
+ok    after restart: 3 reservations ABORTED (expected 3)
+ok    after restart: a request reserving 10906 > room 10515 is refused (400)
+ok    kill: after restart gross = 1003 + full reservation 482; 3 ABORTED (error, cut, kill)
+ok    kill: the basic phase's gross was the base of the slow request
+ok    20 concurrent streams: 7 forwarded, 13 refused FORGE_LLM_CAP_REACHED; room 10515, R 1418, expected 7 (3.1 s)
+ok    after the burst: gross 11411 == 1485 + 7 x 1418, <= cap 12000, verdict ACCEPT
+ok    phase concurrency (20 concurrent streams)
+ok    concurrency: the provider received exactly the 7 forwarded requests (7 new; refused ones never left the airlock)
+ok    after restart: gross 11411 == expected 11411, open 0, verdict ACCEPT
+ok    after restart: a request reserving 978 > room 589 is refused (400)
+ok    restart: the cap and the gross (11411) survive a restart; over-room request refused (8.6 s)
+ok    breach: the model key planted in the agent's env -> canary exit 10 (expect 10)
+ok    breach: after BREACH the model endpoint refuses: 503 {"type": "error", "error": {"type": "invalid_request_error", "message": "FORGE_CANARY_
+ok    final: session gross 11411 <= cap 12000, verdict ACCEPT; day log gross 11411 == session gross (one session today)
+ok    forge up: exit 0, no --pass-env for the model key, call through the airlock (15.1 s)
+ok    forge up: says where model access goes; --pass-env of another value still prints its warning
+ok    forge up: --pass-env of the model key is refused (exit 1)
+ok    forge up: the fake provider got 1 request(s), each with the real key and no dummy
+ok    cleanup: llm-* containers/volumes/networks left: 0/0/0
+timings (s): image build 1.2, basic 15.9, check 6.9, concurrency 4.1, check 7.0, forge up 15.1
+llm gate: 21/21 ok in 72.8 s
