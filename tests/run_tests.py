@@ -128,6 +128,31 @@ def decision_record_edited(root):
     edit(root, DECISIONS, '| Reject; never a partial spend |', '| Allow a partial spend |')
 
 
+def approve_as_shown(root):  # the mod's approval path: spec --json, then approve --hashes
+    shown = json.loads(subprocess.run([sys.executable, CLI, 'spec', '--root', root, '--json'],
+                                      stdout=subprocess.PIPE, universal_newlines=True).stdout)['hashes']
+    subprocess.run([sys.executable, CLI, 'approve', '--root', root, '--hashes', json.dumps(shown)],
+                   stdout=subprocess.DEVNULL, check=True)
+
+
+def legacy_note_edited(root):  # an approval from before 0.13 holds the full-file hash: a note edit still counts
+    edit(root, DECISIONS, '- Who may spend (authorization).', '- Who may spend (authorization; see the auth rule).')
+
+
+def out_of_scope_note_edited(root):  # prose only: no new approval needed (0.13)
+    if not open(os.path.join(root, APPROVED)).read().count('"n:'):
+        approve_as_shown(root)
+        if os.path.isdir(os.path.join(root, '.git')):
+            git(root, 'add', '.')
+            git(root, 'commit', '-q', '-m', 'approved in the 0.13 form')
+            git(root, 'branch', '-f', 'base')
+    edit(root, DECISIONS, '- Who may spend (authorization).', '- Who may spend (authorization; see the auth rule).')
+
+
+def broken_ts_app(root):  # a missing brace in a file the check touches
+    edit(root, 'legacy_wallet.ts', '  return { ok: false, spent }\n}', '  return { ok: false, spent }\n')
+
+
 def edit_emitted(root):  # hand edit of emitted code
     path = os.path.join(root, 'verified/wallet-cap/py/wallet_cap-py/Wallet.py')
     text = open(path).read()
@@ -167,6 +192,10 @@ CASES = [
     ('spec leaves an answer open (D3), re-approved', spec_leaves_answer_open, 'EXAMPLES_FAILED', 1, False),
     ('an answer edited after approval', answer_edited, 'SPEC_CHANGED', 1, False),
     ('decision record edited after approval', decision_record_edited, 'SPEC_CHANGED', 1, False),
+    ('out-of-scope note edited after approval', out_of_scope_note_edited, 'VERIFIED', 0, False),
+    ('note edited under an approval from before 0.13', legacy_note_edited, 'SPEC_CHANGED', 1, False),
+    ('out-of-scope note edited, with --base', out_of_scope_note_edited, 'VERIFIED', 0, True),
+    ('decision record edited, with --base', decision_record_edited, 'APPROVAL_CHANGED', 1, True),
     ('answers file changed, with --base', answer_edited, 'APPROVAL_CHANGED', 1, True),
 ]
 
@@ -177,6 +206,7 @@ BUILD_CASES = [
     ('emitted code edited by hand', edit_emitted, 'STALE_BUILD', 1),
     ('fuzz harness expects a wrong result', wrong_expect, 'FUZZ_FAILED', 1),
     ('app no longer imports the built code', unwire, 'NOT_WIRED', 1),
+    ('a touched app file does not parse (missing brace)', broken_ts_app, 'APP_SYNTAX_ERROR', 1),
 ]
 
 
@@ -451,6 +481,91 @@ def main():
             extra += 1
             print('%s  %-52s want approve %d, %s  got %d, %s%s' % ('ok  ' if ok else 'FAIL', 'approval: ' + name,
                   want_exit, want_verdict, r.returncode, ','.join(got), '' if covered else ' (hashes miss a file)'))
+    # the approval digest: shorter, but every clause line of the spec and every decision row is in it
+    full = subprocess.run([sys.executable, CLI, 'spec', '--root', EXAMPLE, '--full'], stdout=subprocess.PIPE,
+                          universal_newlines=True).stdout
+    with tempfile.TemporaryDirectory() as tmp:  # nothing approved yet: the digest shows every rule
+        shutil.copytree(EXAMPLE, os.path.join(tmp, 'p'), ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
+        open(os.path.join(tmp, 'p', APPROVED), 'w').write('{}\n')
+        dig = subprocess.run([sys.executable, CLI, 'spec', '--root', os.path.join(tmp, 'p')], stdout=subprocess.PIPE,
+                             universal_newlines=True).stdout
+    again = subprocess.run([sys.executable, CLI, 'spec', '--root', EXAMPLE], stdout=subprocess.PIPE,
+                           universal_newlines=True).stdout
+    ok_again = 'approved, unchanged' in again and 'ensures' not in again
+    failed += not ok_again
+    extra += 1
+    print('%s  approval digest: approved, unchanged files shown as one line (%d characters)' % (
+        'ok  ' if ok_again else 'FAIL', len(again)))
+    spec_lines = [l.rstrip() for l in open(os.path.join(EXAMPLE, SPEC)).read().split('\n')
+                  if re.match(r'\s*(requires|ensures|predicate|function|datatype|//)', l) or l.startswith('      ')]
+    rows = [l for l in open(os.path.join(EXAMPLE, DECISIONS)).read().split('\n') if l.startswith('| D')]
+    ok = len(dig) < len(full) and all(l in dig for l in spec_lines + rows) and '/forge approve --full' in dig
+    failed += not ok
+    extra += 1
+    print('%s  approval digest: %d of %d characters, all %d spec clause lines and %d decisions kept' % (
+        'ok  ' if ok else 'FAIL', len(dig), len(full), len(spec_lines), len(rows)))
+    # the syntax step on a machine with no git and a Node without a TypeScript parser (found in CI): no false alarm
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, 'p')
+        shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
+        bin_dir = os.path.join(tmp, 'bin')
+        os.makedirs(bin_dir)
+        os.symlink(sys.executable, os.path.join(bin_dir, 'python3'))
+        with open(os.path.join(bin_dir, 'node'), 'w') as f:
+            f.write('#!/bin/sh\nexit 3\n')  # an old Node: syntax_check.mjs exits 3 when it cannot parse TypeScript
+        os.chmod(os.path.join(bin_dir, 'node'), 0o755)
+        env = dict(os.environ, PATH=bin_dir)
+        c = subprocess.run([sys.executable, CLI, 'check', '--root', root, '--json', '--no-write'], env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        try:
+            res = json.loads(c.stdout)
+        except ValueError:
+            res = {'verdicts': {}, 'warnings': ['<no result> ' + c.stderr[-300:]]}
+        ok = (c.returncode == 0 and list(res['verdicts'].values()) == ['VERIFIED']
+              and not any(w.startswith('APP_SYNTAX_ERROR') for w in res.get('warnings', [])))
+        failed += not ok
+        extra += 1
+        print('%s  syntax step: no git and a Node without TypeScript parsing: not checked, no false alarm' % (
+            'ok  ' if ok else 'FAIL'))
+        if not ok:
+            print('      ' + json.dumps(res.get('warnings'))[:400] + c.stderr[-300:])
+    # a decision record that names code: approval remembers that code; a later change to it is flagged (never a
+    # failed verdict), and an out-of-scope item that names code is offered as the next rule
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, 'p')
+        shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
+        edit(root, DECISIONS, '- Several wallets sharing one cap; concurrency; persistence.',
+             '- Several wallets sharing one cap; concurrency; persistence.\n'
+             '- Input checks before `legacySpend` is called (legacy_wallet.ts): assumed done by the caller.')
+        shown = json.loads(subprocess.run([sys.executable, CLI, 'spec', '--root', root, '--json'],
+                                          stdout=subprocess.PIPE, universal_newlines=True).stdout)['hashes']
+        subprocess.run([sys.executable, CLI, 'approve', '--root', root, '--hashes', json.dumps(shown)],
+                       stdout=subprocess.DEVNULL, check=True)
+        def chk():
+            c = subprocess.run([sys.executable, CLI, 'check', '--root', root, '--json'],
+                               stdout=subprocess.PIPE, universal_newlines=True)
+            return c.returncode, json.loads(c.stdout)
+        code0, before = chk()
+        edit(root, 'legacy_wallet.ts', 'export interface Result', 'export interface Result /* changed */')
+        code1, after = chk()
+        nxt = (before.get('next_rule') or {}).get('wallet-cap', {})
+        cases = [
+            ('notes: nothing flagged while the described code is unchanged (negative control)',
+             code0 == 0 and before['warnings'] == []),
+            ('notes: change to described code flagged DECISION_NOTE_STALE, verdict stays VERIFIED',
+             code1 == 0 and list(after['verdicts'].values()) == ['VERIFIED']
+             and len(after['warnings']) == 1 and after['warnings'][0].startswith('DECISION_NOTE_STALE')
+             and 'legacy_wallet.ts' in after['warnings'][0]),
+            ('next rule: the out-of-scope item that names code is suggested',
+             nxt.get('code') == ['legacy_wallet.ts'] and 'legacySpend' in nxt.get('item', '')),
+        ]
+        for name, ok in cases:
+            failed += not ok
+            extra += 1
+            print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
+            if not ok:
+                print('      ' + json.dumps({'before': before.get('warnings'), 'after': after.get('warnings'),
+                                             'next': before.get('next_rule')})[:600])
     # mutation testing: a strong spec catches every planted bug; a weakened one lets some survive
     for name, weaken, want_survivors in [('strong spec: every planted bug caught', False, False),
                                          ('weakened spec (W4 removed): survivors reported', True, True)]:

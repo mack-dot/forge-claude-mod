@@ -31,7 +31,14 @@ type Check = {
 type LastDiff = { checks: Record<string, { verdict: string; inputs?: number; disagreements?: unknown[] }> }
 type Config = { version: 1; checks: Check[]; dafny?: string }
 type Verdict = string
-type LastCheck = { at: string; verdicts: Record<string, Verdict>; detail: Record<string, string> }
+type LastCheck = {
+  at: string
+  verdicts: Record<string, Verdict>
+  detail: Record<string, string>
+  warnings?: string[]
+  // places outside a rule that decide on its watched fields (written by `check` when a check has watchedFields)
+  outside?: Record<string, unknown[]>
+}
 
 const DIR = '.forge'
 const CONFIG = `${DIR}/forge.json`
@@ -83,8 +90,28 @@ function summary(last: LastCheck | undefined, total: number): string {
   if (!vs.length) return 'forge: no checks · /forge'
   const ok = vs.filter(([, v]) => v === 'VERIFIED').length
   const bad = vs.find(([, v]) => v !== 'VERIFIED')
-  if (!bad) return `forge ✓ VERIFIED ${ok}/${vs.length}`
+  if (!bad) return vs.length === 1 ? `forge ✓ ${vs[0][0]}: model PROVED` : `forge ✓ ${ok}/${vs.length} models PROVED`
   return `forge ✗ ${bad[1]} ${bad[0]} · ${ok}/${vs.length} verified`
+}
+
+// What a green check does NOT cover, said in the same line: the fuzz (a finite test of the code people run),
+// code outside the rule that decides the same question, and decision notes that may be stale.
+function scopeText(last: LastCheck | undefined, diff: LastDiff | undefined, cfg: Config | undefined): string {
+  if (!last || !Object.values(last.verdicts).every(v => v === 'VERIFIED')) return ''
+  let t = ''
+  const fuzzed = cfg?.checks.some(c => c.diff) ?? false
+  if (!fuzzed && !(diff && Object.keys(diff.checks).length)) t += ' · app code NOT fuzzed'
+  // Bypasses: shown (also as 0) once a check names the fields it governs; unknown otherwise, so say nothing.
+  const watched = cfg?.checks.some(c => (c as { watchedFields?: unknown[] }).watchedFields?.length) ?? false
+  const outside = Object.values(last.outside ?? {}).reduce((n, xs) => n + (xs?.length ?? 0), 0)
+  if (watched || outside) t += outside ? ` · ${outside} bypass${outside === 1 ? '' : 'es'}, /forge:bypass` : ' · 0 bypasses'
+  const warnings = last.warnings ?? []
+  const stale = warnings.filter(w => w.startsWith('DECISION_NOTE_STALE')).length
+  const broken = warnings.filter(w => w.startsWith('APP_SYNTAX_ERROR')).length
+  if (broken) t += ` · ✗ ${broken} app file${broken === 1 ? '' : 's'} do not parse`
+  if (stale) t += ` · ${stale} decision record${stale === 1 ? '' : 's'} may be stale`
+  else if (cfg?.checks.some(c => (c as { decisions?: string }).decisions)) t += ' · records current'
+  return t
 }
 
 async function refreshStatus($: Api) {
@@ -105,8 +132,9 @@ async function refreshStatus($: Api) {
       ? ` · fuzz ${broken.verdict}`
       : bad
         ? ` · fuzz ✗ ${bad} disagreement(s), /forge diff`
-        : ` · fuzz ✓ ${inputs.toLocaleString('en-US')} inputs`
+        : ` · fuzzed ${inputs.toLocaleString('en-US')} cases, wrapper NOT proved`
   }
+  if (!isChecking && !isDiffing) text += scopeText(last, diff, cfg)
   $.ui.status(cfg || last ? text : undefined)
 }
 
@@ -159,9 +187,10 @@ async function runBuild($: Api, isCheckOnly: boolean): Promise<string> {
 const PENDING = `${DIR}/pending-approval.json`
 const PENDING_MAX_AGE_MS = 24 * 3600 * 1000
 
-async function showSpecs($: Api): Promise<{ text: string; isOk: boolean; hashes?: Record<string, string> }> {
+async function showSpecs($: Api, isFull = false): Promise<{ text: string; isOk: boolean; hashes?: Record<string, string> }> {
   const root: string = await $.session.root()
-  const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'spec', '--root', root, '--json'], {
+  const args = ['python3', `${$.plugin.root}/cli/forge_check.py`, 'spec', '--root', root, '--json', ...(isFull ? ['--full'] : [])]
+  const r = await $.process.run(args, {
     cwd: root,
     timeoutMs: 60_000,
   })
@@ -173,17 +202,17 @@ async function showSpecs($: Api): Promise<{ text: string; isOk: boolean; hashes?
   }
 }
 
-async function showForApproval($: Api, lead: string): Promise<string> {
+async function showForApproval($: Api, lead: string, isFull = false): Promise<string> {
   const root: string = await $.session.root()
-  const { text, isOk, hashes } = await showSpecs($)
+  const { text, isOk, hashes } = await showSpecs($, isFull)
   if (!isOk || !hashes) return text
   await writeJson($, root, PENDING, { shownAt: new Date().toISOString(), hashes })
   return `${lead}\n\n${text}\n\nFor a plain-words explanation: /forge:explain\nTo approve exactly this: /forge approve yes`
 }
 
-async function approve($: Api, isConfirmed: boolean): Promise<string> {
+async function approve($: Api, isConfirmed: boolean, isFull = false): Promise<string> {
   const root: string = await $.session.root()
-  if (!isConfirmed) return showForApproval($, 'You are about to approve this:')
+  if (!isConfirmed) return showForApproval($, 'You are about to approve this:', isFull)
   const pending = await readJson<{ shownAt: string; hashes: Record<string, string> }>($, join(root, PENDING))
   const isFresh = !!pending && Date.now() - Date.parse(pending.shownAt) < PENDING_MAX_AGE_MS
   if (!pending || !isFresh)
@@ -371,15 +400,20 @@ export const register: Register = on => {
       })
       return { text: (r.stdout || r.stderr).trim().slice(0, 6000) || `The checker did not run (exit ${r.exitCode}).` }
     }
-    if (arg === 'approve') return { text: await approve($, /^approve\s+yes\b/.test(e.args.trim())) }
+    if (arg === 'approve')
+      return { text: await approve($, /^approve\s+yes\b/.test(e.args.trim()), /--full\b/.test(e.args)) }
     if (arg === 'spec') {
-      const { text } = await showSpecs($)
+      const { text } = await showSpecs($, /--full\b/.test(e.args))
       return { text: `${text}\n\nFor a plain-words explanation: /forge:explain` }
     }
     if (arg === 'status') {
       const root: string = await $.session.root()
       const last = await readJson<LastCheck>($, join(root, LAST))
-      return { text: last ? `${summary(last, 0)}\nlast run ${last.at}\n${JSON.stringify(last.verdicts, null, 2)}` : 'No check has run yet. Try /forge.' }
+      const cfg = await readJson<Config>($, join(root, CONFIG))
+      const diff = await readJson<LastDiff>($, join(root, '.forge/last-diff.json'))
+      if (!last) return { text: 'No check has run yet. Try /forge.' }
+      const extra = [...(last.warnings ?? []).map(w => `! ${w}`)]
+      return { text: `${summary(last, 0)}${scopeText(last, diff, cfg)}\nlast run ${last.at}\n${JSON.stringify(last.verdicts, null, 2)}${extra.length ? '\n' + extra.join('\n') : ''}` }
     }
     // Steps where Claude talks with the person are Markdown commands (/forge:scan …). A command.run hook
     // cannot start a Claude turn, so put the right command in the prompt box: the person presses Enter.

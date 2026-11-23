@@ -109,6 +109,36 @@ def sha256(path):
         return hashlib.sha256(f.read()).hexdigest()
 
 
+# Sections of a decision record that state nothing binding: editing them needs no new approval. Everything else
+# (the rule in the person's words, the confirmed defaults, the choices table) is hashed.
+NON_NORMATIVE = ('out of scope', 'notes', 'background', 'history')
+
+
+def normative_text(text):
+    keep, skip = [], False
+    for line in text.replace('\r\n', '\n').split('\n'):
+        m = re.match(r'#{2,6}\s+(.*)', line)
+        if m:
+            skip = m.group(1).strip().lower().startswith(NON_NORMATIVE)
+        if not skip:
+            keep.append(line.rstrip())
+    return '\n'.join(keep).strip() + '\n'
+
+
+def contract_hash(path):
+    """The hash an approval stores. A Markdown decision record is hashed without its non-normative sections
+    (Out of scope, Notes), so fixing a note does not need a new approval; every other file byte for byte."""
+    if path.endswith('.md'):
+        return 'n:' + hashlib.sha256(normative_text(read_text(path)).encode('utf-8')).hexdigest()
+    return sha256(path)
+
+
+def approved_matches(approved, rel, path):
+    """Approvals written before 0.13 hold the full-file hash of a decision record: accept both."""
+    h = approved.get(rel)
+    return h is not None and (h == contract_hash(path) or h == sha256(path))
+
+
 def read_json(path, default=None):
     try:
         with open(path, encoding='utf-8') as f:
@@ -301,9 +331,17 @@ def include_closure(root, files):
 
 
 def changed_since(root, base, paths):
-    """Protected paths that differ from the git ref `base`. None if git cannot tell."""
+    """Protected paths that differ from the git ref `base`. None if git cannot tell. A decision record counts as
+    changed only if its normative part changed (see contract_hash)."""
     out = []
     for rel in paths:
+        if rel.endswith('.md') and os.path.isfile(inside(root, rel)):
+            old = subprocess.run(['git', '-C', root, 'show', '%s:%s' % (base, rel)], stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, universal_newlines=True)
+            if old.returncode == 0:
+                if normative_text(old.stdout) != normative_text(read_text(inside(root, rel))):
+                    out.append(rel)
+                continue
         r = subprocess.run(['git', '-C', root, 'diff', '--quiet', base, '--', rel],
                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         if r.returncode == 1:
@@ -354,7 +392,7 @@ def run_checks(root, base=None):
         if unapproved:
             put('NOT_APPROVED', '%s never approved. Read and approve.' % ', '.join(unapproved))
             continue
-        changed = [f for f in contract_files(c) if approved[f] != sha256(inside(root, f))]
+        changed = [f for f in contract_files(c) if not approved_matches(approved, f, inside(root, f))]
         if changed:
             put('SPEC_CHANGED', '%s changed after approval. Read the new version and approve it.'
                 % ', '.join(changed))
@@ -428,6 +466,8 @@ def run_checks(root, base=None):
         'at': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
         'verdicts': verdicts,
         'detail': detail,
+        'warnings': stale_records(root, cfg) + app_syntax_warnings(root, cfg),
+        'next_rule': next_rules(root, cfg),
     }
 
 
@@ -436,7 +476,7 @@ def summary(result):
     ok = sum(1 for x in v.values() if x == 'VERIFIED')
     bad = [(n, x) for n, x in v.items() if x != 'VERIFIED']
     if not bad:
-        return 'forge ✓ VERIFIED %d/%d' % (ok, len(v))
+        return 'forge ✓ VERIFIED %d/%d (model PROVED; wrappers and other app code NOT proved)' % (ok, len(v))
     return 'forge ✗ %s %s · %d/%d verified' % (bad[0][1], bad[0][0], ok, len(v))
 
 
@@ -447,6 +487,14 @@ def report(result):
     for name, verdict in result['verdicts'].items():
         if verdict != 'VERIFIED':
             lines.append('\n--- %s ---\n%s' % (name, result['detail'][name]))
+    lines += ['! ' + w for w in result.get('warnings', [])]
+    for name, n in (result.get('next_rule') or {}).items():
+        lines.append('next rule for %s: "%s" (%s) is assumed by this rule but not proved. /forge:add it to close '
+                     'the gap.' % (name, n['item'], ', '.join(n['code'])))
+    if result['verdicts'] and all(x == 'VERIFIED' for x in result['verdicts'].values()):
+        lines.append('VERIFIED covers: the Dafny model meets the approved spec. Not covered: Dafny\'s compilers (the '
+                     'build fuzzes them), the wrapper that turns app values into model values, and any app code that '
+                     'decides the same question without calling the model.')
     return '\n'.join(lines)
 
 
@@ -553,6 +601,83 @@ def tree_hashes(folder):
     return out
 
 
+def app_files(root, c):
+    """The app files a check touches: those that call the built code (usedBy), the code under test the diff
+    watches, and the diff adapters (the wrappers)."""
+    out = [u['file'] for u in (c.get('build') or {}).get('usedBy', [])]
+    for d in diff_entries(c):
+        out += list(d.get('watch') or []) + ([d['adapter']] if d.get('adapter') else [])
+    seen = []
+    for f in out:
+        if f not in seen and os.path.isfile(inside(root, f)):
+            seen.append(f)
+    return seen
+
+
+_JS_EXT = ('.ts', '.mts', '.cts', '.js', '.mjs', '.cjs')
+_IMPORT = re.compile(r'(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|^\s*import\s+)["\'](\.{1,2}/[^"\']+)["\']', re.M)
+
+
+def dependents(root, files, limit=2000):
+    """JS/TS files that import any of `files`, directly or through other files (relative imports only): a broken
+    file here can break the path to the proved code even though no check names it."""
+    tracked = [f for f in project_files(root) if f.endswith(_JS_EXT) and not f.startswith(('node_modules/',))]
+    rev = {}
+    for f in tracked[:limit]:
+        try:
+            text = read_text(os.path.join(root, f))
+        except OSError:
+            continue
+        for m in _IMPORT.finditer(text):
+            base = os.path.normpath(os.path.join(os.path.dirname(f), m.group(1)))
+            for cand in [base] + [base + e for e in _JS_EXT] + [os.path.join(base, 'index' + e) for e in _JS_EXT]:
+                if os.path.isfile(os.path.join(root, cand)):
+                    rev.setdefault(cand, set()).add(f)
+                    break
+    seen, todo = set(files), [os.path.normpath(f) for f in files]
+    while todo:
+        for g in rev.get(todo.pop(), ()):
+            if g not in seen:
+                seen.add(g)
+                todo.append(g)
+    return sorted(seen - set(files))
+
+
+def syntax_errors(root, files):
+    """A cheap sanity step, not a proof: does each file at least parse? Returns (errors, unchecked)."""
+    errors, unchecked = [], []
+    node = shutil.which('node')
+    js = [f for f in files if os.path.splitext(f)[1] in _JS_EXT]
+    if js and node:
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'eval', 'syntax_check.mjs')
+        r = subprocess.run([node, script] + [inside(root, f) for f in js], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
+        if r.returncode == 1 and r.stdout.strip() and not r.stdout.lstrip().startswith(('file:', 'node:')):
+            errors += [os.path.relpath(l.split(': ', 1)[0], root) + ': ' + l.split(': ', 1)[-1]
+                       for l in r.stdout.strip().split('\n') if l]
+        elif r.returncode != 0:  # 3: no TypeScript parser in this Node; anything else: the checker itself failed
+            unchecked += ['%s (this Node cannot parse TypeScript; Node 22.13 or later can)' % f for f in js]
+    for rel in files:
+        if os.path.splitext(rel)[1] in _JS_EXT and node:
+            continue
+        path = inside(root, rel)
+        ext = os.path.splitext(rel)[1]
+        if ext == '.py':
+            try:
+                compile(read_text(path), rel, 'exec')
+            except SyntaxError as e:
+                errors.append('%s:%s: %s' % (rel, e.lineno, e.msg))
+            continue
+        if ext == '.go' and shutil.which('gofmt'):
+            r = subprocess.run(['gofmt', '-e', '-l', path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               universal_newlines=True, timeout=120)
+            if r.returncode != 0:
+                errors.append('%s: %s' % (rel, r.stdout.strip().split('\n')[0].replace(path, rel)))
+            continue
+        unchecked.append(rel)
+    return errors, unchecked
+
+
 def build_one(root, cfg, c, dafny, check_only):
     bd = c['build']
     name = c['name'].replace('-', '_')
@@ -563,6 +688,27 @@ def build_one(root, cfg, c, dafny, check_only):
         if res['verdict'] == 'BUILT':
             res['verdict'] = verdict
         res['notes'].append(note)
+
+    # 0. sanity: the app files this check touches must at least parse (a missing brace is caught here, not in
+    # production). Optional "typecheck": a command run in the project folder, for example
+    # ["npx", "--no-install", "tsc", "--noEmit"].
+    touched = app_files(root, c)
+    errs, unchecked = syntax_errors(root, touched + dependents(root, touched))
+    if errs:
+        fail('APP_SYNTAX_ERROR', 'app file(s) do not parse: ' + '; '.join(errs[:5]))
+        return res
+    if unchecked:
+        res['notes'].append('not syntax-checked (no checker for this file type here): ' + ', '.join(unchecked))
+    if bd.get('typecheck'):
+        try:
+            r = subprocess.run(list(bd['typecheck']), cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               universal_newlines=True, timeout=600)
+            if r.returncode != 0:
+                fail('TYPECHECK_FAILED', '%s: exit %d\n%s' % (' '.join(bd['typecheck']), r.returncode, r.stdout[-800:]))
+                return res
+        except (OSError, subprocess.TimeoutExpired) as e:
+            fail('TYPECHECK_FAILED', '%s: %s' % (' '.join(bd['typecheck']), e))
+            return res
 
     with tempfile.TemporaryDirectory() as tmp:
         # 1. fuzz: one clean copy of the sources per target, so builds do not touch the project
@@ -986,7 +1132,7 @@ def invariants_text(root):
             p = inside(root, f)
             if not os.path.isfile(p):
                 state.append('%s missing' % f)
-            elif approved.get(f) != sha256(p):
+            elif not approved_matches(approved, f, p):
                 state.append('%s %s' % (f, 'changed since approval' if f in approved else 'not approved'))
         if approved.get(CONFIG) != sha256(os.path.join(root, CONFIG)):
             state.append('forge.json not approved as it is')
@@ -1064,31 +1210,210 @@ def contract_of(path):
     return '\n'.join(keep)
 
 
-def show_specs(root):
-    """Text of what an approval covers, and the hashes of exactly that text."""
+def spec_digest(text):
+    """The spec for reading at approval: everything, except the bodies of lemmas and methods (proof steps and code,
+    which Dafny checks). Predicate and function bodies stay: they ARE the meaning of the rule. The approval hashes
+    the whole file."""
+    out, skipping, depth, pending = [], False, 0, False
+    for line in text.split('\n'):
+        st = line.strip()
+        if skipping:
+            depth += line.count('{') - line.count('}')
+            if depth <= 0:
+                skipping = False
+                out.append(line[:len(line) - len(line.lstrip())] + '{ … }  (body checked by Dafny, not shown)')
+            continue
+        if re.match(r'((ghost|static)\s+)*(lemma|method|constructor)\b', st):
+            pending = True
+        elif pending and re.match(r'(predicate|function|datatype|type|const|module|class|trait)\b', st):
+            pending = False
+        if pending and st.startswith('{'):
+            pending = False
+            depth = line.count('{') - line.count('}')
+            if depth > 0:
+                skipping = True
+                continue
+            out.append(line[:len(line) - len(line.lstrip())] + '{ … }  (body checked by Dafny, not shown)')
+            continue
+        out.append(line.rstrip())
+    return '\n'.join(out).rstrip()
+
+
+def config_digest(cfg):
+    lines = []
+    for c in cfg['checks']:
+        lines.append('- %s: proves %s against spec %s%s' % (c['name'], ', '.join(c['files']), c['spec'],
+                     '; bound by the first lines of %s' % c['binding']['file'] if c.get('binding') else ''))
+        if c.get('watchedFields'):
+            lines.append('  watched fields (code outside the rule that decides on them is listed): %s'
+                         % ', '.join(map(str, c['watchedFields'])))
+        bd = c.get('build') or {}
+        if bd:
+            lines.append('  build: %s into %s/; app callers: %s' % (', '.join(bd.get('targets', [])), bd.get('out'),
+                         ', '.join(u['file'] for u in bd.get('usedBy', [])) or 'none listed'))
+        for d in diff_entries(c):
+            lines.append('  fuzz: %s (%s) against the proved model' % (', '.join(d.get('watch') or [d.get('adapter', '?')]), d['lang']))
+    return '\n'.join(lines)
+
+
+def show_specs(root, full=False):
+    """Text of what an approval covers, and the hashes of exactly the files it covers. By default a digest for
+    reading (every spec clause complete, every answer, the whole decision record); full=True prints every file."""
     cfg = load_config(root)
     approved = read_json(os.path.join(root, APPROVED), {}) or {}
     hashes = {CONFIG: sha256(os.path.join(root, CONFIG))}
 
     def state(key):
-        if approved.get(key) == hashes[key]:
+        if approved.get(key) == hashes[key] or (key in approved and key != CONFIG
+                                                and approved_matches(approved, key, os.path.join(root, key))):
             return 'approved'
         return 'CHANGED since it was approved' if key in approved else 'not approved yet'
 
     parts = ['=== which code is checked against which spec: %s (%s) ===\n%s'
-             % (CONFIG, state(CONFIG), json.dumps(cfg, indent=2))]
+             % (CONFIG, state(CONFIG), json.dumps(cfg, indent=2) if full else config_digest(cfg))]
     for c in cfg['checks']:
         for rel in contract_files(c):
             if rel in hashes:
                 continue
-            hashes[rel] = sha256(inside(root, rel))
+            hashes[rel] = contract_hash(inside(root, rel))
             # The whole file, every word: an approval covers the complete file (by hash), so the person must be
             # able to read all of it. (Before 0.12.1 the spec was shortened to its clause lines.)
             body = read_text(inside(root, rel)).rstrip()
+            if not full and state(rel) == 'approved':
+                # Already approved and unchanged: one line, so the screen shows only what is new.
+                parts.append('=== %s %s: %s (approved, unchanged, sha256 %s…) ===' % (
+                    c['name'], 'spec' if rel == c['spec'] else 'your answers' if rel == c.get('examples')
+                    else 'decision record', rel, hashes[rel][:12]))
+                continue
+            if not full and rel == c['spec']:
+                body = spec_digest(body)
+            elif not full and rel == c.get('examples'):
+                ids = re.findall(r'//\s*(D\d+[a-z]?)\b[^\n]*', body)
+                body = ('%d answers written as Dafny asserts (%s); each must follow from the spec, or check fails with '
+                        'EXAMPLES_FAILED.' % (len(set(ids)), ', '.join(sorted(set(ids), key=lambda x: (len(x), x))))
+                        if ids else body)
             kind = 'spec' if rel == c['spec'] else 'your answers' if rel == c.get('examples') else 'decision record'
             parts.append('=== %s %s: %s (%s, sha256 %s…) ===\n%s'
                          % (c['name'], kind, rel, state(rel), hashes[rel][:12], body))
+    if not full:
+        parts.append('This is a digest. The approval covers the complete files above by their sha256 (shown). '
+                     'Read every line: /forge approve --full')
     return '\n\n'.join(parts), hashes
+
+
+DESCRIBED = DIR + '/described.json'
+_PATHLIKE = re.compile(r'(?<![\w/.-])((?:[\w.-]+/)*[\w.-]+\.[A-Za-z]{1,5})(?::\d+)?(?![\w/])')
+_IDENT = re.compile(r'`([A-Za-z_$][\w$]{2,})(?:\(\))?`')
+_SKIP_DIRS = ('.git', 'node_modules', '.forge', 'dist', 'build', 'target', '__pycache__', 'vendor')
+_TEST_FILE = re.compile(r'(^|/)(tests?|__tests__|spec)/|[._-](test|spec)\.[A-Za-z]+$|(^|/)test_[^/]+\.py$')
+
+
+def project_files(root):
+    """Tracked files (git ls-files), or a walk that skips build, vendor and hidden folders."""
+    try:
+        r = subprocess.run(['git', '-C', root, 'ls-files', '-z'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:  # no git on this machine: walk the folder
+        r = None
+    if r is not None and r.returncode == 0 and r.stdout:
+        return [f for f in r.stdout.decode('utf-8', 'replace').split('\0') if f and os.path.isfile(os.path.join(root, f))]
+    out = []
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in _SKIP_DIRS and not x.startswith('.')]
+        out += [os.path.relpath(os.path.join(d, f), root) for f in files]
+    return out
+
+
+def described_files(root, c):
+    """Code a decision record talks about: file paths it names (`gate.ts`, `src/x.py:47`) and functions it names in
+    backticks, found by a definition (function / def / func / fn / class / const …). The check's own contract and
+    proved files are left out. A heuristic: it finds what the record names, not what it means."""
+    rel = c.get('decisions')
+    if not rel or not os.path.isfile(inside(root, rel)):
+        return {}
+    return refs_in_text(root, c, read_text(inside(root, rel)))
+
+
+def refs_in_text(root, c, text):
+    own = set(contract_files(c) + [c['spec']] + c['files'] + [CONFIG])
+    out_dir = (c.get('build') or {}).get('out')
+    found = set()
+    for m in _PATHLIKE.finditer(text):
+        cand = m.group(1)
+        p = os.path.join(root, cand)
+        if os.path.isfile(p) and cand not in own:
+            found.add(os.path.normpath(cand))
+    idents = sorted({m.group(1) for m in _IDENT.finditer(text)})
+    code_ext = ('.ts', '.tsx', '.js', '.mjs', '.cjs', '.py', '.go', '.rs', '.java', '.cs', '.kt', '.rb')
+    out_norm = os.path.normpath(out_dir) + os.sep if out_dir else None
+    for ident in idents:
+        pat = re.compile(r'\b(?:function|def|func|fn|class|const|let|var)\s+%s\b|^\s*(?:export\s+)?%s\s*[:=]\s*(?:async\s*)?\('
+                         % (re.escape(ident), re.escape(ident)), re.M)
+        hits = []
+        for relf in project_files(root):
+            if not relf.endswith(code_ext) or relf in own or _TEST_FILE.search(relf):
+                continue
+            if out_norm and os.path.normpath(relf).startswith(out_norm):
+                continue
+            full = os.path.join(root, relf)
+            if os.path.getsize(full) <= 2000000 and pat.search(read_text(full)):
+                hits.append(relf)
+        # A name defined in many places says nothing about which code the record means: skip it.
+        if 1 <= len(hits) <= 2:
+            found.update(hits)
+    return {f: sha256(os.path.join(root, f)) for f in sorted(found)}
+
+
+def record_described(root):
+    """Written at approval: the code each decision record describes, as it was when the person approved it."""
+    cfg = load_config(root)
+    write_json(root, DESCRIBED, {c['name']: described_files(root, c) for c in cfg['checks'] if c.get('decisions')})
+
+
+def app_syntax_warnings(root, cfg):
+    """check: the app files the checks touch, and every file that imports them, must parse (a warning in check;
+    build fails with APP_SYNTAX_ERROR)."""
+    touched = []
+    for c in cfg['checks']:
+        touched += [f for f in app_files(root, c) if f not in touched]
+    if not touched:
+        return []
+    errs, _ = syntax_errors(root, touched + dependents(root, touched))
+    return ['APP_SYNTAX_ERROR %s' % e for e in errs[:10]]
+
+
+def stale_records(root, cfg):
+    """Warnings (never a failed verdict): code a decision record describes changed after approval."""
+    seen = read_json(os.path.join(root, DESCRIBED), {}) or {}
+    out = []
+    for c in cfg['checks']:
+        changed = [f for f, h in sorted((seen.get(c['name']) or {}).items())
+                   if not os.path.isfile(os.path.join(root, f)) or sha256(os.path.join(root, f)) != h]
+        if changed:
+            out.append('DECISION_NOTE_STALE %s: the decision record %s describes %s, which changed after approval. '
+                       'Re-read the record: it may no longer match the code (the proof approval is not affected).'
+                       % (c['name'], c['decisions'], ', '.join(changed)))
+    return out
+
+
+def next_rules(root, cfg):
+    """For each check: the first "Out of scope" item that names code in this repo (a backticked function or a file
+    path), as the suggested next rule. The record lists what the rule assumes; proving one of those assumptions
+    closes a gap the proof depends on. A heuristic over the person's own words."""
+    out = {}
+    for c in cfg['checks']:
+        rel = c.get('decisions')
+        if not rel or not os.path.isfile(inside(root, rel)):
+            continue
+        for line in _section(read_text(inside(root, rel)), 'Out of scope').split('\n'):
+            item = line.strip().lstrip('-*').strip()
+            if not item:
+                continue
+            refs = sorted(refs_in_text(root, c, item))
+            if refs:
+                out[c['name']] = {'item': item, 'code': refs}
+                break
+    return out
+
 
 
 def write_json(root, rel, value):
@@ -1441,6 +1766,7 @@ def main(argv=None):
     p.add_argument('--inputs', type=int, help='diff: at most this many random inputs (default from forge.json, 1500)')
     p.add_argument('--budget-ms', type=int, help='diff: time budget per check in ms (default 1500)')
     p.add_argument('--seed', type=int, help='diff: random seed (default: a fresh one each run)')
+    p.add_argument('--full', action='store_true', help='spec/approve: print every approved file in full')
     p.add_argument('--check', action='store_true', help='build: write nothing; the emitted code on '
                                                         'disk must equal a fresh build')
     p.add_argument('--rule', help='bypass: the check whose watchedFields or allowedBypasses to write')
@@ -1510,7 +1836,7 @@ def main(argv=None):
                 print('dafny: %s\nversion: %s (pinned download: %s)' % (path, version, DAFNY_VERSION))
             return 0 if version else 1
         if a.command == 'spec':
-            text, hashes = show_specs(root)
+            text, hashes = show_specs(root, a.full)
             print(json.dumps({'text': text, 'hashes': hashes}, ensure_ascii=False) if a.json else text)
             return 0
         if a.command == 'approve' and a.hashes:
@@ -1525,22 +1851,24 @@ def main(argv=None):
                 print('changed since it was shown: %s. Read it again.' % ', '.join(differ))
                 return 1
             write_json(root, APPROVED, current)
+            record_described(root)
             print('\n'.join('approved %s  sha256 %s…' % (k, h[:12]) for k, h in current.items()))
             return 0
         if a.command == 'approve':
             if not (sys.stdin.isatty() and sys.stdout.isatty()):
                 print('approve needs a person at a terminal.', file=sys.stderr)
                 return 2
-            text, hashes = show_specs(root)
+            text, hashes = show_specs(root, a.full)
             print(text)
             if input('\nApprove exactly this? Type yes: ').strip() != 'yes':
                 print('Not approved.')
                 return 1
             for key, h in hashes.items():
-                if sha256(os.path.join(root, key)) != h:
+                if (sha256 if key == CONFIG else contract_hash)(os.path.join(root, key)) != h:
                     print('%s changed while you read it. Run approve again.' % key)
                     return 1
             write_json(root, APPROVED, hashes)
+            record_described(root)
             print('approved: ' + ', '.join(hashes))
             return 0
         if a.command == 'build':

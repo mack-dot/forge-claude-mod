@@ -3,6 +3,14 @@
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
 ## Unreleased
+
+- Status line and `check` say what VERIFIED covers: `model PROVED`, the fuzz count with `wrapper NOT proved`, bypasses, `records current`.
+- `DECISION_NOTE_STALE`: code named in a decision record changed after approval (warning only). `.forge/described.json` is written at approval.
+- Approval hashes only the binding sections of a decision record (`n:` hashes); notes sections can be edited without re-approval. Old full-file approvals are still accepted.
+- Next-rule suggestion from the Out-of-scope items that name code.
+- `build`: `APP_SYNTAX_ERROR` when an app file a check touches, or any JS/TS file that imports one, does not parse; optional `typecheck` command (`TYPECHECK_FAILED`). `check` warns on the same.
+- `/forge approve` shows a digest; `--full` prints every file; approved, unchanged files collapse to one line.
+- Measured on a copy of a real app (2 rules): stale note flagged on the changed `turbopufferFilter`; the note fixed without re-approval; a missing brace in a file three imports away flagged; `visibleTo()` suggested as the next rule; approval screen 26,214 → 1,404 characters with both rules already approved.
 - Added (fuzzer): messy inputs for the unproved wrapper that turns app/JSON values into proved-code values (owner
   feedback: chronicle's gate-mayread wrapper threw on `householdId: undefined`, and the fuzz never sent one). An
   adapter may export `wrapper` / `wrappers` (the app's real wrapper, called with raw values) and `failClosed` /
