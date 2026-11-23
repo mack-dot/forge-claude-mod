@@ -31,7 +31,9 @@ def main(argv):
     for k, v in job["env"].items():
         cmd += ["-e", k]
         env[k] = v
-    cmd += [os.environ.get("FORGE_AIRLOCK_IMAGE", "forge-airlock:local")] + job["argv"]
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    import forge_airlock  # the same airlock image name as `up` (per source tag, or FORGE_AIRLOCK_IMAGE)
+    cmd += [forge_airlock.IMAGE] + job["argv"]
     rc = subprocess.run(cmd, env=env, stdin=subprocess.DEVNULL).returncode
     with open(log, "a") as f:
         f.write(f"FORGE-VM-RC {job['nonce']} {rc}\n")

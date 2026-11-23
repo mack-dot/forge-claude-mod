@@ -38,6 +38,10 @@
   shared kernel, on a Linux Docker host that has that runtime; `up` refuses when it is missing and checks
   in the box that the agent's kernel is not the host kernel. The airlock stays on runc. gVisor and Kata are
   third-party code: an escape from them is out of scope, as is a hypervisor escape.
+- macOS `--isolation microvm` runs the agent in a vfkit VM (Apple Virtualization.framework), not in Docker
+  Desktop's VM. The VM shares a host folder (the workspace) over virtio-fs and reaches only the airlock's
+  published ports over one vsock connection. Apple's hypervisor, its virtio-fs server and vfkit are
+  third-party code: an escape from them is out of scope.
 - `--pass-env NAME` exposes that value to the agent, which can send it to any host in `agent.egress_allow`.
   Use a separate, spend-capped key. An allowed host can always receive data from the agent.
 - With `llm` in `forge.yaml`, the model key stays in the airlock: the box gets only a dummy value and reaches

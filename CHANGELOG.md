@@ -100,8 +100,17 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
   checks that the agent's kernel is not the host kernel before the canary (exit 10). Tested: unit cases,
   `run_up_e2e.py` (missing backend refused; runc posing as gVisor caught), and on GitHub ubuntu-latest
   (workflow `isolation.yml`, runs 45116333410 and 45121073630) the G2-G4 battery 34/34 (docker), 35/35 (gvisor), 35/35
-  (microvm) and the `up` e2e 12/12 under each. Not tested: macOS `microvm` beyond a VM boot (see the
-  airlock README).
+  (microvm) and the `up` e2e 12/12 under each.
+- **macOS `microvm` = a vfkit VM** (Apple Virtualization.framework; `brew install vfkit`, no sudo): the agent
+  side runs in a disposable VM with its own kernel (Alpine linux-virt, pinned by SHA-256, image built
+  deterministically and cached outside the repository); workspace over virtio-fs, read-only paths as guest
+  binds plus the host immutable flag, network = one vsock tunnel to the airlock's ports only, no NIC driver in
+  the image. Fail closed (exit 2) without vfkit, the image or hardware virtualization. Tested on one Mac:
+  `run_up_e2e.py` 18/18 under vfkit (planted symlinks; vfkit missing / image missing / no virtualization ->
+  exit 2; a fake vfkit that is really Docker -> probe exit 10; a planted NAT device -> canary BREACH) and the
+  validate.sh battery with every agent-side service in a VM (numbers in the airlock README). CI cannot boot a
+  VM on GitHub's macOS runners (no nested virtualization): the job skips that step with a warning. Not
+  tested: Claude Code in the VM (refused), see the airlock README.
 
 ## 0.13.0 — 2026-11-23
 

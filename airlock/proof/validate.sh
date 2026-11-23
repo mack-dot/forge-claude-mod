@@ -49,6 +49,10 @@ if [ -n "$VFK" ]; then
     echo "    volumes: !override [\"./policies/\${FORGE_DOMAIN:-codebase}.yaml:/forge/forge.yaml:ro\", \"./fixtures:/forge-fixtures:ro\", \"logs:/data\", \"state:/state\", \"$VMWS:/ws-raw\"]"
     echo "  mock-http: {networks: [upstream, vmhost], ports: [\"127.0.0.1::9100\"]}"
     echo "  bench-direct: {volumes: !override [\"$VMWS:/ws:ro\"]}"; } >"$VFK_OVR"
+  { echo "services:"
+    echo "  airlock:"
+    echo "    environment: {FORGE_WS_RAW: \"\"}"
+    echo "    volumes: !override [\"./policies/\${FORGE_DOMAIN:-codebase}.yaml:/forge/forge.yaml:ro\", \"./fixtures:/forge-fixtures:ro\", \"logs:/data\", \"state:/state\", \"$VMWS:/ws\"]"; } >"$OUT/compose.vfkit-nosym.yml"
 fi
 RT=$([ -n "$VFK" ] || python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import backends as B; print(B.runtime_for(sys.argv[2], B.docker_runtimes()) or "")' .. "$ISO") \
   || { echo "VALIDATE: isolation $ISO not available on this Docker host (fail closed)" | tee -a "$OUT/summary.txt"; exit 2; }
@@ -78,7 +82,9 @@ fi
 echo "== run $FORGEAIR_RUN" | tee -a "$OUT/summary.txt"
 echo "== isolation $ISO (agent runtime: ${RT:-runc}$([ -n "$VFK" ] && echo '; vfkit VM, not a container'))" | tee -a "$OUT/summary.txt"
 
-dc_raw() { docker compose -p "forgeair-$FORGEAIR_RUN-$DOM" -f docker-compose.yml ${OVR:+-f "$OVR"} ${RT_OVR:+-f "$RT_OVR"} ${VFK_OVR:+-f "$VFK_OVR"} ${XOVR:+-f "$XOVR"} "$@"; }
+dc_raw() {  # vfkit: the no-nosymfollow control needs its workspace mount on the shared host folder too (last file wins)
+  local nosym=""; [ -n "$VFK" ] && [ "${OVR:-}" = control-nosymfollow-off.yml ] && nosym="$OUT/compose.vfkit-nosym.yml"
+  docker compose -p "forgeair-$FORGEAIR_RUN-$DOM" -f docker-compose.yml ${OVR:+-f "$OVR"} ${RT_OVR:+-f "$RT_OVR"} ${VFK_OVR:+-f "$VFK_OVR"} ${nosym:+-f "$nosym"} ${XOVR:+-f "$XOVR"} "$@"; }
 dc() {  # under a runtime override, `run` without --interactive: under Kata a `run -T` never ended in CI (run 45115365474); stdin is the suspect
   if [ -n "$RT" ] && [ "$1" = run ]; then shift; set -- run --interactive=false "$@"; fi
   if [ -n "$VFK" ]; then vfk_dc "$@"; return; fi
@@ -96,14 +102,17 @@ vfk_vm() {  # vfk_vm [run options] <agent-side service> [command...]: the servic
     -e) envs+=(-e "$2"); shift 2;; *) break;; esac; done
   svc=$1; shift
   [ -n "$nodeps" ] || dc_raw up -d --wait airlock >/dev/null 2>&1 || { echo "vfk: airlock did not start" >&2; return 2; }
-  dc_raw config --format json >"$OUT/vm-config.json" 2>/dev/null || return 2
+  dc_raw --profile controls --profile bench config --format json >"$OUT/vm-config.json" 2>/dev/null || return 2
   p_air=$(dc_raw port airlock 8700 2>/dev/null | head -1 | sed 's/.*://')
   p_mock=$(dc_raw port mock-http 9100 2>/dev/null | head -1 | sed 's/.*://')
   [ -n "$p_air" ] || { echo "vfk: the airlock's port is not published (fail closed)" >&2; return 2; }
   dc_raw exec -T airlock python3 -I -c "import json; d=json.load(open('/state/workspace.json')); print(json.dumps({'closed_dirs': d.get('closed_dirs', []), 'readonly_files': d.get('readonly_files', [])}))" >"$OUT/vm-ro.json" 2>/dev/null \
     || { echo "vfk: no read-only list from the airlock (fail closed)" >&2; return 2; }
-  a=(--config "$OUT/vm-config.json" --service "$svc" --volume "ws=$VMWS" --ro-list "$OUT/vm-ro.json" --lock
-     --net "agentnet=8700:127.0.0.1:${p_air:-0}:airlock")
+  a=(--config "$OUT/vm-config.json" --service "$svc" --volume "ws=$VMWS" --net "agentnet=8700:127.0.0.1:${p_air:-0}:airlock")
+  # control-root-writes in a VM: guest root alone cannot write read-only entries (guest read-only binds
+  # AND the host immutable flag; measured: the canary PASSES as guest root). The planted breach for the
+  # VM is therefore "root AND no read-only protection"; the canary must report it.
+  [ "$svc" = control-root-writes ] || a+=(--ro-list "$OUT/vm-ro.json" --lock)
   [ -n "$p_mock" ] && a+=(--net "upstream=9100:127.0.0.1:$p_mock:mock-http")
   if [ -n "$detach" ]; then
     python3 -I ../backends/vfkit_compose.py "${a[@]}" ${envs[@]+"${envs[@]}"} -- "$@" >/dev/null 2>&1 &
