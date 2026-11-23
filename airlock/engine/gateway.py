@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mcp_client  # noqa: E402
 import workspace  # noqa: E402
 from gatelog import GateLog, GateError  # noqa: E402
-from policy import Policy, PolicyError, Refusal, canonical_json, clip, strict_loads, MONEY_MAX  # noqa: E402
+from policy import SEP, Policy, PolicyError, Refusal, canonical_json, clip, strict_loads, MONEY_MAX  # noqa: E402
 
 POLICY_FILE = os.environ.get("FORGE_POLICY", "/forge/forge.yaml")
 DATA = os.environ.get("FORGE_DATA", "/data")
@@ -38,6 +38,9 @@ MAX_BODY = 1 << 20
 READ_TIMEOUT_S = float(os.environ.get("FORGE_READ_TIMEOUT_S", "30"))  # F1: per socket read
 MAX_CONN = int(os.environ.get("FORGE_MAX_CONN", "256"))  # F1: concurrent connections (threads)
 TOKEN_HEADER = "x-forge-canary-token"  # F7
+MAX_SESSIONS = int(os.environ.get("FORGE_MAX_SESSIONS", "256"))  # listen side, least recently used dropped
+SESSIONS_LOCK = threading.Lock()
+ALLOWED_ORIGINS = [x for x in os.environ.get("FORGE_ALLOWED_ORIGINS", "").split(",") if x]
 
 
 def die(msg):
@@ -85,7 +88,7 @@ def secure_ws_mount(ws):
 class Airlock:
     def __init__(self):
         try:
-            self.policy = Policy.load(POLICY_FILE)
+            self.policy = Policy.load(POLICY_FILE, role=os.environ.get("FORGE_ROLE") or None)
         except (PolicyError, OSError) as e:
             die(f"policy: {e}")
         os.makedirs(DATA, exist_ok=True)
@@ -110,20 +113,7 @@ class Airlock:
                 self.logs[name] = GateLog(DATA, name, cap, ein, eat)
         except (GateError, OSError) as e:
             die(f"gate log: {e}")
-        self.upstreams, self.route, self.upstream_tools = {}, {}, {}
-        for name, spec in self.policy.upstreams.items():
-            try:
-                up, tools = mcp_client.connect(spec)
-            except Exception as e:  # noqa: BLE001
-                die(f"upstream {name}: {e}")
-            self.upstreams[name] = up
-            self.upstream_tools[name] = {t["name"]: t for t in tools}
-        for tp in self.policy.tools.values():
-            owners = [u for u, ts in self.upstream_tools.items() if tp.name in ts
-                      and (tp.upstream is None or tp.upstream == u)]
-            if len(owners) != 1:
-                die(f"policy tool {tp.name!r}: offered by {len(owners)} matching upstreams (need exactly 1)")
-            self.route[tp.name] = owners[0]
+        self.connect_upstreams()
         self.llm = None
         if self.policy.llm:
             import llm_proxy
@@ -132,24 +122,51 @@ class Airlock:
             except (GateError, OSError, ValueError) as e:
                 die(f"llm gate log: {e}")
         self.restart_lock = threading.Lock()
+        self.sessions = {}
         self.canary = "PENDING"  # PENDING -> PASSED | BREACH ; one report per airlock lifetime
         self.canary_lock = threading.Lock()
         self.canary_report = None
         self.canary_token = canary_token()
         # F7: fingerprints are salted per workspace build (workspace.json, airlock side only)
         self.fp_salt = bytes.fromhex(self.ws.get("fp_salt", ""))
-        print(f"[airlock] up on :{PORT}; {len(self.route)} tools exposed; {len(self.logs)} gate logs; "
+        print(f"[airlock] up on :{PORT}; role {self.policy.role or '(base policy)'}; "
+              f"{len(self.upstreams)} upstreams; {len(self.route)} tools exposed; {len(self.logs)} gate logs; "
               f"{sum(len(t) for t in self.upstream_tools.values())} upstream tools seen; canary PENDING", flush=True)
+
+    def connect_upstreams(self):
+        """Start (stdio) or open (Streamable HTTP) every upstream, list its tools and route each
+        policy tool to exactly one of them. Fail closed at start: an upstream that does not come
+        up, a tool without a name, a name listed twice, or a namespacing collision stops the airlock.
+        After the start each upstream fails alone (see _live_upstream)."""
+        self.upstreams, self.route, self.upstream_tools = {}, {}, {}
+        for name, spec in self.policy.upstreams.items():
+            try:
+                up, tools = mcp_client.connect(spec)
+            except Exception as e:  # noqa: BLE001
+                die(f"upstream {name}: {e}")
+            self.upstreams[name] = up
+            names = [t.get("name") for t in tools if isinstance(t, dict)]
+            if len(names) != len(tools) or not all(isinstance(n, str) and n for n in names):
+                die(f"upstream {name}: a tool without a string name")
+            if len(set(names)) != len(names):
+                die(f"upstream {name}: lists one tool name twice (collision)")
+            self.upstream_tools[name] = {t["name"]: t for t in tools}
+        try:
+            self.route = route_tools(self.policy, self.upstream_tools)
+        except PolicyError as e:
+            die(str(e))
 
     # ------------------------------------------------------------ MCP methods
     def tools_list(self):
         out = []
         for name in sorted(self.route):
-            t = dict(self.upstream_tools[self.route[name]][name])
             tp = self.policy.tools[name]
+            t = dict(self.upstream_tools[self.route[name]][tp.raw])
+            t["name"] = name  # the agent sees the namespaced name (upstream__tool) when namespace: true
             if tp.gated:
+                cap = tp.cap if tp.role_cap is None else f"{tp.role_cap} (role {self.policy.role}; base {tp.cap})"
                 t["description"] = (t.get("description", "") + f" [forge gate: log={tp.log} unit={tp.unit} "
-                                    f"cap={tp.cap}]").strip()
+                                    f"cap={cap}]").strip()
             out.append(t)
         return {"tools": out}
 
@@ -167,22 +184,35 @@ class Airlock:
         if self.canary != "PASSED":
             raise Refusal("FORGE_CANARY_PENDING", "startup canary has not passed; nothing is forwarded yet")
         up = self._live_upstream(self.route[name])
+        call = {"name": tp.raw, "arguments": fwd}  # the upstream's own tool name
         if not tp.gated:
             try:
-                return up.request("tools/call", {"name": name, "arguments": fwd})
+                return up.request("tools/call", call)
             except mcp_client.UpstreamError as e:
                 raise Refusal("FORGE_UPSTREAM_FAILED", str(e)) from None
-        log = self.logs[tp.log]
         meta = {"tool": name, "args_sha256": hashlib.sha256(canonical_json(args).encode()).hexdigest()}
-        verdict, seq, gross = log.reserve(amount, step_id, meta)
-        if verdict != "ACCEPT":
-            raise Refusal("FORGE_GATE_REFUSED", f"gate {tp.log}: verifier verdict {verdict}",
-                          verdict=verdict, log=tp.log, gross=gross, cap=tp.cap)
+        # A role cap is one more, smaller log in front of the base log: the step must be ACCEPTed
+        # by both (the role log first). A refusal by the base log finishes the role step as
+        # ABORTED (spent): the error is on the safe side (counted, never lost).
+        chain = ([(tp.role_log, tp.role_cap)] if tp.role_log else []) + [(tp.log, tp.cap)]
+        held = []  # (log, seq)
+        try:
+            for ln, cap in chain:
+                lg = self.logs[ln]
+                verdict, seq, gross = lg.reserve(amount, step_id, meta)
+                if verdict != "ACCEPT":
+                    raise Refusal("FORGE_GATE_REFUSED", f"gate {ln}: verifier verdict {verdict}",
+                                  verdict=verdict, log=ln, gross=gross, cap=cap)
+                held.append((lg, seq))
+        except BaseException as e:
+            for lg, sq in held:
+                lg.finish(sq, False, f"refused after reserve: {clip(str(e), 150)}")
+            raise
         # F8: every exit from here finishes the step: COMMITTED only for a dict result without
         # isError, ABORTED (still spent) for an error, a timeout or ANY exception.
         ok, note = False, "internal error before the upstream answered"
         try:
-            res = up.request("tools/call", {"name": name, "arguments": fwd})
+            res = up.request("tools/call", call)
             if not isinstance(res, dict):
                 raise mcp_client.UpstreamError(f"{name}: upstream result is not an object")
             ok, note = not res.get("isError"), ""
@@ -194,15 +224,20 @@ class Airlock:
             note = f"{type(e).__name__}: {clip(str(e), 150)}"
             raise
         finally:
-            log.finish(seq, ok, note)
+            for lg, sq in held:
+                lg.finish(sq, ok, note)
         res = dict(res)
         res["_meta"] = {"forge": {"log": tp.log, "seq": seq, "gross": gross, "cap": tp.cap, "verdict": verdict}}
+        if tp.role_log:
+            res["_meta"]["forge"]["role"] = {"role": self.policy.role, "log": tp.role_log, "cap": tp.role_cap}
         return res
 
     def _declared(self, name):
         """Argument names the upstream's inputSchema lists for this tool (for strict_args)."""
         route = self.route.get(name) if isinstance(name, str) else None
-        schema = (self.upstream_tools.get(route, {}).get(name) or {}).get("inputSchema") if route else None
+        tp = self.policy.tools.get(name) if route else None
+        raw = tp.raw if tp is not None else name
+        schema = (self.upstream_tools.get(route, {}).get(raw) or {}).get("inputSchema") if route else None
         props = schema.get("properties") if isinstance(schema, dict) else None
         return set(props) if isinstance(props, dict) else set()
 
@@ -269,7 +304,8 @@ class Airlock:
     # ------------------------------------------------------------ canary
     def canary_plan(self):
         """Probe plan for the startup canary. Served only while the canary is PENDING."""
-        unlisted = sorted({t for ts in self.upstream_tools.values() for t in ts} - set(self.route))
+        unlisted = sorted({exposed_name(self.policy, u, t) for u, ts in self.upstream_tools.items() for t in ts}
+                          - set(self.route))
         reads = [n for n, tp in self.policy.tools.items() if "read" in tp.path_args.values()]
         writes = [n for n, tp in self.policy.tools.items() if "write" in tp.path_args.values()]
         revs = [n for n, tp in self.policy.tools.items() if "git_revpath" in tp.path_args.values()]
@@ -309,9 +345,62 @@ class Airlock:
         out = []
         for u in self.policy.upstreams.values():
             if u["transport"] == "http":
-                hp = u["url"].split("//", 1)[1].split("/", 1)[0]
-                out.append(hp if ":" in hp else hp + ":80")
+                from urllib.parse import urlsplit
+                x = urlsplit(u["url"])
+                out.append(f"{x.hostname}:{x.port or (443 if x.scheme == 'https' else 80)}")
         return out
+
+    # ------------------------------------------------------------ listen-side sessions
+    def _sessions(self):
+        with SESSIONS_LOCK:
+            return self.__dict__.setdefault("sessions", {})
+
+    def new_session(self):
+        sid = secrets.token_urlsafe(24)
+        sess = self._sessions()
+        with SESSIONS_LOCK:
+            if len(sess) >= MAX_SESSIONS:  # drop the least recently used
+                del sess[min(sess, key=sess.get)]
+            sess[sid] = time.monotonic()
+        return sid
+
+    def touch_session(self, sid):
+        sess = self._sessions()
+        with SESSIONS_LOCK:
+            if sid not in sess:
+                return False
+            sess[sid] = time.monotonic()
+            return True
+
+    def end_session(self, sid):
+        sess = self._sessions()
+        with SESSIONS_LOCK:
+            return sess.pop(sid, None) is not None
+
+
+def exposed_name(policy, upstream, raw):
+    return f"{upstream}{SEP}{raw}" if policy.namespace else raw
+
+
+def route_tools(policy, upstream_tools):
+    """Exposed tool name -> upstream name, for every policy tool. Fail closed (PolicyError):
+    a policy tool that no upstream (or more than one) offers, or two upstream tools that would
+    be exposed under one name."""
+    seen = {}
+    for u, ts in upstream_tools.items():
+        for t in ts:
+            n = exposed_name(policy, u, t)
+            if n in seen and policy.namespace:  # without namespace a pinned `upstream:` decides (below)
+                raise PolicyError(f"tool name collision: {n!r} is offered by upstreams {seen[n]!r} and {u!r}")
+            seen.setdefault(n, u)
+    route = {}
+    for tp in policy.tools.values():
+        owners = [u for u, ts in upstream_tools.items() if tp.raw in ts and (tp.upstream is None or tp.upstream == u)]
+        if len(owners) != 1:
+            raise PolicyError(f"policy tool {tp.name!r}: offered by {len(owners)} matching upstreams (need exactly 1"
+                              + ("" if len(owners) < 2 else "; collision: set namespace: true or pin upstream:") + ")")
+        route[tp.name] = owners[0]
+    return route
 
 
 def canary_token():
@@ -343,10 +432,12 @@ class Handler(BaseHTTPRequestHandler):
     A = None
     timeout = READ_TIMEOUT_S  # F1: every socket read times out (slow-loris)
 
-    def _send(self, code, obj):
+    def _send(self, code, obj, headers=None):
         body = json.dumps(obj, allow_nan=False).encode()
         self.send_response(code)
         self.send_header("content-type", "application/json")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -393,7 +484,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         A = self.A
         if self.path == "/healthz":
-            return self._send(200, {"ok": True, "canary": A.canary, "ws_mount": A.ws_mount})
+            return self._send(200, {"ok": True, "canary": A.canary, "ws_mount": A.ws_mount,
+                                    "role": A.policy.role})
         if self.path == "/forge/canary/plan":
             if not self._token_ok():
                 return self._send(403, {"error": "canary token required"})
@@ -409,10 +501,46 @@ class Handler(BaseHTTPRequestHandler):
             return
         return self._send(404, {"error": "not found"})
 
-    def do_DELETE(self):  # session end: there are no sessions
-        self.send_response(405)
+    def _empty(self, code, headers=None):
+        self.send_response(code)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.send_header("content-length", "0")
         self.end_headers()
+
+    def _mcp_refusal(self, rpc_id=None):
+        """MCP Streamable HTTP checks before a POST or DELETE /mcp is handled. Returns None
+        when the request may go on, else sends the refusal and returns True.
+        - Origin (DNS rebinding): a request that carries Origin is refused (403) unless the
+          origin is listed in FORGE_ALLOWED_ORIGINS. Programs in the box send no Origin.
+        - MCP-Protocol-Version: when present it must be a supported version (400).
+        - Mcp-Session-Id: when present it must be a live session of this airlock (404, the
+          client then starts a new session with initialize). A request without it is served
+          (sessionless clients); sessions carry no authority here: every gate is global."""
+        origin = self.headers.get("origin")
+        if origin is not None and origin not in ALLOWED_ORIGINS:
+            self.close_connection = True
+            self._send(403, {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32600,
+                                                                       "message": "origin not allowed"}})
+            return True
+        ver = self.headers.get("mcp-protocol-version")
+        if ver is not None and ver.strip() not in mcp_client.SUPPORTED:
+            self._send(400, {"jsonrpc": "2.0", "id": rpc_id, "error": {
+                "code": -32600, "message": f"unsupported MCP-Protocol-Version {clip(ver, 40)}"}})
+            return True
+        return None
+
+    def do_DELETE(self):  # MCP Streamable HTTP: end a session
+        if self.path.split("?")[0] != "/mcp":
+            return self._send(404, {"error": "not found"})
+        if self._mcp_refusal():
+            return
+        sid = self.headers.get("mcp-session-id")
+        if sid is None:
+            return self._send(400, {"error": "Mcp-Session-Id is required to end a session"})
+        if not self.A.end_session(sid):
+            return self._send(404, {"error": "unknown session"})
+        return self._empty(200)
 
     def do_POST(self):
         A = self.A
@@ -433,6 +561,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"state": A.canary})
         if self.path.split("?")[0] != "/mcp":
             return self._send(404, {"error": "not found"})
+        if self._mcp_refusal():
+            return
         ok_body, msg = self._read_or_reply(True)
         if not ok_body:
             return
@@ -441,15 +571,21 @@ class Handler(BaseHTTPRequestHandler):
                                     "error": {"code": -32600, "message": "batches are not supported"}})
         mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
         pname = clip(params.get("name")) if isinstance(params, dict) else clip(type(params).__name__)
-        if mid is None:  # notification
-            self.send_response(202)
-            self.send_header("content-length", "0")
-            self.end_headers()
-            return
+        sid, hdrs = self.headers.get("mcp-session-id"), {}
+        if method == "initialize" and mid is not None:
+            hdrs["mcp-session-id"] = A.new_session()
+        elif sid is not None and not A.touch_session(sid):
+            return self._send(404, {"jsonrpc": "2.0", "id": mid if isinstance(mid, (int, str)) else None,
+                                    "error": {"code": -32001, "message": "unknown or ended Mcp-Session-Id; "
+                                              "send initialize for a new session"}})
+        if mid is None or "method" not in msg:  # notification, or a client response: accepted
+            return self._empty(202)
         try:
             if method == "initialize":
-                res = {"protocolVersion": mcp_client.PROTOCOL, "capabilities": {"tools": {"listChanged": False}},
-                       "serverInfo": {"name": "forge-airlock", "version": "0.1"}}
+                want = params.get("protocolVersion") if isinstance(params, dict) else None
+                res = {"protocolVersion": want if want in mcp_client.SUPPORTED else mcp_client.PROTOCOL,
+                       "capabilities": {"tools": {"listChanged": False}},
+                       "serverInfo": {"name": "forge-airlock", "version": "0.2"}}
             elif method == "ping":
                 res = {}
             elif method == "tools/list":
@@ -462,12 +598,12 @@ class Handler(BaseHTTPRequestHandler):
         except Refusal as r:
             print(f"[airlock] refuse {pname}: {r.code} {clip(r.message, 300)}", flush=True)
             return self._send(200, {"jsonrpc": "2.0", "id": mid, "error": {
-                "code": ERR, "message": f"{r.code}: {r.message}", "data": dict(r.data, forge_code=r.code)}})
+                "code": ERR, "message": f"{r.code}: {r.message}", "data": dict(r.data, forge_code=r.code)}}, hdrs)
         except Exception as e:  # noqa: BLE001 - fail closed on any internal error
             print(f"[airlock] internal error: {type(e).__name__}: {clip(str(e), 300)}", flush=True)
             return self._send(200, {"jsonrpc": "2.0", "id": mid, "error": {
-                "code": ERR, "message": "FORGE_INTERNAL: refused", "data": {"forge_code": "FORGE_INTERNAL"}}})
-        return self._send(200, {"jsonrpc": "2.0", "id": mid, "result": res})
+                "code": ERR, "message": "FORGE_INTERNAL: refused", "data": {"forge_code": "FORGE_INTERNAL"}}}, hdrs)
+        return self._send(200, {"jsonrpc": "2.0", "id": mid, "result": res}, hdrs)
 
     def log_message(self, *a):
         pass
