@@ -29,8 +29,10 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
   2164257368): a flaky control, replaced. Base
   detection per event and the subfolder fix have their own steps in `checker-tests` (the old code fails the
   subfolder step: checked on one machine).
-- Measured (that run): the 50,000-input Python sweep took 1,500–4,054 ms per job; the example's five languages,
-  50,000 inputs each, 1,901–2,813 ms per language.
+- Measured on the runner: the 50,000-input Python sweep took 1,500–4,054 ms per job (run 45113316698) and
+  2,158–2,198 ms (run 45114616292); the example's five languages, 50,000 inputs each, 1,901–2,813 ms per language
+  (run 45113316698) and 3,829–5,389 ms (run 45114616292). The replaced bug in run 45114616292: 1,500 inputs found
+  it in 8 of 20 seeds, 50,000 in 10 of 10.
 - Not tested: macOS and Windows runners with the Action; `pull_request_target` and `merge_group` events on GitHub
   (only the detection from a stored event file); Java, Rust and .NET versions other than the runner's own.
 

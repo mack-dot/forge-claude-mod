@@ -64,7 +64,11 @@ Measured on GitHub-hosted `ubuntu-latest`, selftest run 45113316698 (one run):
 - `logic-bug`, first version (cap ends in 777): 1,500 inputs found it in 2 of 20 seeded runs, 50,000 inputs in 10
   of 10. In the next run (45113930328, seed 2164257368) the 50,000-input sweep missed it: about 0.9 inputs in
   10,000 hit it, a miss chance near 1% per run. It was replaced by `cap % 250 == 27` (about 4 in 10,000; counted
-  over 2,000,000 generated inputs on one machine); its CI numbers: PENDING_NEXT_RUN.
+  over 2,000,000 generated inputs on one machine); in run 45114616292,
+  the Action's sweep (seed 2164943332) found it in 2,198 ms; 1,500 inputs found it in 8 of 20 seeded runs (seeds
+  1–20), 50,000 inputs in 10 of 10 (seeds 1–10).
+- Run 45114616292: `clean` sweep 2,158 ms; the example's five languages 3,829–5,389 ms per language, 31 s wall
+  time; `action-on-example` sets up no toolchain itself, so the Action installed Node and Go for it.
 - The example, 50,000 inputs in each of its five languages (its legacy code disagrees, so this includes grouping
   and shrinking): py 2,813 ms, js 2,418 ms, go 2,204 ms, rs 2,192 ms, java 1,901 ms; 17 s wall time for the step,
   evaluator builds included.
