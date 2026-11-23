@@ -930,6 +930,63 @@ def main():
                 print('      ' + json.dumps({k: {kk: v.get(kk) for kk in ('verdict', 'per_candidate', 'messy', 'error')}
                                              for k, v in on.items()}, ensure_ascii=True)[:700])
 
+    # Messy inputs in the compiled languages (Go, Rust, Java; C# in tests/run_cs_diff.py): each adapter names wrappers
+    # that take the RAW JSON value (json.RawMessage, serde_json::Value, the evaluator's parsed value) and a fail-closed
+    # answer. Planted per language: one wrapper that panics/throws on a null or wrong-typed amount, one that coerces "5".
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, 'p')
+        shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
+        cfg = json.load(open(os.path.join(root, CONFIG)))
+        crash = {'go': 'wrapper-panics', 'rs': 'wrapper-panics', 'java': 'wrapper-throws'}
+
+        def compiled_cfg(flag):
+            cfg['checks'][0]['diff'] = [
+                dict({'name': 'messy-go', 'lang': 'go', 'inputs': 'diff/wallet_inputs.py', 'adapter': 'diff/wallet_messy.go'}, **flag),
+                dict({'name': 'messy-rs', 'lang': 'rs', 'inputs': 'diff/wallet_inputs.py', 'adapter': 'diff/wallet_messy.rs'}, **flag),
+                dict({'name': 'messy-java', 'lang': 'java', 'inputs': 'diff/wallet_inputs.py', 'adapter': 'diff/wallet_messy.java',
+                      'java_sources': ['messyjava']}, **flag)]
+            json.dump(cfg, open(os.path.join(root, CONFIG), 'w'))
+
+        compiled_cfg({'messy': False})  # negative control first: without the messy step, nothing is found
+        code_off, off = diff(root)
+        compiled_cfg({})
+        code_on, on = diff(root)
+        code_again, again = diff(root)
+        no_undef = [k for k in forge_diff.MESSY_KINDS if k != 'undefined']
+        cases_cm = [('messy (Go, Rust, Java): negative control, messy off: the planted wrappers agree on well-typed inputs',
+                     code_off == 0 and len(off) == 3 and all(r.get('verdict') == 'DIFF_OK' and 'messy' not in r for r in off.values()))]
+        for lang, label in (('go', 'Go'), ('rs', 'Rust'), ('java', 'Java')):
+            r = on.get('wallet-cap:messy-' + lang, {})
+            m = r.get('messy') or {}
+            t = got(r, crash[lang], 'THROWS_ON_MESSY_INPUT')
+            c = got(r, 'wrapper-coerces', 'MESSY_ANSWER')
+            kinds = [k for k in no_undef if k != 'lone-surrogate'] if lang == 'rs' else no_undef
+            cases_cm += [
+                ('messy %s: the wrapper that crashes on a null, missing or wrong-typed amount is THROWS_ON_MESSY_INPUT, '
+                 'only on amount, shrunk to cap 0, spent 0' % label,
+                 code_on == 1 and len(t) > 0 and {d['messy']['as'] for d in t} & {'null', 'removed'}
+                 and all(d['messy']['field'] == 'amount' for d in got(r, crash[lang]))
+                 and any({k: v for k, v in d['input'].items() if k != 'amount'} == {'cap': 0, 'spent': 0} for d in t)),
+                ('messy %s: the wrapper that coerces "5" to 5 is a MESSY_ANSWER disagreement' % label,
+                 any(d['messy']['as'] == 'number-as-text' and isinstance(d['input']['amount'], str) for d in c)),
+                ('messy %s: negative control, the fail-closed wrapper has 0 messy disagreements (%d messy inputs)'
+                 % (label, m.get('inputs', 0)),
+                 r.get('per_candidate', {}).get('wrapper-safe') == 0 and m.get('inputs', 0) > 100),
+                ('messy %s: every kind but undefined%s is tried and judged' % (label, ' and lone-surrogate (serde_json rejects it)'
+                                                                              if lang == 'rs' else ''),
+                 m.get('kinds') == kinds and m.get('not_judged') == 0 and m.get('pairs_tried', 0) >= 3 * len(kinds)
+                 and m.get('skipped_kinds', []) == (['lone-surrogate'] if lang == 'rs' else [])),
+                ('messy %s: saved messy cases replay first next run' % label,
+                 again.get('wallet-cap:messy-' + lang, {}).get('replayed', 0) >= len(got(r, crash[lang])) > 0 and code_again == 1),
+            ]
+        for name, ok in cases_cm:
+            failed += not ok
+            extra += 1
+            print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
+            if not ok:
+                print('      ' + json.dumps({k: {kk: v.get(kk) for kk in ('verdict', 'per_candidate', 'messy', 'error')}
+                                             for k, v in on.items()}, ensure_ascii=True)[:1500])
+
     # INVARIANTS.md: generated from the approved rules; CI catches a stale copy
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, 'p')

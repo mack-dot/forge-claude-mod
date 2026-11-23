@@ -2,6 +2,24 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## Unreleased
+
+- New (diff, M1.1b): messy-input fuzz in the Go, Rust, Java and C# evaluators, as in JavaScript/TypeScript and
+  Python. An adapter may name raw-value `wrappers` (or one `wrapper`) and a fail-closed answer: Go
+  `json.RawMessage` (`failClosed`), Rust `serde_json::Value` (`fail_closed`), Java the evaluator's parsed value
+  (`failClosed`), C# `JsonElement` (`FailClosed`). Go and Rust bind them at build time (an adapter without them still
+  builds); Java and C# find them by reflection. A panic or exception is `THROWS_ON_MESSY_INPUT`. `undefined` is
+  JavaScript only; Rust does not get the lone surrogate (serde_json rejects it while it parses), announced in the
+  protocol hello as `"skip"` and reported as `skipped_kinds`.
+- Example: three planted wrappers per language (`messygo/`, `messy_wrappers.rs`, `messyjava/`, `messycs/`, adapters
+  `diff/wallet_messy.{go,rs,java,cs}`): one that crashes on a null, missing or wrong-typed amount, one that coerces
+  `"5"`, and a fail-closed one (negative control).
+- Tested: `tests/run_tests.py` 115 cases, 0 failed (16 new for Go, Rust, Java: messy off finds nothing; the crash and
+  the coercion are found on `amount` only and shrunk to cap 0, spent 0; the fail-closed wrapper has 0 messy
+  disagreements over about 1,525 messy inputs; every kind is tried and judged; saved cases replay).
+  `tests/run_cs_diff.py`: the same for C#, plus the warm speed of a 1,500-input run (CI only: no .NET locally).
+- Not tested: C# on a local machine; wrappers that take a typed struct (the adapter passes raw JSON).
+
 ## 0.13.0 — 2026-11-23
 
 One release with the owner's chronicle feedback and the airlock:
