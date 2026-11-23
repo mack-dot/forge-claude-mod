@@ -12,7 +12,7 @@ That is all you need to remember: `/forge` runs whatever comes next (a read-only
 the fuzz). Nothing in your app changes until you approve. What it looks like on the included example:
 
 ```
-forge ✓ VERIFIED 1/1
+forge ✓ VERIFIED 1/1 (model PROVED; wrappers and other app code NOT proved)
 ✗ wallet-cap:py: 3 failing decision(s) in 1500 random inputs (177 ms)
   your recorded decisions: 1 of 4 agree; failing: D1 exact cap allowed, D3 zero rejected, D4 negative rejected
 ✗ wallet-cap:java: … legacy-java says {"ok": true, "spent": -9223372036854775808}   (a long overflow, found by itself)
@@ -61,8 +61,9 @@ conversation with Claude; commands with a **space** (`/forge approve`) run a fix
 | State a rule | `/forge:add <the rule in your own words>` | A conversation: Claude says whether the rule can be proved, confirms safe defaults, asks edge-case questions with concrete numbers (as many rounds as needed), probes the spec with Dafny for cases nobody asked about, then writes the spec, **your answers as Dafny checks**, a decision record and the implementation. |
 | Read it | `/forge:explain` | Claude explains every clause in plain words, checks that each of your answers is covered, and lists what is not guaranteed. |
 | Approve it | `/forge approve`, then `/forge approve yes` | Shows exactly what you approve (spec, your answers, decision record, `forge.json`); "yes" approves exactly that, even after a restart. Typing "yes" first only shows it. If a file changed in between, it shows the new version instead. Only you can do this. |
-| Prove it | `/forge check` | Your answers are checked against the spec (`EXAMPLES_FAILED` if the spec says otherwise or leaves one open), then the code against the spec. The status line shows `forge ✓ VERIFIED n/n` or what failed. |
+| Prove it | `/forge check` | Your answers are checked against the spec (`EXAMPLES_FAILED` if the spec says otherwise or leaves one open), then the code against the spec. The status line says what a green check covers, for example `forge ✓ wallet-cap: model PROVED · fuzzed 1,500 cases, wrapper NOT proved · records current`, or what failed. |
 | Find bugs in your real code | automatic (set up by `/forge add` when the rule already exists in your code), or `/forge fuzz` | Runs your shipped code and the proved rule on fresh random inputs at the end of each turn that changed them (about a second), saves each disagreement as a small repeatable case. `/forge fuzz` on its own is a deep run. See **Fuzz** below. |
+| Find code around the rule | `/forge:bypass` | Claude proposes the fields the rule decides on, searches for code outside the rule that uses them, and asks you about each place. See **Bypass** below. |
 | Measure it | `/forge mutate` | Plants up to 30 small bugs in the proved code, one at a time in a temporary copy, and counts how many the proof catches. A survivor is a change your spec allows: harmless, or a gap in the spec. Changes nothing. |
 | Something failed | `/forge:fix` | Claude explains the verdict and proposes a fix to the code; it never weakens the spec without your word. |
 | Use it in your app | `/forge:build-setup`, then `/forge build` | Compiles the proved code to your languages (`py`, `js`, `go`, `java`, `cs`, `rs`), fuzzes the compiled code in every language (identical output required), and checks that your app imports it. |
@@ -228,6 +229,60 @@ Rust evaluators takes about 7 s.
 Labels: the inputs, the evaluators and the core are test code (not proved); a run is a FINITE TEST. It compares
 returned values only; side effects of the code under test are not checked.
 
+## Bypass: code that goes around a proved rule
+
+A proof is only as strong as the guarantee that nothing goes around it. On a real app, a proved read rule decided that
+`body.for` counts only on Companion's rows, but two other functions still trusted `body.for` on any row. A person
+found that by hand. `bypass` finds such places.
+
+Add `"watchedFields"` to a check: the texts that name what the rule decides on (field names such as `body.for` or
+`householdId`, a comparison, function names). A text between slashes is a regular expression
+(`"/spent\\s*\\+\\s*amount[^;{]*<=?\\s*cap/"`); anything else is literal. `/forge:bypass` proposes them from the approved
+spec and decision record. Then:
+
+```
+python3 cli/forge_check.py bypass [--root DIR] [--json]
+```
+
+searches the project's files (git's tracked and untracked-but-not-ignored files; without git, a walk) for each term.
+It skips the rule's own files (spec, implementation and its includes, your answers, decision record, fuzz harness,
+emitted code, diff adapters and inputs, `INVARIANTS.md`), vendored and build folders (`node_modules`, `dist`,
+`build`, `verified`, `vendor`, `target`, `.forge`, …), documentation and lockfiles. It reports every remaining line:
+file:line, the term, the line, and the enclosing function when a cheap heuristic finds it (Python, TS/JS, Go, Java,
+C#, Rust). `/forge:bypass` explains each place and asks you: route it through the proved rule, it is fine (record
+why), or make it part of a new rule. A "fine" answer is stored in the check's `"allowedBypasses"` list as
+`{file, line_text_sha256, note}`, so an edited line shows up again. Both lists are in `forge.json`, so you approve them
+like any other change: every allowed bypass is approved by a person.
+
+**A hard gate.** For a check with `watchedFields`, `check` gives `UNAPPROVED_BYPASS` (exit 1) when its proof passes
+but a line outside the rule matches and is not in its approved `allowedBypasses`; the detail lists the lines. A failed
+proof (or any other verdict) still wins. A check without `watchedFields` behaves as before.
+
+**Specific terms.** Because it is a gate, a term must name the forms that decide, not every mention:
+`.body.for` (a property access), `/\\bhouseholdId\\s*(===|!==|==|!=)/` (a comparison), not a bare `householdId`.
+`bypass --count --rule NAME --set-terms TERM…` previews the number of lines per term and writes nothing.
+
+| Bypass verdict | Meaning | Exit |
+| --- | --- | --- |
+| `BYPASS_CLEAR` | No unreviewed line outside the rule uses its watched fields | 0 |
+| `BYPASS_FOUND` | At least one such line | 1 |
+| `NO_SCOPE_TERMS` | No check has `watchedFields`: nothing was searched (not a pass) | 0 |
+| `UNAPPROVED_BYPASS` (a `check` verdict) | The proof passed, but an unallowed line outside the rule matches | 1 |
+
+`check` runs the same search: the unreviewed places also go under `"outside"` in its JSON and on one line of its
+report (`3 places decide with body.for outside gate-mayread: gate.ts:83 mayRetract, …`).
+`/forge approve yes` prints the count; bare `/forge` offers `/forge:bypass` for a check without watched fields.
+
+Measured on that app (a copy, 205 files searched, about 0.3 s): the bare terms `body.for` and `householdId` match 290
+lines in 25 files (275 of them for `householdId`): too many for a gate. The specific terms `.body.for`,
+`/\\bhouseholdId\\s*(===|!==|==|!=)/` and `/(===|!==|==|!=)\\s*[\\w.]*\\bhouseholdId\\b/` match 19 lines in 10 files,
+and still name the three places found by hand (`gate.ts:83 mayRetract`, `companion.ts:186 retract`,
+`companion.ts:224 forget`).
+
+Limits: a text search per line, not a data-flow analysis (a FINITE TEST of the listed terms). It misses aliases
+(`const f = body.for`), dynamic access (`body[key]`), destructuring (`const { for: f } = body`), a term split over
+lines, and code that decides the same question under other names. The function name is a heuristic on indentation.
+
 ## INVARIANTS.md: every approved rule in one place
 
 `/forge invariants` (and every `/forge approve yes`) writes `INVARIANTS.md`: one table of all approved rules, then
@@ -273,6 +328,52 @@ python3 cli/forge_check.py mutate    # plant small bugs, count how many the proo
 ```
 
 `examples/wallet-cap` is a small complete project. `tests/run_tests.py` drives every verdict.
+### Messy inputs: the wrapper must fail closed, never throw
+
+The wrapper that turns your app's values (often JSON) into the proved code's values is not proved. Runtime JSON
+does not follow your types: a field can be `undefined`, `null`, a number where text was expected, or missing. On a
+real app, `householdId: undefined` reached such a wrapper and it threw instead of answering "forbid". The plain
+fuzz never sent that value, so it did not see it.
+
+If the JavaScript/TypeScript or Python adapter exports a raw-value wrapper, the fuzz also sends **messy variants**
+of its inputs to it: each field (nested objects and lists too, bounded) is in turn made `undefined` (JavaScript
+only), `null`, a number, a boolean, `""`, a lone surrogate, a 20,000-character text, `[]`, `{}`, the number as
+text (`"5"` for `5`), or removed. Big integers in the other fields stay exact.
+
+```js
+// diff/<check>_diff.mjs (Python: wrapper / wrappers, fail_closed, returning None for "the rule takes it")
+export const wrapper = (i) => myRealWrapper(i)        // the app's REAL wrapper, raw values, no conversion here
+// or: export const wrappers = { name: fn, ... }
+export function failClosed(i) {                        // the spec's fail-closed answer for a value the
+  return typeof i.householdId === 'string' ? undefined // proved rule does not take; undefined: the rule
+    : { effect: 'forbid', rule: 'other_household' }    // takes it, so the proved rule's answer is expected
+}
+```
+
+Rules: a throw from the wrapper on any messy input is always a disagreement of kind `THROWS_ON_MESSY_INPUT`.
+Otherwise its answer must equal `failClosed(input)`, or the proved rule's answer where `failClosed` returns
+`undefined`. Messy disagreements are grouped, shrunk (the messy field and its kind stay; the rest of the input
+shrinks) and saved like the others. `"messy": false` on a diff entry turns them off; an inputs module can list
+fields to leave alone in `messy_skip = ['retracted', 'limits[].setBy']`. A messy input that has no fail-closed
+answer and that the proved rule cannot take is counted as "not judged" (only a throw is reported for it).
+
+```
+  NEW wrapper-throws: input {"cap": 0, "spent": 0, "amount": {"__undefined__": true}} → expected (fail-closed or proved) {"ok": false, "spent": null}, wrapper-throws says {"__throws__": "TypeError"}
+    messy field amount = undefined: THROWS_ON_MESSY_INPUT (TypeError): the wrapper crashed instead of failing closed
+```
+
+The example has three planted wrappers (`examples/wallet-cap/messy_wrappers.ts` and `.py`, adapters
+`diff/wallet_messy.*`): one that throws on `amount` undefined/null, one that turns `"5"` into `5`, and a correct one
+that fails closed (the negative control). They are not in the example's `forge.json`; the tests add them.
+
+Time, measured on the example (one machine, warm, 1,500 inputs, median of 3 runs): the three wrappers with messy
+off 324 ms (JS) and 216 ms (Python); with messy on (about 1,530 messy inputs, including shrinking the planted bugs)
+1,192 ms and 1,236 ms. An entry without a wrapper does not change. With the default time budget (1.5 s per entry)
+messy inputs share the budget, so fewer plain inputs run (584 instead of 1,500 for JS in one measured run).
+
+Labels: the messy values are a fixed list, not every possible value; the fail-closed answer is the adapter's (the
+person's) choice, not proved; a run is a FINITE TEST.
+
 See `PLAN.md` for what is built and what is not.
 
 ## Limits
@@ -285,3 +386,12 @@ See `PLAN.md` for what is built and what is not.
 ## License
 
 MIT. See `LICENSE`. Also: `CHANGELOG.md`, `SECURITY.md`, `CONTRIBUTING.md`, `PLAN.md`, `TRIAL.md`.
+
+## What a green check covers (and what it does not)
+
+- **Status line:** `model PROVED` (the Dafny model meets the approved spec) · `fuzzed N cases, wrapper NOT proved` (a finite test of the code people run) · bypass count, once a rule names its fields · `records current` or `decision record may be stale`.
+- **Stale decision records:** at approval Forge remembers the code a decision record names (file paths, and functions in backticks defined in at most two non-test files). When that code changes, `check` prints `DECISION_NOTE_STALE` (a warning; the proof approval stands).
+- **Notes do not need re-approval:** an approval hashes the binding part of a decision record (the rule in words, the defaults, the choices). Sections headed Out of scope, Notes, Background or History can be fixed freely. Approvals written before 0.13 hold the full-file hash; approve once more to get this.
+- **Next rule:** `check` names the first Out-of-scope item that points at code in your repo, as the next `/forge:add`.
+- **Build sanity step:** `build` first parses every app file a check touches and every JS/TS file that imports them, directly or not (`APP_SYNTAX_ERROR`). `check` reports the same as a warning. Optional `"typecheck": ["npx", "--no-install", "tsc", "--noEmit"]` in a check's build entry runs a real type check. Parsing is not proving: it catches a missing brace, not a wrong type.
+- **Shorter approval screen:** `/forge approve` shows a digest: every spec clause in full (predicate and function bodies included; lemma and method bodies left out), the answers by id, the whole decision record, and files that are already approved and unchanged as one line. `/forge approve --full` prints every file. The approval always covers the complete files by hash.

@@ -13,6 +13,17 @@ proved rule, in any language, through a small line protocol:
       then, per line in: {"input": <json>}
       per line out:    {"reference": <json>, "candidates": {"name": <json>, ...}}
       An exception in a function is reported as {"__throws__": "<ErrorName>"}.
+
+  messy inputs (the wrapper that turns app/JSON values into Dafny values, which is not proved):
+      the hello line may also name {"messy": ["wrapper", ...]}: candidates that take RAW host values; and
+      {"undefined": true} if the language has `undefined` (JavaScript).
+      Then the core also sends {"input": <json>, "messy": true}: a generated input with ONE field replaced by an
+      odd value (undefined, null, a number, a boolean, "", a lone surrogate, a very long text, an array, an object,
+      the number as text) or removed. `undefined` travels as {"__undefined__": true}; the evaluator turns it into
+      a real undefined. The answer has the same shape, with only the messy candidates. Its "reference" is the
+      adapter's fail-closed answer (failClosed / fail_closed), or, where that returns undefined/None (the value
+      is one the proved rule takes), the proved rule's answer. A throw from a messy candidate is always a
+      disagreement of kind THROWS_ON_MESSY_INPUT.
   Forge ships evaluators for JavaScript/TypeScript (cli/eval/node_eval.mjs) and Python (cli/eval/py_eval.py).
   Any other language (Go, Rust, Java, C#, ...) plugs in as a "cmd" entry: a program that speaks the protocol.
 
@@ -35,6 +46,13 @@ import time
 CALL_TIMEOUT_S = 2.0
 MAX_PER_CANDIDATE = 40  # examples kept per candidate per run
 MAX_PER_GROUP = 3  # differently shaped examples kept per kind of wrong answer
+MESSY_PER_INPUT = 1  # messy variants tried per generated input once every (field, kind) pair has been tried
+MESSY_MAX_DEPTH = 4  # how deep into nested objects and lists the messy fields go
+MESSY_MAX_FIELDS = 64  # fields considered per input
+MESSY_LIST_ITEMS = 2  # list elements considered per list
+UNDEFINED = {'__undefined__': True}
+MESSY_KINDS = ('undefined', 'null', 'number', 'boolean', 'empty-text', 'lone-surrogate', 'long-text', 'array',
+               'object', 'number-as-text', 'removed')
 
 
 class Rng:
@@ -136,6 +154,93 @@ def shrinks(v):
                 yield dict(v, **{k: s})
 
 
+def is_throw(v): return isinstance(v, dict) and set(v) == {'__throws__'}
+
+
+def messy_fields(v, skip=(), path=(), depth=0, out=None):
+    """The paths of the fields of an input (dict keys and the first list elements), bounded."""
+    out = [] if out is None else out
+    if depth >= MESSY_MAX_DEPTH:
+        return out
+    items = list(v.items()) if isinstance(v, dict) else list(enumerate(v[:MESSY_LIST_ITEMS])) if isinstance(v, list) else []
+    for k, x in items:
+        if len(out) >= MESSY_MAX_FIELDS:
+            break
+        p = path + (k,)
+        if field_pattern(p) in skip:
+            continue
+        out.append(p)
+        messy_fields(x, skip, p, depth + 1, out)
+    return out
+
+
+def field_pattern(path):
+    """'limits[].scope': the field without list positions (used for coverage and grouping)."""
+    return ''.join(('[]' if isinstance(k, int) else ('.' if i else '') + str(k)) for i, k in enumerate(path))
+
+
+def field_name(path):
+    return ''.join(('[%d]' % k if isinstance(k, int) else ('.' if i else '') + str(k)) for i, k in enumerate(path))
+
+
+def _get(v, path):
+    for k in path:
+        if isinstance(v, dict) and k in v or isinstance(v, list) and isinstance(k, int) and k < len(v):
+            v = v[k]
+        else:
+            raise KeyError(k)
+    return v
+
+
+def messy_value(kind, orig):
+    """The odd value of this kind for a field whose generated value is `orig`; None if it does not apply."""
+    num = isinstance(orig, (int, float)) and not isinstance(orig, bool)
+    vals = {'undefined': UNDEFINED, 'null': None, 'number': 1.5 if num else 7, 'boolean': not orig if isinstance(orig, bool) else True,
+            'empty-text': '', 'lone-surrogate': '\ud800', 'long-text': 'x' * 20000, 'array': [], 'object': {},
+            'number-as-text': str(orig) if num else None}
+    v = vals.get(kind)
+    if kind == 'number-as-text' and not num:
+        return None
+    if v is not None and canon(v) == canon(orig) or kind == 'null' and orig is None:
+        return None
+    return ('set', v)
+
+
+def messy_applies(base, path, kind):
+    try:
+        orig = _get(base, path)
+    except KeyError:
+        return False
+    if kind == 'removed':
+        return isinstance(_get(base, path[:-1]), dict)
+    return messy_value(kind, orig) is not None
+
+
+def apply_messy(base, path, kind):
+    """`base` with the field at `path` made messy (a new value); None if the field or the kind does not apply."""
+    try:
+        orig = _get(base, path)
+    except KeyError:
+        return None
+    out = copy.deepcopy(base)
+    parent = _get(out, path[:-1])
+    if kind == 'removed':
+        if not isinstance(parent, dict):
+            return None
+        del parent[path[-1]]
+        return out
+    mv = messy_value(kind, orig)
+    if mv is None:
+        return None
+    parent[path[-1]] = copy.deepcopy(mv[1])
+    return out
+
+
+def dumps_any(v, **kw):
+    """JSON text that may hold a lone surrogate (written as an escape, so the file stays valid JSON)."""
+    return json.dumps(v, ensure_ascii=False, **kw).encode('utf-8', 'backslashreplace').decode('utf-8')
+
+
 class EvaluatorError(Exception):
     pass
 
@@ -150,6 +255,8 @@ class Evaluator:
         if not isinstance(hello, dict) or not isinstance(hello.get('candidates'), list):
             raise EvaluatorError('the evaluator did not start: %s' % self._stderr())
         self.candidates = hello['candidates']
+        self.messy = [n for n in hello.get('messy') or [] if n in self.candidates]
+        self.has_undefined = hello.get('undefined') is True
 
     def _stderr(self):
         try:
@@ -167,8 +274,9 @@ class Evaluator:
             raise EvaluatorError('the evaluator stopped: %s' % self._stderr())
         return json.loads(line)
 
-    def run(self, inp):
-        self.p.stdin.write(json.dumps({'input': inp}, ensure_ascii=False) + '\n')
+    def run(self, inp, messy=False):
+        msg = {'input': inp, 'messy': True} if messy else {'input': inp}
+        self.p.stdin.write(json.dumps(msg, ensure_ascii=messy) + '\n')  # ASCII escapes carry a lone surrogate
         self.p.stdin.flush()
         out = self._read(CALL_TIMEOUT_S)
         if out is None:
@@ -194,8 +302,9 @@ def load_inputs_module(path):
     return mod
 
 
-def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir):
-    """Run one diff entry. Returns the result dict (same shape for every language)."""
+def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, messy=True):
+    """Run one diff entry. Returns the result dict (same shape for every language). `messy`: also send messy
+    variants of the inputs to the candidates the evaluator names as raw-value wrappers (see the top of this file)."""
     started = time.time()
     result = {'inputs': 0, 'out_of_domain': 0, 'replayed': 0, 'seed': seed, 'disagreements': [],
               'decisions': {'total': 0, 'agree': 0, 'failing': []}}
@@ -223,6 +332,104 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir):
             ref, got = o['reference'], o['candidates'].get(name)
             return None if canon(ref) == canon(got) else (ref, got)
 
+        # ---- messy inputs: one field of a generated input made odd; judged against the fail-closed answer.
+        mnames = ev.messy if messy else []
+        kinds = [k for k in MESSY_KINDS if k != 'undefined' or ev.has_undefined]
+        skip = set(getattr(gen, 'messy_skip', []) or [])
+        mcache = {}
+        mstats = {'inputs': 0, 'pairs_tried': 0, 'not_judged': 0, 'candidates': mnames, 'kinds': kinds}
+
+        def m_outputs(inp):
+            key = canon(inp)
+            if key not in mcache:
+                if len(mcache) > 20000:
+                    mcache.clear()
+                mcache[key] = ev.run(copy.deepcopy(inp), messy=True)
+            return mcache[key]
+
+        def m_judge(name, inp):
+            """(signature, reference, got) for a messy input the wrapper gets wrong, else None."""
+            o = m_outputs(inp)
+            ref, got = o['reference'], o['candidates'].get(name)
+            if is_throw(got):
+                return ('THROWS_ON_MESSY_INPUT %s' % got['__throws__'], ref, got)
+            if is_throw(ref):  # no fail-closed answer and the proved rule cannot take it: not judged
+                return None
+            return None if canon(ref) == canon(got) else ('MESSY_ANSWER ' + signature(ref, got), ref, got)
+
+        def m_shrink(name, base, path, kind, sig):
+            """Shrink the rest of the input; the messy field and its kind stay (the smallest input that still
+            fails the same way at the same field)."""
+            best, steps, improved = base, 0, True
+            while improved and steps < 300:
+                improved = False
+                for s in shrinks(best):
+                    steps += 1
+                    if steps > 300:
+                        break
+                    if not in_domain(s):
+                        continue
+                    m = apply_messy(s, path, kind)
+                    d = m is not None and m_judge(name, m)
+                    if d and d[0] == sig:
+                        best, improved = s, True
+                        break
+            return best
+
+        def m_record(name, inp, meta, is_new):
+            d = m_judge(name, inp)
+            if not d:
+                return
+            key = 'messy:' + name + canon(inp)
+            if key in seen:
+                return
+            seen.add(key)
+            remember(('%s|%s|%s' % (name, d[0], meta['pattern']), meta['as']))
+            fname = '%s-messy-%s.json' % (name, hashlib.sha256(key.encode('utf-8', 'surrogatepass')).hexdigest()[:10])
+            path = os.path.join(reg_dir, fname)
+            if is_new and not os.path.exists(path):
+                os.makedirs(reg_dir, exist_ok=True)
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(dumps_any({'candidate': name, 'messy': meta, 'input': inp, 'reference': d[1], 'got': d[2],
+                                       'seed': seed, 'found_at': datetime.datetime.now(datetime.timezone.utc).isoformat(
+                                           timespec='seconds')}, indent=2) + '\n')
+            result['disagreements'].append({'candidate': name, 'input': inp, 'reference': d[1], 'got': d[2],
+                                            'file': fname, 'new': is_new, 'group': '%s at %s' % (d[0], meta['pattern']),
+                                            'messy': meta,
+                                            'kind': d[0].split(' ')[0]})
+
+        mrng = random.Random(seed ^ 0x6d657373)  # its own stream: the plain inputs stay the same for a seed
+        tried = set()
+
+        def messy_round(base):
+            pairs = [(p, k) for p in messy_fields(base, skip) for k in kinds if messy_applies(base, p, k)]
+            fresh = [pk for pk in pairs if (field_pattern(pk[0]), pk[1]) not in tried]
+            mrng.shuffle(fresh)
+            pick = fresh[:max(MESSY_PER_INPUT, 12)] if fresh else [mrng.choice(pairs) for _ in range(MESSY_PER_INPUT)] if pairs else []
+            for path, kind in pick:
+                inp = apply_messy(base, path, kind)
+                if inp is None:
+                    continue
+                tried.add((field_pattern(path), kind))
+                mstats['inputs'] += 1
+                if is_throw(m_outputs(inp)['reference']):
+                    mstats['not_judged'] += 1
+                for name in mnames:
+                    if sum(d['candidate'] == name for d in result['disagreements']) >= MAX_PER_CANDIDATE:
+                        continue
+                    d0 = m_judge(name, inp)
+                    if not d0:
+                        continue
+                    raw = 'messy|%s|%s|%s|%s' % (name, d0[0], field_pattern(path), kind)
+                    if raw in raw_kinds:
+                        continue
+                    raw_kinds.add(raw)
+                    small = m_shrink(name, base, path, kind, d0[0])
+                    meta = {'field': field_name(path), 'pattern': field_pattern(path), 'as': kind}
+                    if known(('%s|%s|%s' % (name, d0[0], meta['pattern']), kind)):
+                        continue
+                    m_record(name, apply_messy(small, path, kind), meta, True)
+
         def shrink(name, inp):
             sig = signature(*disagrees(name, inp))
             best, steps, improved = inp, 0, True
@@ -239,6 +446,7 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir):
             return best
 
         seen = set()
+        raw_kinds = set()
         groups = {}  # group -> set of input shapes already kept
 
         def known(k):
@@ -280,7 +488,11 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir):
             for f in sorted(os.listdir(reg_dir)):
                 if f.endswith('.json'):
                     case = json.load(open(os.path.join(reg_dir, f), encoding='utf-8'))
-                    if case.get('candidate') in names:
+                    if case.get('messy') is not None:
+                        if case.get('candidate') in mnames:
+                            result['replayed'] += 1
+                            m_record(case['candidate'], case['input'], case['messy'], False)
+                    elif case.get('candidate') in names:
                         result['replayed'] += 1
                         record(case['candidate'], case['input'], False)
         # 2. The person's recorded decisions (reported, not saved again; their kinds are then skipped below).
@@ -295,13 +507,14 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir):
                 remember(kind_of(n, shrink(n, dec['input'])))
         # 3. Fresh random inputs within the input and time budget.
         rng = Rng(seed)
-        raw_kinds = set()
         while result['inputs'] < max_inputs and (time.time() - started) * 1000 < budget_ms:
             inp = gen.generate(rng)
             result['inputs'] += 1
             if not in_domain(inp):
                 result['out_of_domain'] += 1
                 continue
+            if mnames:
+                messy_round(inp)
             for name in names:
                 if sum(d['candidate'] == name for d in result['disagreements']) >= MAX_PER_CANDIDATE:
                     continue
@@ -316,6 +529,9 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir):
                 if known(kind_of(name, small)):
                     continue
                 record(name, small, True)
+        if mnames:
+            mstats['pairs_tried'] = len(tried)
+            result['messy'] = mstats
         result['per_candidate'] = {n: sum(d['candidate'] == n for d in result['disagreements']) for n in names}
     except EvaluatorError as e:
         result['error'] = str(e)
