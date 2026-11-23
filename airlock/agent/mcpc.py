@@ -10,7 +10,10 @@ _ids = itertools.count(1)
 
 def http(method, path, body=None, timeout=60):
     data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(URL + path, data=data, method=method, headers={"content-type": "application/json"})
+    headers = {"content-type": "application/json"}
+    if path.startswith("/forge/canary/") and os.environ.get("FORGE_CANARY_TOKEN"):
+        headers["x-forge-canary-token"] = os.environ["FORGE_CANARY_TOKEN"]  # F7: only the canary has it
+    req = urllib.request.Request(URL + path, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read() or b"null")

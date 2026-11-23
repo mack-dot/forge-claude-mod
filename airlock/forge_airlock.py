@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import signal
 import subprocess
@@ -144,7 +145,8 @@ def compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, pass
     svc = {
         "airlock": {
             "image": IMAGE, "command": ["python3", "-I", "/forge/airlock/gateway.py"],
-            "environment": ["FORGE_SOURCE=/source", "FORGE_POLICY=/forge/forge.yaml", "FORGE_WS_RAW=/ws-raw"]
+            "environment": ["FORGE_SOURCE=/source", "FORGE_POLICY=/forge/forge.yaml", "FORGE_WS_RAW=/ws-raw",
+                            "FORGE_CANARY_TOKEN"]  # F7: value from this process only (see cmd_up)
             + list(pol.env_names),
             "volumes": [f"{os.path.abspath(policy_path)}:/forge/forge.yaml:ro", f"{stage}:/source:ro",
                         "logs:/data", "state:/state", "ws:/ws-raw"],
@@ -178,6 +180,9 @@ def compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, pass
             "image": IMAGE, "user": "1000:1000", "networks": ["agentnet", "outnet"],
             "command": ["python3", "-I", "/forge/airlock/egress_proxy.py", "3128"] + list(pol.egress_allow)})
         svc["agent"]["depends_on"]["egress"] = {"condition": "service_started"}
+    # F2: bounded container logs (json-file rotation): an agent cannot fill the host disk
+    for v in svc.values():
+        v["logging"] = {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}}
     return {"services": svc,
             "networks": {"agentnet": {"internal": True}, "outnet": {}},
             "volumes": {"ws": {}, "state": {}, "logs": {"external": True, "name": logs_volume}}}
@@ -278,6 +283,9 @@ def cmd_up(a):
     project = f"forgeair-{repo_key(repo)}-{os.path.basename(run_dir)[-8:].lower()}"
     logs_volume = f"forge-airlock-logs-{repo_key(repo)}"
     dc = ["docker", "compose", "-p", project, "-f", os.path.join(run_dir, "compose.json")]
+    # F7: a one-time token for the canary endpoints. Only the airlock and the canary process
+    # get it; the agent's command runs after `unset FORGE_CANARY_TOKEN`.
+    os.environ["FORGE_CANARY_TOKEN"] = secrets.token_hex(24)
     code = 1
     old_int = signal.getsignal(signal.SIGINT)
     try:
@@ -302,9 +310,9 @@ def cmd_up(a):
         say("running the breach canary in the agent container, then: " + " ".join(cmd))
         tty = [] if sys.stdin.isatty() and sys.stdout.isatty() else ["-T"]
         signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl-C belongs to the program in the box
-        rc = run(dc + ["run", "--rm"] + tty + ["agent", "sh", "-c",
+        rc = run(dc + ["run", "--rm", "-e", "FORGE_CANARY_TOKEN"] + tty + ["agent", "sh", "-c",
                  'python3 -I /forge/agent/canary.py >/tmp/forge-canary.log 2>&1; c=$?; tail -n 3 /tmp/forge-canary.log; '
-                 '[ "$c" = 0 ] || exit 86; exec "$@"', "forge-box"] + cmd).returncode
+                 'unset FORGE_CANARY_TOKEN; [ "$c" = 0 ] || exit 86; exec "$@"', "forge-box"] + cmd).returncode
         signal.signal(signal.SIGINT, old_int)
         state = out(dc + ["exec", "-T", "airlock", "python3", "-c",
                           "import json,urllib.request; print(json.load(urllib.request.urlopen("

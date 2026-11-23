@@ -4,6 +4,9 @@
 x-image: &img
   build: {context: .., target: airlock}
   image: forge-airlock-proof:local
+  logging: &logging   # F2: bounded container logs
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
 
 x-agent: &agent
   <<: *img
@@ -17,6 +20,7 @@ x-agent: &agent
     HOME: /tmp
     FORGE_DOMAIN: ${FORGE_DOMAIN:-codebase}
     FORGE_PHASE: ${FORGE_PHASE:-1}
+    FORGE_CANARY_TOKEN: ${FORGE_CANARY_TOKEN:-}   # F7: the harness sets it (validate.sh)
   volumes:
     - ws:/workspace
   networks: [agentnet]
@@ -43,6 +47,7 @@ services:
       FORGE_DEMO_FIXTURES: /forge-fixtures
       FORGE_VERIFIER: ${FORGE_VERIFIER:-persistent}
       FORGE_WS_RAW: ${FORGE_WS_RAW-/ws-raw}   # empty = no nosymfollow mount (control only)
+      FORGE_CANARY_TOKEN: ${FORGE_CANARY_TOKEN:-}
     cap_add: [SYS_ADMIN]                      # only for the nosymfollow bind mount of the workspace
     security_opt: ["apparmor=unconfined"]     # AppArmor's docker-default forbids mount(2)
     volumes:
@@ -70,6 +75,7 @@ services:
     environment:
       FORGE_AIRLOCK: http://airlock:8700
       HOME: /tmp
+      FORGE_CANARY_TOKEN: ${FORGE_CANARY_TOKEN:-}
       LEAKED_TOKEN: FAKE_repo_token_DEMO_ONLY_not_real_0002   # the codebase policy's repo credential
     command: ["python3", "-I", "/forge/agent/canary.py"]
   control-hidden-mount:

@@ -157,6 +157,41 @@ exactly the allowed files; a passed upstream secret gives canary BREACH, exit 10
   ABORTED, spent). The audit then shows exactly 5 of 5 spent (2 COMMITTED, 3 ABORTED), the 6th call
   is refused REJECT_OVER_CAP, and the total is still exactly 5 after two more restarts.
 
+## Protocol hardening (red-team findings F1 to F8)
+
+- **Request framing (F1).** `/mcp` and the canary endpoints need one decimal `Content-Length`
+  of at most 1 MiB (missing: 411, malformed or `Transfer-Encoding`: 400, larger: 413). Every
+  socket read times out after `FORGE_READ_TIMEOUT_S` (30 s); at most `FORGE_MAX_CONN` (256)
+  connections are served at once, one more gets 503 and is closed.
+- **Logs (F2).** Untrusted strings (tool names, paths, method names) are cut to 120 characters
+  plus their length and a hash in log lines and error replies. `forge up` and the proof
+  compose rotate container logs (json-file, `max-size: 10m`, `max-file: 3`).
+- **Argument rules (F3).** `not_in` and `not_equals` are deny-lists: they need `type`
+  (string, integer or boolean), and every listed value must have that type. For strings they
+  compare NFKC-normalized, without format characters (zero-width), stripped and case-folded.
+  `equals` and `in` compare exactly, type included (`1` is not `true`). Homoglyphs from other
+  scripts are NOT folded: prefer `in` or `regex` (allow-lists) over deny-lists.
+  `strict_args` is now ON by default: an argument is refused unless the policy names it
+  (`arg_rules`, `path_args`, `value_field`, `id_field`, `allow_args: [..]`) or the upstream's
+  `inputSchema.properties` lists it. Opt-out per tool: `strict_args: false`.
+- **Replay ids (F4).** A gate's `id_field` must be a string; it is NFC-normalized and stripped,
+  then must fully match `id_regex` (default `[A-Za-z0-9._:-]{1,128}`). The normalized id is the
+  replay key and is what the upstream receives.
+- **Numbers (F5).** `NaN`, `Infinity`, `-Infinity` and numbers that overflow to infinity do not
+  parse (400), and nothing is serialized with `allow_nan`.
+- **Upstreams (F6).** A stdio upstream that times out is killed before the step is marked
+  ABORTED; the next call starts a new one. Lines on its stdout that are not a JSON-RPC response
+  object are skipped (the reader does not stop).
+- **Canary (F7).** `/forge/canary/plan` and `/forge/canary/report` need the header
+  `x-forge-canary-token`. `forge up` makes a random token per run and gives it only to the
+  airlock and to the canary process (the command runs after `unset FORGE_CANARY_TOKEN`);
+  the proof scripts export one per run. Fingerprints are salted per workspace build.
+- **Gate steps (F8).** Every exit after a reserved step (result, upstream error, any exception)
+  writes COMMITTED or ABORTED; nothing stays PENDING until a restart.
+
+Tests: `tests/redteam_regress.py` (part of `run_tests.py`; `FORGE_ENGINE_DIR=<old engine>` runs it
+against other code) and `agent/protocol_regress.py` in `validate.sh` (domain concurrency).
+
 ## Honest labels
 
 | Part | Label |

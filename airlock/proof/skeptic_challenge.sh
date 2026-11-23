@@ -4,6 +4,8 @@
 # read-only root fs, internal network only). Try to break it. Exit the shell to clean up.
 set -u
 cd "$(dirname "$0")"
+# F7: one token for the canary endpoints of this run (airlock + canary only)
+export FORGE_CANARY_TOKEN="${FORGE_CANARY_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_hex(24))')}"
 export FORGE_DOMAIN=skeptic FORGE_PHASE=1
 dc() { docker compose -p forgeair-skeptic -f docker-compose.yml "$@"; }
 OVR="$(mktemp -t forge-skeptic-mounts.XXXXXX)"

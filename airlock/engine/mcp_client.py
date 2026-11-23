@@ -14,6 +14,8 @@ import threading
 import urllib.error
 import urllib.request
 
+from policy import strict_loads
+
 PROTOCOL = "2025-06-18"
 
 
@@ -35,12 +37,18 @@ class StdioUpstream:
         threading.Thread(target=self._reader, daemon=True).start()
 
     def _reader(self):
+        # F6: a line that is not a JSON object with a usable id (a log line, a batch, a bare
+        # number, NaN) is skipped; the reader never dies while the process lives.
         for line in self.proc.stdout:
             try:
-                msg = json.loads(line)
-            except ValueError:
+                msg = strict_loads(line)
+            except (ValueError, RecursionError):
                 continue
+            if not isinstance(msg, dict) or "method" in msg:
+                continue  # not a response (server-to-client requests are not supported)
             mid = msg.get("id")
+            if type(mid) is not int:
+                continue
             with self._plock:
                 slot = self._pending.pop(mid, None)
             if slot is not None:
@@ -54,7 +62,8 @@ class StdioUpstream:
 
     def notify(self, method, params=None):
         with self._wlock:
-            self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": method, "params": params or {}}) + "\n")
+            self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": method, "params": params or {}},
+                                             allow_nan=False) + "\n")
             self.proc.stdin.flush()
 
     def request(self, method, params=None, timeout=None):
@@ -65,18 +74,34 @@ class StdioUpstream:
         try:
             with self._wlock:
                 self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": mid, "method": method,
-                                                  "params": params or {}}) + "\n")
+                                                  "params": params or {}}, allow_nan=False) + "\n")
                 self.proc.stdin.flush()
         except (OSError, ValueError) as e:
             raise UpstreamError(f"{self.name}: write failed: {e}") from None
         if not slot[0].wait(timeout or self.timeout):
             with self._plock:
                 self._pending.pop(mid, None)
-            raise UpstreamError(f"{self.name}: timeout after {timeout or self.timeout}s")
-        msg = slot[1]
-        if "error" in msg:
-            raise UpstreamError(f"{self.name}: {msg['error'].get('message')}")
-        return msg.get("result")
+            # F6: a hung upstream would answer later (after we said ABORTED) and block every
+            # later call. Kill it first; the next call starts a fresh one (_live_upstream).
+            self.kill()
+            raise UpstreamError(f"{self.name}: timeout after {timeout or self.timeout}s; upstream killed")
+        return _result(self.name, slot[1])
+
+    def kill(self):
+        try:
+            self.proc.kill()
+            self.proc.wait(5)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _result(name, msg):
+    """F8: an error member that is not an object, or a missing result, is an UpstreamError."""
+    if "error" in msg:
+        err = msg["error"]
+        why = err.get("message") if isinstance(err, dict) else err
+        raise UpstreamError(f"{name}: {str(why)[:200]}")
+    return msg.get("result")
 
 
 class HttpUpstream:
@@ -89,7 +114,7 @@ class HttpUpstream:
         h = {"content-type": "application/json", "accept": "application/json, text/event-stream",
              "mcp-protocol-version": PROTOCOL}
         h.update(self.headers)
-        req = urllib.request.Request(self.url, data=json.dumps(body).encode(), headers=h, method="POST")
+        req = urllib.request.Request(self.url, data=json.dumps(body, allow_nan=False).encode(), headers=h, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 ctype = r.headers.get("content-type", "")
@@ -100,14 +125,21 @@ class HttpUpstream:
             raise UpstreamError(f"{self.name}: {type(e).__name__}: {str(e)[:120]}") from None
         if not raw:
             return None
-        if ctype.startswith("text/event-stream"):
-            for line in raw.splitlines():
-                if line.startswith("data:"):
-                    msg = json.loads(line[5:])
-                    if msg.get("id") == body.get("id"):
-                        return msg
-            raise UpstreamError(f"{self.name}: SSE body without a matching response")
-        return json.loads(raw)
+        try:  # F8: a body that does not parse is an UpstreamError (the gate step is finished)
+            if ctype.startswith("text/event-stream"):
+                for line in raw.split("\n"):
+                    line = line.rstrip("\r")
+                    if line.startswith("data:"):
+                        msg = strict_loads(line[5:])
+                        if isinstance(msg, dict) and msg.get("id") == body.get("id"):
+                            return msg
+                raise UpstreamError(f"{self.name}: SSE body without a matching response")
+            msg = strict_loads(raw)
+        except (ValueError, RecursionError):
+            raise UpstreamError(f"{self.name}: response does not parse") from None
+        if not isinstance(msg, dict):
+            raise UpstreamError(f"{self.name}: response is not an object")
+        return msg
 
     def notify(self, method, params=None):
         self._post({"jsonrpc": "2.0", "method": method, "params": params or {}}, self.timeout)
@@ -117,9 +149,7 @@ class HttpUpstream:
         msg = self._post(body, timeout or self.timeout)
         if msg is None:
             raise UpstreamError(f"{self.name}: empty response")
-        if "error" in msg:
-            raise UpstreamError(f"{self.name}: {msg['error'].get('message')}")
-        return msg.get("result")
+        return _result(self.name, msg)
 
 
 def connect(spec):

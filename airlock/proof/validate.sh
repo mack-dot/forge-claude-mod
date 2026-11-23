@@ -5,6 +5,8 @@
 # Label: FINITE TEST. Container tier: the agent shares the host kernel.
 set -u
 cd "$(dirname "$0")"
+# F7: one token for the canary endpoints of this run (airlock + canary only)
+export FORGE_CANARY_TOKEN="${FORGE_CANARY_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_hex(24))')}"
 OUT="${1:-results/latest}"
 mkdir -p "$OUT"
 : > "$OUT/summary.txt"
@@ -134,6 +136,12 @@ for DOM in ${DOMAINS:-codebase visible quota concurrency crash}; do
     rec "concurrency: audit (every log re-verifies ACCEPT, gross <= cap)" $? 0 $((SECONDS-t))
     json_check "$OUT/$DOM-audit.json" "d['logs']['charge']['gross']==1000 and d['logs']['deploy']['gross']==5 and d['upstream_ledger']['charge']['calls']==14 and d['upstream_ledger']['charge']['sum']['amount']==1000 and d['upstream_duplicate_invoice_ids']==0 and d['upstream_ledger']['deploy']['calls']==5"
     rec "concurrency: audit numbers (sum 1000, 14 charges, 0 duplicate ids, 5 deploys)" $? 0 0
+    t=$SECONDS; restart_airlock
+    dc run --rm agent sh -c "python3 -I /forge/agent/protocol_regress.py pre && python3 -I /forge/agent/canary.py >/dev/null && unset FORGE_CANARY_TOKEN && exec python3 -I /forge/agent/protocol_regress.py post" >"$OUT/$DOM-protocol.log" 2>&1
+    rec "concurrency: protocol red-team regressions (F1 F2 F3 F4 F5 F7) through the airlock" $? 0 $((SECONDS-t))
+    grep -E "^\[protocol_regress\]" "$OUT/$DOM-protocol.log" | sed 's/^/     /'
+    lc=$(docker inspect -f '{{json .HostConfig.LogConfig}}' "$(dc ps -q airlock)" 2>/dev/null)
+    echo "$lc" | grep -q '"max-size":"10m"'; rec "concurrency: F2 airlock container log rotation (max-size 10m)" $? 0 0
   fi
 
   dc logs --no-log-prefix airlock >"$OUT/$DOM-airlock.log" 2>&1

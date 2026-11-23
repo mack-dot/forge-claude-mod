@@ -29,8 +29,11 @@ GENV = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp", "GIT_CONFIG_NOSY
 GIT = ["git", "-c", "safe.directory=*"]
 
 
+SALT = [b""]  # F7: per-build salt from the plan
+
+
 def fp(b):
-    return hashlib.sha256(b"forge-fp:" + b).hexdigest()[:32]
+    return hashlib.sha256(b"forge-fp:" + SALT[0] + b).hexdigest()[:32]
 
 
 def breach(what):
@@ -79,6 +82,7 @@ def main():
         print(f"[canary] no probe plan (HTTP {code}); fail closed", flush=True)
         return 11
     root = plan["agent_root"].rstrip("/")
+    SALT[0] = bytes.fromhex(plan.get("fp_salt", ""))
     fps, secret_fps = set(plan["fingerprints"]), set(plan["secret_fps"])
     hidden = plan["hidden_names"]
 

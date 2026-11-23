@@ -3,6 +3,8 @@
 # Writes ${1:-results/latest}/bench.json and a table. Exit 0 if both runs completed.
 set -u
 cd "$(dirname "$0")"
+# F7: one token for the canary endpoints of this run (airlock + canary only)
+export FORGE_CANARY_TOKEN="${FORGE_CANARY_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_hex(24))')}"
 OUT="${1:-results/latest}"
 mkdir -p "$OUT"
 export FORGE_DOMAIN=bench FORGE_PHASE=1

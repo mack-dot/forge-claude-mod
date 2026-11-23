@@ -5,11 +5,13 @@
 # pattern, cap and argument rule comes from forge.yaml. Unknown keys, missing keys and
 # contradictions are load errors (fail closed). Anything that forge.yaml does not list
 # is blocked (default deny).
+import hashlib
 import json
 import os
 import posixpath
 import re
 import sys
+import unicodedata
 
 MONEY_MAX = (1 << 63) - 1
 U64_MAX = (1 << 64) - 1
@@ -17,6 +19,41 @@ U64_MAX = (1 << 64) - 1
 
 class PolicyError(Exception):
     pass
+
+
+# ---------------------------------------------------------------- untrusted-value helpers
+def clip(v, n=120):
+    """repr of an untrusted value for a log line or an error message: at most n characters
+    of it, plus its length and a hash when it is longer (F2: no log or reply amplification)."""
+    r = repr(v)
+    if len(r) <= n:
+        return r
+    h = hashlib.sha256(r.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+    return f"{r[:n]}...[{len(r)} chars, sha256 {h}]"
+
+
+def _no_constant(name):
+    raise ValueError(f"JSON constant {name} is not allowed")
+
+
+def _finite_float(text):
+    v = float(text)
+    if v != v or v in (float("inf"), float("-inf")):
+        raise ValueError(f"JSON number {text[:40]} is not finite")
+    return v
+
+
+def strict_loads(raw):
+    """json.loads that refuses NaN, Infinity, -Infinity and numbers that overflow to inf (F5)."""
+    return json.loads(raw, parse_constant=_no_constant, parse_float=_finite_float)
+
+
+def norm_text(s):
+    """Comparison form of a string for NEGATIVE rules (not_in, not_equals): NFKC, without
+    format characters (zero-width and similar, category Cf), stripped, case-folded (F3)."""
+    s = unicodedata.normalize("NFKC", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Cf")
+    return s.strip().casefold()
 
 
 class Refusal(Exception):
@@ -98,6 +135,9 @@ def _int(v, where, lo=0, hi=U64_MAX):
 
 
 RULE_KEYS = ("equals", "not_equals", "in", "not_in", "regex", "int_min", "int_max", "optional", "type")
+SCALAR = {"string": lambda v: isinstance(v, str), "integer": lambda v: type(v) is int,
+          "boolean": lambda v: isinstance(v, bool)}
+DEFAULT_ID_REGEX = r"[A-Za-z0-9._:-]{1,128}"
 PATH_MODES = ("read", "write", "git_revpath")
 
 
@@ -115,8 +155,22 @@ class ArgRule:
         for k in ("int_min", "int_max"):
             if k in spec and type(spec[k]) is not int:
                 raise PolicyError(f"{where}.{k} must be an integer")
-        if "type" in spec and spec["type"] not in ("string", "integer", "boolean"):
+        if "type" in spec and spec["type"] not in SCALAR:
             raise PolicyError(f"{where}.type must be string, integer or boolean")
+        # F3: a negative rule is a deny-list; without a scalar type, a list, an object or a
+        # number that compares equal (1 == True) walks past it. Require the type, and every
+        # listed value must have it.
+        if "not_in" in spec or "not_equals" in spec:
+            if "type" not in spec:
+                raise PolicyError(f"{where}: not_in / not_equals need a scalar type (string, integer or boolean)")
+            vals = list(spec.get("not_in") or []) + ([spec["not_equals"]] if "not_equals" in spec else [])
+            if not all(SCALAR[spec["type"]](x) for x in vals):
+                raise PolicyError(f"{where}: every not_in / not_equals value must be of type {spec['type']}")
+        t = spec.get("type")
+        self._neg = None
+        if t == "string":
+            self._neg = {norm_text(x) for x in list(spec.get("not_in") or [])
+                         + ([spec["not_equals"]] if "not_equals" in spec else [])}
 
     def check(self, args):
         if self.name not in args:
@@ -135,14 +189,20 @@ class ArgRule:
             bad("must be a boolean")
         if t == "integer" and type(v) is not int:
             bad("must be an integer")
-        if "equals" in s and v != s["equals"]:
+        if t is None and not isinstance(v, (str, int, float, bool)) and v is not None:
+            if any(k in s for k in ("equals", "in", "regex", "int_min", "int_max")):
+                bad("must be a scalar")
+        if "equals" in s and not (v == s["equals"] and type(v) is type(s["equals"])):
             bad(f"must equal {s['equals']!r}")
-        if "not_equals" in s and v == s["not_equals"]:
-            bad(f"must not equal {s['not_equals']!r}")
-        if "in" in s and v not in s["in"]:
+        if "in" in s and not any(v == x and type(v) is type(x) for x in s["in"]):
             bad(f"must be one of {s['in']!r}")
-        if "not_in" in s and v in s["not_in"]:
-            bad(f"must not be one of {s['not_in']!r}")
+        if self._neg is not None and norm_text(v) in self._neg:
+            bad(f"must not be one of {sorted(self._neg)!r} (compared case-folded, NFKC, stripped)")
+        elif self._neg is None:
+            if "not_equals" in s and v == s["not_equals"]:
+                bad(f"must not equal {s['not_equals']!r}")
+            if "not_in" in s and v in s["not_in"]:
+                bad(f"must not be one of {s['not_in']!r}")
         if self.regex is not None and (not isinstance(v, str) or not self.regex.fullmatch(v)):
             bad(f"must fully match /{self.regex.pattern}/")
         if ("int_min" in s or "int_max" in s) and type(v) is not int:
@@ -158,9 +218,9 @@ class ToolPolicy:
 
     def __init__(self, spec, where, gated):
         base = ("tool",)
-        opt = ("upstream", "arg_rules", "path_args", "strict_args")
+        opt = ("upstream", "arg_rules", "path_args", "strict_args", "allow_args")
         gopt = ("log", "unit", "value_field", "cap", "per_call_max", "expires_in_s", "expires_at",
-                "id_field", "checker")
+                "id_field", "id_regex", "checker")
         if gated:
             _keys(spec, where, required=base + ("cap",), optional=opt + gopt)
         else:
@@ -177,7 +237,16 @@ class ToolPolicy:
             if m not in PATH_MODES:
                 raise PolicyError(f"{where}.path_args.{k} must be one of {PATH_MODES}")
         self.path_args = dict(pa)
-        self.strict_args = bool(spec.get("strict_args", False))
+        # F3: strict by default. Allowed argument names: the policy's own (rules, path_args,
+        # value_field, id_field, allow_args) plus the properties the upstream declares in the
+        # tool's inputSchema. Opt-out: strict_args: false (documented in README).
+        if "strict_args" in spec and not isinstance(spec["strict_args"], bool):
+            raise PolicyError(f"{where}.strict_args must be true or false")
+        self.strict_args = spec.get("strict_args", True)
+        aa = spec.get("allow_args") or []
+        if not isinstance(aa, list) or not all(isinstance(x, str) for x in aa):
+            raise PolicyError(f"{where}.allow_args must be a list of strings")
+        self.allow_args = set(aa)
         if gated:
             self.unit = spec.get("unit", "count")
             if self.unit not in ("count", "value"):
@@ -201,6 +270,12 @@ class ToolPolicy:
             if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", self.log):
                 raise PolicyError(f"{where}.log must match [A-Za-z0-9_.-]{{1,64}}")
             self.id_field = spec.get("id_field")
+            if "id_regex" in spec and self.id_field is None:
+                raise PolicyError(f"{where}: id_regex needs id_field")
+            try:
+                self.id_regex = re.compile(spec.get("id_regex", DEFAULT_ID_REGEX))
+            except (re.error, TypeError) as e:
+                raise PolicyError(f"{where}.id_regex does not compile: {e}") from None
             ck = spec.get("checker")
             if ck is not None:
                 _keys(ck, f"{where}.checker", required=("command",), optional=("timeout_s",))
@@ -209,7 +284,7 @@ class ToolPolicy:
             self.checker = ck
 
     def known_args(self):
-        names = {r.name for r in self.rules} | set(self.path_args)
+        names = {r.name for r in self.rules} | set(self.path_args) | self.allow_args
         if self.gated:
             names |= {x for x in (self.value_field, self.id_field) if x}
         return names
@@ -413,25 +488,25 @@ class Policy:
         if p.startswith(self.agent_root.rstrip("/") + "/") or p == self.agent_root:
             p = p[len(self.agent_root):]
         elif p.startswith("/"):
-            raise Refusal("FORGE_PATH_OUTSIDE", f"absolute path {raw!r} is outside the workspace")
+            raise Refusal("FORGE_PATH_OUTSIDE", f"absolute path {clip(raw)} is outside the workspace")
         lexical = posixpath.normpath("/" + p.lstrip("/"))  # resolves '..' without escaping '/'
         if posixpath.normpath(p.lstrip("/") or ".").startswith(".."):
-            raise Refusal("FORGE_PATH_OUTSIDE", f"path {raw!r} escapes the workspace")
+            raise Refusal("FORGE_PATH_OUTSIDE", f"path {clip(raw)} escapes the workspace")
         lex_rel = lexical.lstrip("/")
         real = os.path.realpath(os.path.join(root, p.lstrip("/")))
         if real != root and not real.startswith(root + "/"):
-            raise Refusal("FORGE_PATH_OUTSIDE", f"path {raw!r} resolves outside the workspace")
+            raise Refusal("FORGE_PATH_OUTSIDE", f"path {clip(raw)} resolves outside the workspace")
         real_rel = os.path.relpath(real, root)
         real_rel = "" if real_rel == "." else real_rel
         is_dir = os.path.isdir(real)
         for rel in (lex_rel, real_rel):
             if self._path_hidden(rel, is_dir):
-                raise Refusal("FORGE_PATH_HIDDEN", f"path {raw!r} is hidden by policy")
+                raise Refusal("FORGE_PATH_HIDDEN", f"path {clip(raw)} is hidden by policy")
             if rel == ".git" or rel.startswith(".git/"):
-                raise Refusal("FORGE_PATH_REFUSED", f"path {raw!r} is inside .git")
+                raise Refusal("FORGE_PATH_REFUSED", f"path {clip(raw)} is inside .git")
             if mode == "write" and (self.readonly.match(rel) or self.readonly.closes_dir(rel)
                                     or self.protected.match(rel)):
-                raise Refusal("FORGE_PATH_READONLY", f"path {raw!r} is read-only by policy")
+                raise Refusal("FORGE_PATH_READONLY", f"path {clip(raw)} is read-only by policy")
         return real_rel
 
     def check_revpath(self, raw):
@@ -444,25 +519,30 @@ class Policy:
         if path.startswith("/") or posixpath.normpath(path or ".").startswith(".."):
             raise Refusal("FORGE_PATH_OUTSIDE", "git path escapes the repository")
         if lexical not in ("", ".") and self._path_hidden(lexical, True, basename_ok=False):
-            raise Refusal("FORGE_PATH_HIDDEN", f"git path {path!r} is hidden by policy")
+            raise Refusal("FORGE_PATH_HIDDEN", f"git path {clip(path)} is hidden by policy")
         return raw
 
     # ------------------------------------------------------------ call check
-    def check_call(self, name, args):
+    def check_call(self, name, args, declared=()):
         """Static checks for one tools/call. Returns (ToolPolicy, arguments to forward).
+        declared: argument names the upstream's inputSchema lists for this tool.
 
         A path argument may be a string or a list of strings; every element is checked."""
+        if not isinstance(name, str):
+            raise Refusal("FORGE_TOOL_BLOCKED", "tool name must be a string", tool=clip(name))
         if name in self.deny:
-            raise Refusal("FORGE_TOOL_BLOCKED", f"tool {name!r} is denied by policy", tool=name)
+            raise Refusal("FORGE_TOOL_BLOCKED", f"tool {clip(name)} is denied by policy", tool=clip(name))
         tp = self.tools.get(name)
         if tp is None:
-            raise Refusal("FORGE_TOOL_BLOCKED", f"tool {name!r} is not listed in policy (default deny)", tool=name)
+            raise Refusal("FORGE_TOOL_BLOCKED", f"tool {clip(name)} is not listed in policy (default deny)",
+                          tool=clip(name))
         if not isinstance(args, dict):
             raise Refusal("FORGE_ARG_REFUSED", "arguments must be an object")
         if tp.strict_args:
-            extra = set(args) - tp.known_args()
+            extra = set(args) - tp.known_args() - set(declared or ())
             if extra:
-                raise Refusal("FORGE_ARG_REFUSED", f"arguments not declared in policy: {sorted(extra)}")
+                raise Refusal("FORGE_ARG_REFUSED", f"arguments not declared in policy or in the tool's "
+                              f"inputSchema: {clip(sorted(extra))}")
         for r in tp.rules:
             r.check(args)
         fwd = dict(args)
@@ -483,7 +563,7 @@ class Policy:
 
 
 def canonical_json(v):
-    return json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
 
 
 def main(argv):
