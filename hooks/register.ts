@@ -363,7 +363,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'forge',
       description: 'Forge proof gate: next step, or check / approve / build / spec / status (conversations: /forge:scan, /forge:add, /forge:bypass)',
-      argumentHint: '[check|approve|approve yes|build|diff|invariants|mutate|spec|status]',
+      argumentHint: '[check|approve|approve yes|build|diff|invariants|mutate|mutate app|spec|status]',
     })
     const r = await next(e)
     void refreshStatus($).catch(() => undefined)
@@ -394,7 +394,9 @@ export const register: Register = on => {
     }
     if (arg === 'mutate') {
       const root: string = await $.session.root()
-      const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'mutate', '--root', root, '--max', '30'], {
+      // `/forge mutate app`: mutants of the shipped code, scored by the diff (cli/forge_mutate_app.py)
+      const app = /^mutate\s+(--)?app\b/.test(e.args.trim()) ? ['--app'] : []
+      const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'mutate', ...app, '--root', root, '--max', '30'], {
         cwd: root,
         timeoutMs: 600_000,
       })

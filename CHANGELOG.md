@@ -19,6 +19,27 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
   disagreements over about 1,525 messy inputs; every kind is tried and judged; saved cases replay).
   `tests/run_cs_diff.py`: the same for C#, plus the warm speed of a 1,500-input run (CI only: no .NET locally).
 - Not tested: C# on a local machine; wrappers that take a typed struct (the adapter passes raw JSON).
+- New: `diff --coverage` (off by default): per watched file of a py or js diff entry, the lines and branches the
+  run reached, and every unreached branch by `file:line` and source line. coverage.py when importable, else a
+  standard-library tracer (`cli/eval/py_cover.py`); JS/TS through Node's built-in `NODE_V8_COVERAGE` (blocks never
+  run; V8 gives no branch total). Not measured: Go, Rust, Java, C#, cmd. Code: `cli/forge_coverage.py`, small hooks
+  in `run_diff`/`diff_report`.
+- New: `mutate --app`: mutants of the shipped code (the diff entries' watch files) in a temporary copy, one diff
+  run each (fixed seed and input count); caught / survived / not run, survivors marked as on a line the fuzz
+  reached or never reached; equivalent mutants are possible and said so. py and js by default, `--langs all` for
+  the compiled languages. Code: `cli/forge_mutate_app.py`.
+- Tested (`tests/coverage_mutate_cases.py`, 10 cases, 11 with coverage.py installed): on the example with the
+  planted bugs fixed, the example's inputs reach 4/4 lines and 2/2 branches of `legacy_wallet.py` and catch every
+  mutant of the cap comparison (Python and TypeScript; 19 of 21 caught overall); a deliberately weak inputs module
+  (negative control) drops to 1/2 branches, names the unreached reject path in both languages, and lets the
+  cap-comparison mutants survive (8 of 21). Project files unchanged after `mutate --app`. coverage.py 7.16 and the
+  stdlib tracer give the same counts on the example (checked by hand on one machine; the CI runner has no
+  coverage.py, so CI tests the tracer only).
+- Measured (one machine): `--coverage` adds about 85 ms to a 1,500-input Python or TypeScript diff (about 195 ms
+  with coverage.py); `mutate --app` costs one diff run per mutant (0.15–0.4 s py/js; 0.4–1.4 s Go/Rust/Java).
+- Not tested: coverage of Go, Rust, Java, C# (not built); `mutate --app` on C# (no .NET SDK here); JS regular
+  expression literals are not masked, so a mutation inside one may be planted (it then shows as caught, survived
+  or not run like any other).
 
 ## 0.13.0 — 2026-11-23
 
