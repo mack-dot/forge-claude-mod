@@ -829,8 +829,11 @@ def main():
         fix_legacy(root)
         code2, res2 = diff(root, '--inputs', '0')
         js2 = res2.get('wallet-cap:js', {})
+        for k, r in res2.items():  # an entry that did not run says why (seen once under heavy machine load)
+            if not r.get('decisions'):
+                print('      %s: %s %s' % (k, r.get('verdict'), (r.get('error') or r.get('detail') or '')[:300]))
         cases.append(('diff: after the shipped code is fixed, every decision agrees',
-                      all(r['decisions']['agree'] == 4 for r in res2.values())
+                      all((r.get('decisions') or {}).get('agree') == 4 for r in res2.values())
                       and res2.get('wallet-cap:py', {}).get('verdict') == 'DIFF_OK'))
         # The "fixed" TypeScript still uses plain numbers: above 2^53 it loses precision, and the fuzz keeps saying so.
         code_big, res_big = diff(root, '--inputs', '3000')
