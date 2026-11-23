@@ -311,9 +311,10 @@ def load_inputs_module(path):
     return mod
 
 
-def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, messy=True):
+def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, messy=True, steer=None):
     """Run one diff entry. Returns the result dict (same shape for every language). `messy`: also send messy
-    variants of the inputs to the candidates the evaluator names as raw-value wrappers (see the top of this file)."""
+    variants of the inputs to the candidates the evaluator names as raw-value wrappers (see the top of this file).
+    `steer`: a forge_steer.Steer that picks the random inputs from coverage feedback (None: blind random)."""
     started = time.time()
     result = {'inputs': 0, 'out_of_domain': 0, 'replayed': 0, 'seed': seed, 'disagreements': [],
               'decisions': {'total': 0, 'agree': 0, 'failing': []}}
@@ -321,6 +322,8 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
     try:
         gen = load_inputs_module(inputs_path)
         in_domain = getattr(gen, 'in_domain', lambda _: True)
+        if steer:
+            steer.bind(gen)
         ev = Evaluator(cmd, cwd, env)
         names = ev.candidates
         result['candidates'] = names
@@ -332,6 +335,8 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
                 if len(cache) > 20000:
                     cache.clear()
                 cache[key] = ev.run(copy.deepcopy(inp))
+                if steer:
+                    steer.sent(inp, cache[key])
             return cache[key]
 
         def disagrees(name, inp):
@@ -519,7 +524,7 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
         # 3. Fresh random inputs within the input and time budget.
         rng = Rng(seed)
         while result['inputs'] < max_inputs and (time.time() - started) * 1000 < budget_ms:
-            inp = gen.generate(rng)
+            inp = steer.next(rng) if steer else gen.generate(rng)
             result['inputs'] += 1
             if not in_domain(inp):
                 result['out_of_domain'] += 1
@@ -544,6 +549,8 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
             mstats['pairs_tried'] = len(tried)
             result['messy'] = mstats
         result['per_candidate'] = {n: sum(d['candidate'] == n for d in result['disagreements']) for n in names}
+        if steer:
+            result['steer'] = steer.stats()
     except EvaluatorError as e:
         result['error'] = str(e)
     except Exception as e:  # noqa: BLE001

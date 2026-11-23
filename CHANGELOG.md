@@ -4,6 +4,34 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
 
 ## Unreleased
 
+- New: fuzz tiers. `.forge/forge.json` may set `"fuzz": {"tiers": {"local" | "ci" | "nightly": {"inputs",
+  "budget_ms", "steer"}}}`; defaults local 1,500 inputs / 1.5 s / blind (the end-of-turn run, unchanged), ci
+  100,000 / 600 s / steered, nightly 1,000,000 / 3,600 s / steered. `diff --tier ci|nightly`; the Action's new
+  `diff-tier` input. A bad tier value is a configuration error (exit 2). Code: `cli/forge_steer.py`, small hooks in
+  `run_diff`, `diff_report`, `forge_ci.py`, `action.yml`.
+- New: coverage-guided steering (`diff --steer`, py and js entries): per-input coverage from the evaluators
+  (`cli/eval/forge_py_steer.py`, `cli/eval/node_steer.mjs`), an AFL-style corpus of inputs that reached a new step,
+  small changes of kept inputs, and a dictionary of constants from the watched files' comparisons. Unreached lines
+  are named plainly (`legacy_wallet.py:3 was never reached`). The core gets one optional `steer` hook
+  (`forge_diff.run_entry`); the judgement of each input is unchanged.
+- New: `/forge crash-fuzz` and `commands/crash-fuzz.md` (`cli/forge_crash.py`, runners `cli/eval/crash_node.mjs`,
+  `cli/eval/crash_py.py`): a zero-spec CRASH-CHECK of boundary functions (HTTP/webhook handlers, parsers, entry
+  points) with messy JSON, crashes shrunk to the smallest repro; private helpers, internal exports and functions
+  that cannot be called directly are skipped with the reason said. Labelled CRASH-CHECK, never PROVED.
+- Measurement scripts (not gates): `tests/bench_tiers.py`, `tests/bench_steer.py`,
+  `tests/js_module/bench_module_vs_hand.mjs`; CI job `measure-fuzz` (continue-on-error) runs them on Linux.
+- Tested (macOS arm64, Python 3.10, Node 24.3; machine heavily loaded by other jobs): `tests/run_tests.py` 171
+  cases, 8 failed, the same 8 Go `build` cases that fail on this machine without the change (goimports missing);
+  19 new cases (`tests/crash_cases.py`): the 3 planted crashes per language found and shrunk; fail-closed handlers 0
+  crashes (negative control); private helpers not reported by default (negative control), reported with
+  `--include-private`; `--target`; blind random at 1,500 inputs misses the `amount == 7777` bug on seeds 1-3 and the
+  steered run finds it on all 3 (py and js); the plain unreached line; tier config and a bad tier value (exit 2).
+  `tests/bench_steer.py --seeds 20`: blind 0/20, steered 20/20 in both languages (README table).
+- Not tested: the `/forge crash-fuzz` subcommand inside Claude Code (only its CLI); whether
+  `commands/crash-fuzz.md` shadows it in the host; Python 3.12 `sys.monitoring` (the tracer is `sys.settrace`);
+  frameworks run for real (Express, Next.js, Flask, Django, FastAPI apps are called directly with fake request
+  objects); steering of Go, Rust, Java, C#; the `diff-tier` Action input in a hosted workflow other than this
+  repository's own jobs.
 - New (diff, M1.1b): messy-input fuzz in the Go, Rust, Java and C# evaluators, as in JavaScript/TypeScript and
   Python. An adapter may name raw-value `wrappers` (or one `wrapper`) and a fail-closed answer: Go
   `json.RawMessage` (`failClosed`), Rust `serde_json::Value` (`fail_closed`), Java the evaluator's parsed value

@@ -5,13 +5,20 @@ The adapter defines reference(input) and candidates = {name: function}. Test cod
 Messy inputs (the unproved wrapper that turns app/JSON values into Dafny values): the adapter may define
 wrapper(inp) or wrappers = {name: function}, which call the app's REAL wrapper with the raw values, and
 fail_closed(inp), the spec's fail-closed answer for a value the proved rule does not take (None when it takes it).
-Messy inputs go only to the wrappers."""
+Messy inputs go only to the wrappers.
+
+Steered runs (cli/forge_steer.py): with FORGE_STEER_FILES set, each plain answer may carry "novel": [n], the
+number of the plain input (0, 1, ...) that took a step in a watched file no earlier plain input took."""
 import copy
 import importlib.util
 import json
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import forge_py_steer  # noqa: E402
+steer = forge_py_steer.start()  # before the adapter loads, so the watched files' import is traced too
+sys.path.pop(0)
 path = os.path.abspath(sys.argv[1])
 sys.path.insert(0, os.path.dirname(path))
 spec = importlib.util.spec_from_file_location('forge_diff_adapter', path)
@@ -30,8 +37,11 @@ def call(fn, inp):
         return {'__throws__': type(e).__name__}
 
 
+if steer:
+    steer.off()
 sys.stdout.write(json.dumps({'candidates': names, 'messy': list(wrappers)}) + '\n')
 sys.stdout.flush()
+seq = 0
 for line in sys.stdin:
     if not line.strip():
         continue
@@ -41,10 +51,24 @@ for line in sys.stdin:
         ref = call(adapter.fail_closed, inp) if hasattr(adapter, 'fail_closed') else {'__none__': True}
         if ref == {'__none__': True}:
             ref = call(adapter.reference, inp)
+        if steer:
+            steer.on(plain=False)
         out = {'reference': ref, 'candidates': {n: call(wrappers[n], inp) for n in wrappers}}
+        if steer:
+            steer.off()
         sys.stdout.write(json.dumps(out) + '\n')  # ASCII escapes: a lone surrogate stays valid
         sys.stdout.flush()
         continue
-    out = {'reference': call(adapter.reference, inp), 'candidates': {n: call(every[n], inp) for n in names}}
+    ref = call(adapter.reference, inp)
+    if steer:
+        steer.on()
+    out = {'reference': ref, 'candidates': {n: call(every[n], inp) for n in names}}
+    if steer:
+        steer.off()
+        if steer.plain_done():
+            out['novel'] = [seq]
+        seq += 1
     sys.stdout.write(json.dumps(out, ensure_ascii=False) + '\n')
     sys.stdout.flush()
+if steer:
+    steer.finish()

@@ -33,6 +33,25 @@ jobs:
           echo '{}' > "$ev"; t workflow_dispatch "" None
       - name: --base with the project in a subfolder (notes edit passes, binding edit is APPROVAL_CHANGED)
         run: bash .github/ci-fixture/subfolder_base.sh . "$RUNNER_TEMP/subfolder-base"
+  measure-fuzz:
+    # Not a gate: wall times of the fuzz tiers (local 1,500 inputs, ci 100,000) per language, blind and steered;
+    # steered against blind random over 20 seeds at 1,500 inputs (a bug planted behind amount == 7777); the
+    # generated ES module against a hand-written TypeScript rule (2,000 x 10 calls, median of 5), with code
+    # generation from strings turned off.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: python3 tests/bench_tiers.py --runs 5 --ci-inputs 100000
+      - run: python3 tests/bench_steer.py --seeds 20 --inputs 1500
+      - run: |
+          for i in 1 2 3; do
+            node --no-warnings --disallow-code-generation-from-strings tests/js_module/bench_module_vs_hand.mjs examples/wallet-cap/verified/wallet-cap/js
+          done
+          echo "new Function / eval( in the generated module's code: $(grep -cE 'new Function[[:space:]]*\(|(^|[^.A-Za-z0-9_$])eval[[:space:]]*\(' examples/wallet-cap/verified/wallet-cap/js/wallet_cap.mjs)"
   action-on-example:
     # No toolchain set up here: the Action must install Node and Go itself for the example's js and go targets.
     runs-on: ubuntu-latest
