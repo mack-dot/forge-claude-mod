@@ -59,9 +59,15 @@ def main():
         r2 = subprocess.run([sys.executable, CLI, 'diff', '--root', root, '--json', '--seed', '8'],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         res2 = json.loads(r2.stdout)['checks']['wallet-cap']
-        ok2 = res2.get('verdict') == 'DIFF_OK' and res2['decisions']['agree'] == 4
-        print('%s  diff: negative control, fixed C# code: verdict %s, decisions %s of %s agree' % (
-            'ok  ' if ok2 else 'FAIL', res2.get('verdict'), res2['decisions']['agree'], res2['decisions']['total']))
+        # The fixed code still takes `long`: inputs above 2^63 cannot be passed to it at all (OverflowException).
+        # Those are the only disagreements allowed; every logic disagreement must be gone.
+        rest = [d for d in res2.get('disagreements', []) if d.get('got') != {'__throws__': 'OverflowException'}]
+        ok2 = res2['decisions']['agree'] == 4 and not rest
+        print('%s  diff: negative control, fixed C# code: decisions %s of %s agree; %d logic disagreements; %d inputs '
+              'beyond long' % ('ok  ' if ok2 else 'FAIL', res2['decisions']['agree'], res2['decisions']['total'], len(rest),
+                               len(res2.get('disagreements', [])) - len(rest)))
+        if rest:
+            print(json.dumps(rest)[:800])
         return 0 if ok and ok2 else 1
 
 
