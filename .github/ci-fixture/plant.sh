@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Change the fixture the way a pull request would, so the Action must fail with one verdict.
-#   plant.sh KIND DIR    KIND: clean | spec-weakened | bypass | stale-invariants | logic-bug
+#   plant.sh KIND DIR    KIND: clean | spec-weakened | bypass | stale-invariants | logic-bug | unverified-caller
 set -euo pipefail
 kind=$1
 cd "$2"
@@ -19,6 +19,10 @@ PY
   bypass)
     # A new function that decides the cap itself instead of calling the proved rule.
     printf 'def refund_then_spend(cap, spent, amount):\n    if spent + amount <= cap:\n        return True\n    return False\n' > refund.py
+    ;;
+  unverified-caller)
+    # A new caller of the replaced logic through an import alias: no field is read, so only the caller gate sees it.
+    printf 'from legacy_wallet import legacy_spend as quick\n\n\ndef fast_path(cap, spent, amount):\n    return quick(cap, spent, amount)\n' > fast_path.py
     ;;
   stale-invariants)
     printf '\n- W5: refunds are always allowed (edited by hand, not generated)\n' >> INVARIANTS.md

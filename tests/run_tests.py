@@ -1018,6 +1018,11 @@ def main():
         extra += 1
         print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
     sys.path.insert(0, HERE)
+    import callgraph_cases  # callers (UNVERIFIED_CALLER), feeders, drift status line
+    for name, ok in callgraph_cases.cases():
+        failed += not ok
+        extra += 1
+        print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
     import coverage_mutate_cases  # diff --coverage and mutate --app (M1.2)
     for name, ok in coverage_mutate_cases.cases():
         failed += not ok

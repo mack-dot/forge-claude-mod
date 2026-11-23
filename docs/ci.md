@@ -50,10 +50,11 @@ inputs, and `.github/ci-fixture/expect.py` requires the outcome and verdict:
 
 | Entry | Change | Required |
 | --- | --- | --- |
-| `clean` | none | pass; 50,000 inputs, `DIFF_OK` |
+| `clean` | none | pass; 50,000 inputs, `DIFF_OK`; callers gate passes (the fixture's `"callers"`: `app.py:spend`, replaced `legacy_wallet.py:legacy_spend`) |
 | `spec-weakened` | W1 removed from the spec | fail, `APPROVAL_CHANGED` |
 | `spec-weakened-nobase` | same, with `base: none` | fail, `SPEC_CHANGED` |
 | `bypass` | a new `refund.py` that compares `spent + amount <= cap` itself | fail, `UNAPPROVED_BYPASS` |
+| `unverified-caller` | a new `fast_path.py` that calls the replaced `legacy_spend` through an import alias | fail, `UNVERIFIED_CALLER`, callers gate names `fast_path.py:5` |
 | `stale-invariants` | a hand edit of `INVARIANTS.md` | fail, `INVARIANTS_STALE` |
 | `logic-bug` | `app.py` rejects an exact-cap spend when `cap % 250 == 27` | fail, `DISAGREE` |
 

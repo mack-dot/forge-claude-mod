@@ -4,6 +4,22 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
 
 ## Unreleased
 
+- New (callers): a static call graph for JavaScript/TypeScript and Python (`cli/forge_callgraph.py`; standard
+  library only). A check's `"callers"` names its governed decision, the wrapper that calls the proved code and the
+  replaced logic; `check` gives `UNVERIFIED_CALLER` (exit 1) for a caller of the replaced logic (also through an
+  import alias, a re-export or a namespace import), a same-name re-implementation, an unresolved member call by the
+  decision's name, or a decision that no longer reaches its wrapper, unless it is in `"allowedCallers"`. Other
+  languages: `callers not checked`. New commands `callers` (report, `--record`) and `status` (the one-line status).
+- New (feeders): the same graph ranks the unproved functions that feed the decision's parameters (direct callers that
+  compute an argument; functions whose return values flow into one) by leverage; `next_rule` names the top one.
+- New (status line): the mod's line comes from `forge_check.py status`: green `forge ✓ model PROVED · 0 bypasses ·
+  fuzz N ok · callers N ok · records current`; yellow `forge ⚠ DRIFT: …` naming a stale decision note, a wrapper
+  changed since the last approval or clean diff run (`.forge/wrapper-hashes.json`, a `WRAPPER_CHANGED` warning in
+  `check`), or a new unverified caller; red `forge ✗` otherwise.
+- forge-ci: its own summary rows for the caller gate and for each `serviceTest` (`NOT_CALLED`), the caller part in each
+  rule's status line, the top feeder, and a new Action negative control `unverified-caller`.
+- Tested: `tests/callgraph_cases.py` (in `tests/run_tests.py`), 23 cases; see the pull request for what ran where.
+
 - New (diff, M1.1b): messy-input fuzz in the Go, Rust, Java and C# evaluators, as in JavaScript/TypeScript and
   Python. An adapter may name raw-value `wrappers` (or one `wrapper`) and a fail-closed answer: Go
   `json.RawMessage` (`failClosed`), Rust `serde_json::Value` (`fail_closed`), Java the evaluator's parsed value
