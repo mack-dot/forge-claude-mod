@@ -26,6 +26,7 @@ type Check = {
   examples?: string
   decisions?: string
   diff?: DiffEntry | DiffEntry[]
+  watchedFields?: string[]
 }
 type LastDiff = { checks: Record<string, { verdict: string; inputs?: number; disagreements?: unknown[] }> }
 type Config = { version: 1; checks: Check[]; dafny?: string }
@@ -229,10 +230,24 @@ async function approve($: Api, isConfirmed: boolean, isFull = false): Promise<st
       cwd: root,
       timeoutMs: 60_000,
     })
-    return `${r.stdout.trim()}\n${inv.exitCode === 0 ? inv.stdout.trim() + ' (commit it with the approval)' : 'INVARIANTS.md was not updated: ' + (inv.stderr || inv.stdout).trim()}\nNext: /forge check`
+    const outside = await bypassCount($, root)
+    return `${r.stdout.trim()}\n${inv.exitCode === 0 ? inv.stdout.trim() + ' (commit it with the approval)' : 'INVARIANTS.md was not updated: ' + (inv.stderr || inv.stdout).trim()}${outside}\nNext: /forge check`
   }
   // Something changed since it was shown: show the new version, so the next "yes" approves that.
   return showForApproval($, `${(r.stdout || r.stderr).trim()}\nHere is the current version:`)
+}
+
+// After an approval: if a check names its watchedFields, count the places outside the rule that use them.
+async function bypassCount($: Api, root: string): Promise<string> {
+  const cfg = await readJson<Config>($, join(root, CONFIG))
+  if (!cfg?.checks?.some(c => c.watchedFields?.length)) return ''
+  const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'bypass', '--root', root, '--json'], { cwd: root, timeoutMs: 60_000 })
+  try {
+    const k = (JSON.parse(r.stdout) as { unreviewed: number }).unreviewed
+    return k ? `\nBypass search: ${k} place${k === 1 ? '' : 's'} outside the rule use its watched fields (/forge:bypass)` : '\nBypass search: no unreviewed place outside the rule uses its watched fields'
+  } catch {
+    return `\nBypass search did not run: ${(r.stderr || r.stdout).trim().slice(0, 300)}`
+  }
 }
 
 // The steps where Claude talks with the person are Markdown commands in commands/ (/forge:scan,
@@ -267,7 +282,13 @@ async function wizard($: Api): Promise<{ text: string; fill?: string }> {
   const next = hasDiff
     ? 'Every disagreement above is a bug in your shipped code or a gap in the rule. Your app files are unchanged.\nOptional next steps: switch your app to the proved code (ask Claude: "switch my app to the proved rule"); /forge add for another rule; /forge mutate; /forge invariants.'
     : 'Next: fuzz your shipped code against the proved rule. Claude sets it up without changing your app files:'
-  return { text: `${proof}${fuzz ? '\n\n' + fuzz : ''}\n\n${next}`, fill: hasDiff ? undefined : '/forge:fuzz ' }
+  // A proof covers the proved function only: offer the search for code that decides the same question elsewhere.
+  const unwatched = cfg.checks.filter(c => !c.watchedFields?.length).map(c => c.name)
+  const bypass = unwatched.length
+    ? `\nNot searched yet for code that goes around the rule (${unwatched.join(', ')}): /forge:bypass`
+    : ''
+  const fill = hasDiff ? (unwatched.length ? '/forge:bypass ' : undefined) : '/forge:fuzz '
+  return { text: `${proof}${fuzz ? '\n\n' + fuzz : ''}\n\n${next}${bypass}`, fill }
 }
 
 // Files whose change should trigger the differential fuzz: the proved code, the files that import it, the
@@ -341,7 +362,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'forge',
-      description: 'Forge proof gate: next step, or check / approve / build / spec / status (conversations: /forge:scan, /forge:add)',
+      description: 'Forge proof gate: next step, or check / approve / build / spec / status (conversations: /forge:scan, /forge:add, /forge:bypass)',
       argumentHint: '[check|approve|approve yes|build|diff|invariants|mutate|spec|status]',
     })
     const r = await next(e)
@@ -396,7 +417,7 @@ export const register: Register = on => {
     }
     // Steps where Claude talks with the person are Markdown commands (/forge:scan …). A command.run hook
     // cannot start a Claude turn, so put the right command in the prompt box: the person presses Enter.
-    const moved = ['scan', 'add', 'explain', 'fix', 'doctor', 'build-setup', 'fuzz']
+    const moved = ['scan', 'add', 'explain', 'fix', 'doctor', 'build-setup', 'fuzz', 'bypass']
     if (moved.includes(arg)) {
       const rest = e.args.trim().slice(arg.length).trim()
       const line = `/forge:${arg}${rest ? ' ' + rest : ' '}`

@@ -8,6 +8,11 @@
 // Big integers: JSON.parse rounds integers above 2^53. Here an integer that is not a safe JavaScript number
 // arrives as a BigInt (exact), and a BigInt or a bignumber.js value in an output is written back with all its
 // digits. Adapters therefore see small integers as numbers and big ones as BigInt.
+//
+// Messy inputs (the unproved wrapper that turns app/JSON values into Dafny values): the adapter may export
+// wrapper(input) or wrappers { name: input => output }, which call the app's REAL wrapper with the raw values, and
+// failClosed(input), the spec's fail-closed answer for a value the proved rule does not take (return undefined when
+// the proved rule takes it). Messy inputs go only to the wrappers; {"__undefined__": true} in them becomes undefined.
 import { createRequire, Module } from 'node:module'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
@@ -43,16 +48,28 @@ const plain = x => {
 const write = obj => JSON.stringify(plain(obj), (k, x) => (typeof x === 'bigint' ? JSON.rawJSON(x.toString()) : x))
 
 const adapter = await import(pathToFileURL(adapterPath).href)
-const names = Object.keys(adapter.candidates)
-const call = (fn, input) => {
+const wrappers = adapter.wrappers ? { ...adapter.wrappers } : adapter.wrapper ? { wrapper: adapter.wrapper } : {}
+const all = { ...(adapter.candidates || {}), ...wrappers }
+const names = Object.keys(all)
+const messyNames = Object.keys(wrappers)
+const isUndef = (x) => x && typeof x === 'object' && !Array.isArray(x) && Object.keys(x).length === 1 && x.__undefined__ === true
+const revive = (x) => {
+  if (Array.isArray(x)) return x.map((v) => (isUndef(v) ? undefined : revive(v)))
+  if (x && typeof x === 'object') {
+    for (const k of Object.keys(x)) x[k] = isUndef(x[k]) ? undefined : revive(x[k])
+  }
+  return x
+}
+const call = (fn, input, messy) => {
   try {
-    const out = fn(parse(write(input))) // a fresh copy per call
+    const copy = parse(write(input)) // a fresh copy per call
+    const out = fn(messy ? revive(copy) : copy)
     return out === undefined ? { __undefined__: true } : out
   } catch (e) {
     return { __throws__: e && e.name ? e.name : String(e) }
   }
 }
-process.stdout.write(JSON.stringify({ candidates: names }) + '\n')
+process.stdout.write(JSON.stringify({ candidates: names, messy: messyNames, undefined: true }) + '\n')
 // Split on "\n" only: readline also splits at U+2028 and U+2029, which may appear inside JSON strings.
 async function* lines(stream) {
   let buf = ''
@@ -69,8 +86,16 @@ async function* lines(stream) {
 process.stdin.setEncoding('utf8')
 for await (const line of lines(process.stdin)) {
   if (!line.trim()) continue
-  const { input } = parse(line)
+  const { input, messy } = parse(line)
+  if (messy) {
+    let reference = adapter.failClosed ? call(adapter.failClosed, input, true) : { __undefined__: true }
+    if (isUndef(reference)) reference = call(adapter.reference, input, true)
+    const out = { reference, candidates: {} }
+    for (const n of messyNames) out.candidates[n] = call(wrappers[n], input, true)
+    process.stdout.write(write(out) + '\n')
+    continue
+  }
   const out = { reference: call(adapter.reference, input), candidates: {} }
-  for (const n of names) out.candidates[n] = call(adapter.candidates[n], input)
+  for (const n of names) out.candidates[n] = call(all[n], input)
   process.stdout.write(write(out) + '\n')
 }

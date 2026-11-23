@@ -232,6 +232,185 @@ def static_checks():
     return problems
 
 
+def bypass_cases():
+    """`bypass` and the UNAPPROVED_BYPASS gate of `check`: code outside the rule that reads the rule's watched fields.
+    Each case plants gift_card.py, whose can_send_gift decides "does the spend fit under the cap?" itself."""
+    cases = []
+
+    def check(root):
+        r = subprocess.run([sys.executable, CLI, 'check', '--root', root, '--json', '--no-write'],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        try:
+            out = json.loads(r.stdout)
+        except ValueError:
+            out = {'verdicts': {'?': '<no result: %s>' % (r.stderr or r.stdout)[-200:]}, 'detail': {}}
+        return r.returncode, list(out['verdicts'].values()), out
+
+    def run(root, *args):
+        r = subprocess.run([sys.executable, CLI, 'bypass', '--root', root] + list(args),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        try:
+            return r.returncode, json.loads(r.stdout) if '--json' in args else r.stdout
+        except ValueError:
+            return r.returncode, {'error': (r.stderr or r.stdout)[-300:]}
+
+    def hits(out):
+        return [h for r in out.get('checks', {}).values() for h in r['hits']]
+
+    def copy(tmp, name='p', plant=True):
+        root = os.path.join(tmp, name)
+        shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
+        if plant:
+            open(os.path.join(root, 'gift_card.py'), 'w').write(
+                '"""Gift sends, added later by another team, outside the proved rule."""\n\n\n'
+                'def can_send_gift(cap, spent, amount):\n'
+                '    if spent + amount <= cap:  # decides the cap itself: a negative gift passes\n'
+                '        return True\n    return False\n')
+        return root
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = copy(tmp)
+        code, out = run(root, '--json')
+        found = hits(out)
+        cases.append(('bypass: a second function outside the rule that checks the cap itself is BYPASS_FOUND',
+                      code == 1 and out.get('verdict') == 'BYPASS_FOUND'
+                      and [(h['file'], h['function']) for h in found] == [('gift_card.py', 'can_send_gift')]))
+        # The term really occurs in the rule's own files (so their exclusion is tested), and none is reported.
+        term = re.compile(json.load(open(os.path.join(root, CONFIG)))['checks'][0]['watchedFields'][0][1:-1])
+        own = [IMPL, 'fuzz/WalletFuzz.dfy', 'INVARIANTS.md', 'verified/wallet-cap/py/wallet_cap-py/Wallet.py']
+        occurs = [f for f in own if term.search(open(os.path.join(root, f), encoding='utf-8').read())]
+        reported = {h['file'] for h in found} | {e['file'] for e in json.load(open(os.path.join(root, CONFIG)))['checks'][0]['allowedBypasses']}
+        cases.append(('bypass: the rule\'s own files (impl, fuzz harness, emitted code, INVARIANTS.md) never appear',
+                      len(occurs) >= 3 and not set(own) & reported
+                      and not any(f.startswith(('spec/', 'impl/', 'fuzz/', 'diff/', 'verified/', '.forge/')) for f in reported)))
+        # the hard gate: the proof passes, but an unapproved reader exists
+        cexit, verdicts, chk = check(root)
+        outside = (chk.get('outside') or {}).get('wallet-cap', [])
+        cases.append(('gate: a new unapproved reader gives UNAPPROVED_BYPASS (exit 1), listed under "outside"',
+                      cexit == 1 and verdicts == ['UNAPPROVED_BYPASS'] and 'gift_card.py:5' in chk['detail'].get('wallet-cap', '')
+                      and [(h['file'], h['function'], h['line']) for h in outside] == [('gift_card.py', 'can_send_gift', found[0]['line'] if found else -1)]
+                      and (set(outside[0]) == {'file', 'line', 'function', 'term', 'text'} if outside else False)))
+        # the person says "it is fine": recorded with the line's hash; forge.json changed, so approval is needed again
+        line = found[0]['line'] if found else 0
+        r = subprocess.run([sys.executable, CLI, 'bypass', '--root', root, '--rule', 'wallet-cap', '--record',
+                            'gift_card.py:%d' % line, '--note', 'test: reviewed'], stdout=subprocess.PIPE, universal_newlines=True)
+        code2, out2 = run(root, '--json')
+        c2 = subprocess.run([sys.executable, CLI, 'check', '--root', root, '--json', '--no-write'],
+                            stdout=subprocess.PIPE, universal_newlines=True)
+        cases.append(('bypass: after the person allows it (recorded by line hash), BYPASS_CLEAR; forge.json needs approval again',
+                      r.returncode == 0 and code2 == 0 and out2.get('verdict') == 'BYPASS_CLEAR'
+                      and list(json.loads(c2.stdout)['verdicts'].values()) == ['CONFIG_CHANGED']))
+        reapprove(root)
+        cexit, verdicts, _ = check(root)
+        cases.append(('gate: after it is in allowedBypasses and re-approved, VERIFIED (exit 0)', cexit == 0 and verdicts == ['VERIFIED']))
+        edit(root, 'gift_card.py', 'if spent + amount <= cap:', 'if spent + amount <= cap and amount != 0:')
+        code3, out3 = run(root, '--json')
+        cases.append(('bypass: editing the allowed line makes it BYPASS_FOUND again (outdated entry shown)',
+                      code3 == 1 and [h['file'] for h in hits(out3)] == ['gift_card.py']
+                      and len(out3['checks']['wallet-cap']['outdated_reviews']) == 1))
+        cexit, verdicts, _ = check(root)
+        cases.append(('gate: editing the allowed line gives UNAPPROVED_BYPASS again', cexit == 1 and verdicts == ['UNAPPROVED_BYPASS']))
+        rbad = subprocess.run([sys.executable, CLI, 'bypass', '--root', root, '--rule', 'wallet-cap', '--record',
+                               'app.py:1', '--note', 'x'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        cases.append(('bypass: a review of a line that is not a hit is refused', rbad.returncode == 2))
+        # no git on PATH (minimal containers; found in CI): the walk is used instead, nothing crashes
+        empty = os.path.join(tmp, 'empty-path')
+        os.makedirs(empty)
+        rng = subprocess.run([sys.executable, CLI, 'bypass', '--root', root, '--json', '--no-write'], env=dict(os.environ, PATH=empty),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        cases.append(('bypass: without git on PATH it walks the folder (still BYPASS_FOUND)',
+                      rng.returncode == 1 and '"BYPASS_FOUND"' in rng.stdout))
+
+    with tempfile.TemporaryDirectory() as tmp:  # a proof failure still wins over the gate
+        root = copy(tmp)
+        bug(root)
+        cexit, verdicts, _ = check(root)
+        cases.append(('gate: a failing proof with an unapproved reader is still FAILED', cexit == 1 and verdicts == ['FAILED']))
+    with tempfile.TemporaryDirectory() as tmp:  # negative control: no watchedFields, the same reader: behaviour unchanged
+        root = copy(tmp)
+        cfg = json.load(open(os.path.join(root, CONFIG)))
+        cfg['checks'][0].pop('watchedFields')
+        json.dump(cfg, open(os.path.join(root, CONFIG), 'w'))
+        reapprove(root)
+        cexit, verdicts, chk = check(root)
+        cases.append(('gate: negative control, no watchedFields: VERIFIED (exit 0), nothing outside',
+                      cexit == 0 and verdicts == ['VERIFIED'] and chk.get('outside') == {}))
+    with tempfile.TemporaryDirectory() as tmp:  # negative control: nothing outside the rule uses the field
+        root = copy(tmp, plant=False)
+        code, out = run(root, '--json')
+        cases.append(('bypass: negative control, no other use: BYPASS_CLEAR', code == 0 and out.get('verdict') == 'BYPASS_CLEAR'
+                      and not hits(out) and out['checks']['wallet-cap']['reviewed'] == 6))
+        cfg = json.load(open(os.path.join(root, CONFIG)))
+        cfg['checks'][0].pop('watchedFields')
+        json.dump(cfg, open(os.path.join(root, CONFIG), 'w'))
+        code, out = run(root, '--json')
+        cases.append(('bypass: no watchedFields: NO_SCOPE_TERMS (nothing searched, not a pass)',
+                      code == 0 and out.get('verdict') == 'NO_SCOPE_TERMS'))
+        cfg['checks'][0]['watchedFields'] = ['/spent(/']
+        json.dump(cfg, open(os.path.join(root, CONFIG), 'w'))
+        code, _ = run(root, '--json')
+        cases.append(('bypass: an invalid regular expression is a configuration error (exit 2)', code == 2))
+
+    # git file list: untracked files count, ignored files and vendored folders do not
+    with tempfile.TemporaryDirectory() as tmp:
+        root = copy(tmp, plant=False)
+        open(os.path.join(root, '.gitignore'), 'w').write('ignored/\n')
+        git(root, 'init', '-q')
+        git(root, 'add', '.')
+        git(root, 'commit', '-q', '-m', 'base')
+        for rel in ('new_spender.py', 'ignored/x.py', 'node_modules/lib/y.js'):
+            os.makedirs(os.path.dirname(os.path.join(root, rel)) or root, exist_ok=True)
+            open(os.path.join(root, rel), 'w').write('def ok(cap, spent, amount):\n    return spent + amount <= cap\n')
+        code, out = run(root, '--json')
+        cases.append(('bypass: git list: an untracked new file is found; ignored and node_modules files are not',
+                      code == 1 and [h['file'] for h in hits(out)] == ['new_spender.py']))
+
+    # chronicle-shaped: a decision says body.for counts only on Companion's rows; a second gate function trusts it
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, 'c')
+        for rel, text in {
+            'spec/GateSpec.dfy': 'abstract module GateSpec { }\n', 'impl/Gate.dfy': 'module Gate { }\n',
+            'src/gate.ts': ('import { mayReadProved } from "./gate-mayread.ts"\n\n'
+                            'export function mayRead(actor: string, row: Row): boolean {\n'
+                            '  return mayReadProved(actor, row)\n}\n\n'
+                            'export const mayRetract = (actorId: string, target: Row): boolean =>\n'
+                            '  target.authorId === actorId || target.body.for === actorId\n\n'
+                            'class Store {\n  forget(input: Input) {\n    for (const e of this.rows) {\n'
+                            '      if (e.authorId !== input.parentId && e.body.for !== input.parentId) continue\n'
+                            '    }\n  }\n}\n'),
+            'src/Svc.java': ('class Svc {\n    public static boolean retract(Row target, String by)\n    {\n'
+                             '        return target.body.for.equals(by);\n    }\n}\n'),
+            'src/svc.go': 'package svc\n\nfunc (s *S) Retract(t Row, by string) bool {\n\treturn t.body.for == by\n}\n',
+            'src/svc.rs': 'pub fn retract(t: &Row, by: &str) -> bool {\n    t.body.for == by\n}\n',
+            'docs/decisions.md': 'D9: body.for counts only on Companion rows.\n',
+        }.items():
+            os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+            open(os.path.join(root, rel), 'w').write(text)
+        os.makedirs(os.path.join(root, '.forge'))
+        json.dump({'version': 1, 'checks': [{'name': 'gate-mayread', 'spec': 'spec/GateSpec.dfy', 'files': ['impl/Gate.dfy'],
+                                             'watchedFields': ['body.for']}]}, open(os.path.join(root, CONFIG), 'w'))
+        code, out = run(root, '--json')
+        got = sorted((h['file'], h['function']) for h in hits(out))
+        cases.append(('bypass: chronicle-shaped: mayRetract and forget (TS), retract in Java/Go/Rust named; docs skipped',
+                      code == 1 and got == [('src/Svc.java', 'retract'), ('src/gate.ts', 'forget'), ('src/gate.ts', 'mayRetract'),
+                                            ('src/svc.go', 'Retract'), ('src/svc.rs', 'retract')]))
+        before = open(os.path.join(root, CONFIG)).read()
+        rc = subprocess.run([sys.executable, CLI, 'bypass', '--root', root, '--count', '--json', '--rule', 'gate-mayread',
+                             '--set-terms', '.body.for', 'not_in_this_project'], stdout=subprocess.PIPE, universal_newlines=True)
+        try:
+            pv = json.loads(rc.stdout).get('gate-mayread', {})
+        except ValueError:
+            pv = {}
+        cases.append(('bypass: --count previews other terms (lines per term) and writes nothing',
+                      rc.returncode == 0 and pv.get('per_term') == {'.body.for': 5, 'not_in_this_project': 0}
+                      and open(os.path.join(root, CONFIG)).read() == before))
+        txt = subprocess.run([sys.executable, CLI, 'check', '--root', root, '--no-write'], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, universal_newlines=True).stdout
+        cases.append(('bypass: check text names the places ("N places decide with body.for outside gate-mayread")',
+                      '5 places decide with body.for outside gate-mayread: ' in txt and 'src/gate.ts:8 mayRetract' in txt))
+    return cases
+
+
 def main():
     failed = 0
     # one shared Rust build folder for every test project (compiled dependencies are reused)
@@ -561,6 +740,66 @@ def main():
         extra += 1
         print('%s  diff: two bugs with the same wrong answer (zero and empty text) are both reported  %s' % ('ok  ' if ok else 'FAIL', found))
 
+    # Messy inputs: the unproved wrapper that turns raw app/JSON values into Dafny values must fail closed, never throw
+    # (owner feedback: a real app's wrapper threw on `householdId: undefined`, and the plain fuzz never sent one).
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, 'p')
+        shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
+        cfg = json.load(open(os.path.join(root, CONFIG)))
+
+        def messy_cfg(flag):
+            cfg['checks'][0]['diff'] = [
+                dict({'name': 'messy-js', 'lang': 'js', 'inputs': 'diff/wallet_inputs.py', 'adapter': 'diff/wallet_messy.mjs'}, **flag),
+                dict({'name': 'messy-py', 'lang': 'py', 'inputs': 'diff/wallet_inputs.py', 'adapter': 'diff/wallet_messy.py'}, **flag)]
+            json.dump(cfg, open(os.path.join(root, CONFIG), 'w'))
+
+        messy_cfg({'messy': False})  # negative control first: without the messy step, nothing is found
+        code_off, off = diff(root)
+        messy_cfg({})  # the default: on, because the adapters name raw-value wrappers
+        code_on, on = diff(root)
+        code_again, again = diff(root)
+        mjs, mpy = on.get('wallet-cap:messy-js', {}), on.get('wallet-cap:messy-py', {})
+
+        def got(r, cand, kind=None):
+            return [d for d in r.get('disagreements', []) if d['candidate'] == cand and (kind is None or d.get('kind') == kind)]
+        t_js, t_py = got(mjs, 'wrapper-throws', 'THROWS_ON_MESSY_INPUT'), got(mpy, 'wrapper-raises', 'THROWS_ON_MESSY_INPUT')
+        c_js, c_py = got(mjs, 'wrapper-coerces', 'MESSY_ANSWER'), got(mpy, 'wrapper-coerces', 'MESSY_ANSWER')
+        undef = {'__undefined__': True}
+        cases_messy = [
+            ('messy: negative control, messy off: the planted wrappers agree on well-typed inputs',
+             all(r.get('verdict') == 'DIFF_OK' and 'messy' not in r for r in off.values()) and code_off == 0),
+            ('messy: JS wrapper that throws on amount undefined/null is found (THROWS_ON_MESSY_INPUT)',
+             code_on == 1 and {d['messy']['as'] for d in t_js} >= {'undefined', 'null'}
+             and all(d['messy']['field'] == 'amount' for d in got(mjs, 'wrapper-throws'))),
+            ('messy: the throw is shrunk to that one field (cap 0, spent 0, amount undefined)',
+             {'cap': 0, 'spent': 0, 'amount': undef} in [d['input'] for d in t_js]
+             and {'cap': 0, 'spent': 0, 'amount': None} in [d['input'] for d in t_js + t_py]),
+            ('messy: Python wrapper that raises on amount None is found, only on that field',
+             'null' in {d['messy']['as'] for d in t_py} and all(d['messy']['field'] == 'amount' for d in got(mpy, 'wrapper-raises'))),
+            ('messy: a wrapper that coerces "5" to 5 is found as a disagreement (JS and Python)',
+             any(d['messy']['as'] == 'number-as-text' and isinstance(d['input']['amount'], str) for d in c_js)
+             and any(d['messy']['as'] == 'number-as-text' for d in c_py)),
+            ('messy: negative control, the fail-closed wrapper has no messy disagreement',
+             mjs.get('per_candidate', {}).get('wrapper-safe') == 0 and mpy.get('per_candidate', {}).get('wrapper-safe') == 0
+             and mjs.get('messy', {}).get('inputs', 0) > 100 and mpy.get('messy', {}).get('inputs', 0) > 100),
+            ('messy: every kind of odd value is tried (undefined only in JS) and judged',
+             mjs.get('messy', {}).get('kinds') == list(forge_diff.MESSY_KINDS)
+             and mpy.get('messy', {}).get('kinds') == [k for k in forge_diff.MESSY_KINDS if k != 'undefined']
+             and mjs['messy']['pairs_tried'] >= 30 and mpy['messy']['pairs_tried'] >= 27
+             and mjs['messy']['not_judged'] == 0 and mpy['messy']['not_judged'] == 0),
+            ('messy: saved messy cases replay first next run (a lone surrogate too)',
+             again.get('wallet-cap:messy-py', {}).get('replayed', 0) >= len(got(mpy, 'wrapper-raises')) > 0
+             and again.get('wallet-cap:messy-js', {}).get('replayed', 0) >= len(got(mjs, 'wrapper-throws')) > 0
+             and code_again == 1),
+        ]
+        for name, ok in cases_messy:
+            failed += not ok
+            extra += 1
+            print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
+            if not ok:
+                print('      ' + json.dumps({k: {kk: v.get(kk) for kk in ('verdict', 'per_candidate', 'messy', 'error')}
+                                             for k, v in on.items()}, ensure_ascii=True)[:700])
+
     # INVARIANTS.md: generated from the approved rules; CI catches a stale copy
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, 'p')
@@ -587,6 +826,10 @@ def main():
             failed += not ok
             extra += 1
             print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
+    for name, ok in bypass_cases():
+        failed += not ok
+        extra += 1
+        print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
     print('%d cases, %d failed' % (len(CASES) + len(BUILD_CASES) + extra, failed))
     return 1 if failed else 0
 

@@ -11,6 +11,54 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
 - `build`: `APP_SYNTAX_ERROR` when an app file a check touches, or any JS/TS file that imports one, does not parse; optional `typecheck` command (`TYPECHECK_FAILED`). `check` warns on the same.
 - `/forge approve` shows a digest; `--full` prints every file; approved, unchanged files collapse to one line.
 - Measured on a copy of a real app (2 rules): stale note flagged on the changed `turbopufferFilter`; the note fixed without re-approval; a missing brace in a file three imports away flagged; `visibleTo()` suggested as the next rule; approval screen 26,214 → 1,404 characters with both rules already approved.
+- Added (fuzzer): messy inputs for the unproved wrapper that turns app/JSON values into proved-code values (owner
+  feedback: chronicle's gate-mayread wrapper threw on `householdId: undefined`, and the fuzz never sent one). An
+  adapter may export `wrapper` / `wrappers` (the app's real wrapper, called with raw values) and `failClosed` /
+  `fail_closed`. Each field is in turn made undefined (JavaScript), null, a number, a boolean, "", a lone surrogate,
+  a long text, [], {}, the number as text, or removed. A throw is always `THROWS_ON_MESSY_INPUT`; any other answer
+  must equal the fail-closed answer (or the proved rule's answer where the input is one it takes). Grouped, shrunk
+  and saved like other disagreements. On by default when the adapter names a wrapper; `"messy": false` turns it off.
+- Changed (protocol, backward compatible): the hello line may name `"messy"` candidates; messy lines carry
+  `"messy": true` and are sent with ASCII escapes. Results, case files and printed reports keep a lone surrogate as
+  its JSON escape instead of failing.
+- Changed: `/forge fuzz` and `/forge:build-setup` tell Claude to write wrappers that fail closed on a non-text id and
+  to add the wrapper as a messy candidate; templates for TypeScript and Python.
+- Tested: 58 cases (8 new: messy off finds nothing (negative control); the JS wrapper that throws on amount
+  undefined/null is found as THROWS_ON_MESSY_INPUT and shrunk to {cap 0, spent 0, amount undefined}; the Python one
+  that raises on None, only on that field; the wrappers that turn "5" into 5, in both languages; the fail-closed
+  wrapper has no messy disagreement (negative control); every kind is tried and judged; saved messy cases replay).
+  On a copy of chronicle (gate-mayread, the app's real gate-mayread.ts, an adapter written for the test): the
+  `householdId: undefined` throw is found, with 23 other throwing fields/kinds (ids that are not text, `limits` that
+  is not a list, `entry` or `viewer` that is not an object); with a fail-closed patch of the wrapper, 2,776 messy
+  inputs give 0 disagreements. Not tested: messy inputs for Go, Rust, Java, C# and "cmd" evaluators (the protocol
+  allows them; no evaluator announces messy candidates yet).
+- Added: `forge_check.py bypass` finds code that goes around a proved rule: lines outside the rule's own files that
+  use the check's `"watchedFields"` (literal text or `/regex/`), with file:line, term, text and enclosing function.
+  Verdicts `BYPASS_CLEAR` (exit 0), `BYPASS_FOUND` (exit 1), `NO_SCOPE_TERMS` (exit 0, nothing searched). Places the
+  person allows are kept in `"allowedBypasses"` (in forge.json, so a person approves each) by the SHA-256 of the line,
+  so an edited line is reported again. `bypass --rule NAME --set-terms …` and `--record FILE:LINE --note …` write
+  them; `bypass --count [--rule NAME --set-terms …]` previews lines per term and writes nothing.
+- Added: a hard gate in `check`: a check with `"watchedFields"` whose proof passes is `UNAPPROVED_BYPASS` (exit 1)
+  while an unallowed line outside the rule matches; the detail lists the lines. A failed proof still wins; a check
+  without `"watchedFields"` behaves as before. The lines also go under `"outside"` in the JSON and on one report line.
+  If the search itself fails, a check with `"watchedFields"` is `ERROR` (fail closed).
+- Added: `/forge:bypass` (a conversation): proposes SPECIFIC watched fields (property access, comparisons) from the
+  approved spec and decision record, shows the measured count per term before saving, explains each place, and
+  asks per place: route it through the proved rule, it is fine (record why), or a new rule. `/forge approve yes`
+  prints the count; bare `/forge` offers `/forge:bypass` for a check without watched fields.
+- Changed: the example has watched fields; its six shipped legacy functions are allowed bypasses (they are the code
+  the fuzz compares). forge.json re-approved, INVARIANTS.md regenerated. The planted second spender
+  (`gift_card.py`, `can_send_gift`) lives in the tests, so the example stays VERIFIED under the gate.
+- Fixed (found in CI): `check` crashed where git is not installed; the search now walks the folder.
+- Measured: on a copy of the real app that motivated it (205 files searched, about 0.3 s): bare `body.for` and
+  `householdId` match 290 lines in 25 files; the specific set `.body.for`, `/\bhouseholdId\s*(===|!==|==|!=)/`,
+  `/(===|!==|==|!=)\s*[\w.]*\bhouseholdId\b/` matches 19 lines in 10 files and still names the three places found
+  by hand (`gate.ts:83 mayRetract`, `companion.ts:186 retract`, `companion.ts:224 forget`).
+- Tested: 18 new cases (found; own files never reported; UNAPPROVED_BYPASS for a new reader; allowed and re-approved
+  → VERIFIED; edited allowed line → UNAPPROVED_BYPASS again; a failed proof still FAILED; negative control without
+  watchedFields → VERIFIED; no other use → clear; no terms; bad regex; review of a non-hit refused; no git on PATH;
+  git untracked/ignored/node_modules; `--count` preview; a chronicle-shaped TS/Java/Go/Rust project). Not tested:
+  the `/forge:bypass` conversation and the register.ts wiring inside Claude Code.
 
 ## 0.12.2 — 2026-11-22
 - Fixed (fuzzer): different bugs that give the same wrong answer were reported as one. The fuzzer kept one example
