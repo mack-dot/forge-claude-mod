@@ -11,6 +11,8 @@ set -u
 cd "$(dirname "$0")"
 # F7: one token for the canary endpoints of this run (airlock + canary only)
 export FORGE_CANARY_TOKEN="${FORGE_CANARY_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_hex(24))')}"
+# Per-run names: two runs on one Docker host must not share containers, volumes or the image.
+export FORGEAIR_RUN="${FORGEAIR_RUN:-r$(python3 -c 'import secrets; print(secrets.token_hex(3))')}"
 OUT="${1:-results/latest}"
 mkdir -p "$OUT"
 : > "$OUT/summary.txt"
@@ -31,26 +33,30 @@ if [ -n "$RT" ]; then  # the agent side only; airlock, mock-http, bench-direct s
   # gVisor's netstack and a Kata guest do not reach Docker's embedded DNS (a NAT rule in the netns):
   # fixed addresses for airlock and mock-http, written into the agent side's /etc/hosts.
   RT_OVR="$OUT/compose.runtime.yml"
+  # two /24s picked from the run id, so parallel gvisor/microvm runs do not ask for the same subnet
+  NA=$(( $(python3 -c 'import hashlib,sys; print(int(hashlib.sha256(sys.argv[1].encode()).hexdigest(), 16) % 120)' "$FORGEAIR_RUN") * 2 ))
+  NB=$(( NA + 1 ))
   # mock-http only for control-egress (the agent on the upstream network): the canary of a normal agent
   # counts a resolvable upstream name as a breach.
-  H='["airlock:172.30.250.10"]'; HE='["airlock:172.30.250.10", "mock-http:172.30.251.20"]'
+  H="[\"airlock:172.30.$NA.10\"]"; HE="[\"airlock:172.30.$NA.10\", \"mock-http:172.30.$NB.20\"]"
   { echo "networks:"
-    echo "  agentnet: {ipam: {config: [{subnet: 172.30.250.0/24}]}}"
-    echo "  upstream: {ipam: {config: [{subnet: 172.30.251.0/24}]}}"
+    echo "  agentnet: {ipam: {config: [{subnet: 172.30.$NA.0/24}]}}"
+    echo "  upstream: {ipam: {config: [{subnet: 172.30.$NB.0/24}]}}"
     echo "services:"
-    echo "  airlock: {networks: {agentnet: {ipv4_address: 172.30.250.10}, upstream: {ipv4_address: 172.30.251.10}}}"
-    echo "  mock-http: {networks: {upstream: {ipv4_address: 172.30.251.20}}}"
+    echo "  airlock: {networks: {agentnet: {ipv4_address: 172.30.$NA.10}, upstream: {ipv4_address: 172.30.$NB.10}}}"
+    echo "  mock-http: {networks: {upstream: {ipv4_address: 172.30.$NB.20}}}"
     for s in agent control-env-secret control-hidden-mount control-egress control-root-writes agent-bench; do
       printf '  %s: {runtime: %s, extra_hosts: %s}\n' "$s" "$RT" "$([ "$s" = control-egress ] && echo "$HE" || echo "$H")"
     done; } >"$RT_OVR"
   # a SECOND airlock (the lock test) must not take the live airlock's fixed address
   printf 'services:\n  airlock: {networks: !override [upstream]}\n' >"$OUT/compose.second-airlock.yml"
 fi
+echo "== run $FORGEAIR_RUN" | tee -a "$OUT/summary.txt"
 echo "== isolation $ISO (agent runtime: ${RT:-runc})" | tee -a "$OUT/summary.txt"
 
 dc() {  # under a runtime override, `run` without --interactive: under Kata a `run -T` never ended in CI (run 45115365474); stdin is the suspect
   if [ -n "$RT" ] && [ "$1" = run ]; then shift; set -- run --interactive=false "$@"; fi
-  docker compose -p "forgeair-$DOM" -f docker-compose.yml ${OVR:+-f "$OVR"} ${RT_OVR:+-f "$RT_OVR"} ${XOVR:+-f "$XOVR"} "$@"; }
+  docker compose -p "forgeair-$FORGEAIR_RUN-$DOM" -f docker-compose.yml ${OVR:+-f "$OVR"} ${RT_OVR:+-f "$RT_OVR"} ${XOVR:+-f "$XOVR"} "$@"; }
 
 json_check() {  # json_check <file> <python expression over d>
   python3 -c "import json,sys; d=json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]); sys.exit(0 if ($2) else 1)" "$1"
@@ -59,7 +65,7 @@ json_check() {  # json_check <file> <python expression over d>
 restart_airlock() { dc restart airlock >/dev/null 2>&1; dc up -d --wait airlock >/dev/null 2>&1; }
 
 echo "== build (one image for every domain)"
-t=$SECONDS; docker compose -p forgeair-build build -q >"$OUT/build.log" 2>&1; rec "image build" $? 0 $((SECONDS-t))
+t=$SECONDS; docker compose -p "forgeair-$FORGEAIR_RUN-build" build -q >"$OUT/build.log" 2>&1; rec "image build" $? 0 $((SECONDS-t))
 
 # ---- isolation probe (airlock/backends.probe_sh), with a negative control on every host
 DOM=iso; export FORGE_DOMAIN=codebase
@@ -201,8 +207,8 @@ for DOM in ${DOMAINS:-codebase visible quota concurrency crash}; do
 done
 
 echo "== total $((SECONDS-T_ALL))s" | tee -a "$OUT/summary.txt"
-left=$(docker ps -a --filter "name=forgeair-" -q | wc -l | tr -d ' ')
-vols=$(docker volume ls -q --filter "name=forgeair-" | wc -l | tr -d ' ')
+left=$(docker ps -a --filter "name=forgeair-$FORGEAIR_RUN-" -q | wc -l | tr -d ' ')
+vols=$(docker volume ls -q --filter "name=forgeair-$FORGEAIR_RUN-" | wc -l | tr -d ' ')
 [ "$left" = 0 ] && [ "$vols" = 0 ]; rec "cleanup: 0 containers and 0 volumes left (c=$left v=$vols)" $? 0 0
 [ "$FAIL" = 0 ] && echo "VALIDATE: PASS" | tee -a "$OUT/summary.txt" || echo "VALIDATE: FAIL" | tee -a "$OUT/summary.txt"
 exit "$FAIL"

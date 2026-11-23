@@ -7,7 +7,9 @@ cd "$(dirname "$0")"
 # F7: one token for the canary endpoints of this run (airlock + canary only)
 export FORGE_CANARY_TOKEN="${FORGE_CANARY_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_hex(24))')}"
 export FORGE_DOMAIN=skeptic FORGE_PHASE=1
-dc() { docker compose -p forgeair-skeptic -f docker-compose.yml "$@"; }
+# Per-run names: two runs on one Docker host must not share containers, volumes or the image.
+export FORGEAIR_RUN="${FORGEAIR_RUN:-r$(python3 -c 'import secrets; print(secrets.token_hex(3))')}"
+dc() { docker compose -p "forgeair-$FORGEAIR_RUN-skeptic" -f docker-compose.yml "$@"; }
 OVR="$(mktemp -t forge-skeptic-mounts.XXXXXX)"
 dc build -q || exit 2
 docker run --rm -v "$PWD/policies:/p:ro" forge-airlock-proof:local \

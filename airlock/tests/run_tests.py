@@ -581,8 +581,30 @@ def test_isolation():
              r.returncode == B.PROBE_EXIT and "RAN" not in r.stdout, (r.returncode, r.stdout, r.stderr))
 
 
+def test_names():
+    """Parallel boxes: the image tag follows the build context's content (two checkouts never share a tag)."""
+    import forge_airlock as FA
+    d = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(d, "engine"))
+        open(os.path.join(d, "engine", "g.py"), "w").write("x = 1\n")
+        a = FA.source_tag(d)
+        os.makedirs(os.path.join(d, "engine", "__pycache__"))
+        open(os.path.join(d, "engine", "__pycache__", "g.pyc"), "wb").write(b"junk")
+        os.makedirs(os.path.join(d, "tests"))
+        open(os.path.join(d, "tests", "t.py"), "w").write("y\n")
+        case("names: source tag ignores __pycache__ and tests (not in the image)", FA.source_tag(d) == a)
+        open(os.path.join(d, "engine", "g.py"), "w").write("x = 2\n")
+        case("names: negative control: changed engine code gives another image tag", FA.source_tag(d) != a)
+        case("names: default image tags carry the source tag, not :local",
+             FA.IMAGE.endswith(":" + FA._TAG) and FA.CLAUDE_IMAGE.endswith(":" + FA._TAG) and ":local" not in FA.IMAGE
+             if "FORGE_AIRLOCK_IMAGE" not in os.environ else True)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
-    for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static, test_redteam, test_human_approval, test_isolation):
+    for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static, test_redteam, test_human_approval, test_isolation, test_names):
         try:
             t()
         except Exception as e:  # noqa: BLE001

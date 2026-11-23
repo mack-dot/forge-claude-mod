@@ -9,15 +9,17 @@
 # Exit 0 only if all three hold. Label: FINITE TEST (container tier; shares the host kernel).
 set -u
 cd "$(dirname "$0")"
+# Per-run names: two runs on one Docker host must not share containers, volumes or the image.
+export FORGEAIR_RUN="${FORGEAIR_RUN:-r$(python3 -c 'import secrets; print(secrets.token_hex(3))')}"
 OUT="${1:-results/latest}"
 mkdir -p "$OUT"
 T=$SECONDS
 echo "prove_airlock: commit $(git rev-parse --short HEAD 2>/dev/null || echo unknown), docker $(docker version --format '{{.Server.Version}}' 2>/dev/null)" | tee "$OUT/prove.txt"
 ./validate.sh "$OUT"; v=$?
 ./bench.sh "$OUT" | tee "$OUT/bench.md"; b=${PIPESTATUS[0]}
-left=$(docker ps -a -q --filter "name=forgeair-" | wc -l | tr -d ' ')
-vols=$(docker volume ls -q --filter "name=forgeair-" | wc -l | tr -d ' ')
-nets=$(docker network ls -q --filter "name=forgeair-" | wc -l | tr -d ' ')
+left=$(docker ps -a -q --filter "name=forgeair-$FORGEAIR_RUN-" | wc -l | tr -d ' ')
+vols=$(docker volume ls -q --filter "name=forgeair-$FORGEAIR_RUN-" | wc -l | tr -d ' ')
+nets=$(docker network ls -q --filter "name=forgeair-$FORGEAIR_RUN-" | wc -l | tr -d ' ')
 c=1; [ "$left$vols$nets" = 000 ] && c=0
 echo "prove_airlock: validate=$v bench=$b cleanup=$c (containers=$left volumes=$vols networks=$nets) total=$((SECONDS-T))s" | tee -a "$OUT/prove.txt"
 [ "$v" = 0 ] && [ "$b" = 0 ] && [ "$c" = 0 ]
