@@ -246,7 +246,7 @@ python3 -I airlock/backends/vfkit_image.py build      # pinned Alpine packages -
 | kernel and root | Alpine `linux-virt` 6.12.118 and an initramfs with python3, git, busybox (31 packages); every input pinned by SHA-256 in `backends/vfkit.lock.json`; the initramfs is built deterministically (same lock -> same bytes). No network driver is in the image. |
 | workspace | the airlock builds it in a host folder of the run (instead of a Docker volume) and reads it through its `nosymfollow` bind as before; the VM sees the folder as a virtio-fs share (`nosuid,nodev`) |
 | read-only paths | read-only binds in the guest AND the macOS immutable flag (`chflags uchg`) on the host: the host file system is case-insensitive, and a guest write to `RO.TXT` reached a read-only `ro.txt` past its bind (tested); an immutable file cannot be written, chmod-ed, renamed or deleted through any name |
-| network | ONE vsock connection per VM (`guest/vsockmux.py`); in the guest, `airlock:8700` (and `:8701` with `llm`, `egress:3128` with an egress allowlist) are local listeners whose streams the host relay connects ONLY to the airlock's (egress proxy's) port, published on the host's 127.0.0.1. Any other port is refused; the guest has no network device. Per-connection vsock (vfkit's own proxy) lost 6-8 of 2000 requests here; the single tunnel lost 0 of 2900. |
+| network | ONE vsock connection per VM (`guest/vsockmux.py`); in the guest, `airlock:8700` (and `:8701` with `llm`, `egress:3128` with an egress allowlist) are local listeners whose streams the host relay connects ONLY to the airlock's (egress proxy's) port, published on the host's 127.0.0.1. Any other port is refused; the guest has no network device. Per-connection vsock (vfkit's own proxy) lost 6-8 of 2000 sequential HTTP requests here; the single tunnel lost 0 of 3900 (sequential, EOF-delimited and 20 concurrent). |
 | keys | as with Docker: the VM gets `ANTHROPIC_BASE_URL=http://airlock:8701` and a dummy token; the model key stays with the airlock |
 | the job | command, environment and canary token reach the guest's PID 1 through a control share that it unmounts before the command starts |
 
@@ -262,8 +262,29 @@ Tests on this Mac (Apple M1 Pro, macOS 27, Docker Desktop 28.5.1, vfkit 0.6.4; F
   no hardware virtualization -> exit 2; a fake vfkit that runs the box in a Docker container (same
   kernel as the airlock) -> the probe refuses, exit 10; a NAT network device planted in the VM ->
   the canary reports BREACH (public DNS resolved), exit 10.
-- `FORGE_ISOLATION=microvm proof/validate.sh`: every agent-side service runs in a VM (see the result
-  below).
+- `FORGE_ISOLATION=microvm proof/validate.sh`: every agent-side service (agent, the 4 planted-breach
+  controls, phase 2/3 agents, the detached crash agent) runs in a VM: 37 of 37 ok. The extra cases: the
+  probe (positive, and runc as negative control) and "guest root with the read-only protection on ->
+  canary PASS" (guest root cannot write read-only entries: guest binds, host immutable flag and the
+  airlock's 0444/0555 modes, which macOS enforces on the vfkit process). So the planted breach
+  `control-root-writes` is, in a VM, "root AND the host protection removed": canary BREACH. The
+  not-gated control "symlink swap WITHOUT nosymfollow" did not win in the VM setup (exit 0; it wins
+  in a container): the race does not land through two virtio-fs layers here, which shows nothing
+  about nosymfollow itself.
+- Measured on this Mac while other agents loaded it (load average 60-150; FINITE TEST, one run each):
+
+  | | docker (runc in Docker Desktop) | microvm (vfkit VM) |
+  | --- | --- | --- |
+  | validate.sh | 34 of 34 ok, 396 s | 37 of 37 ok, 603 s |
+  | `run_up_e2e.py` | 12 of 12 ok | 18 of 18 ok |
+  | `up` wall time, one run (answer n) | 35.9 s | 26.4 s |
+  | canary in the box | 8,700 checks, 15.8 s | 865 checks, 12.3 s |
+  | start of `python3 -I -c pass`, first / warm median of 10 / min (`proof/vfkit_startup_bench.py`) | 1426 / 1466 / 613 ms | 1297 / 1352 / 637 ms |
+
+  Under that load a VM start costs about the same as a container start here. Without other load
+  (earlier the same day, not with the final code) a VM run of `true` took about 0.7 s end to end
+  (guest kernel to command: 0.16 s); the first boots took 1.4-4.4 s until the guest seeded its random
+  pool from virtio-rng (fixed: `guest/init` loads it first). A cold start after a reboot is not measured.
 - CI (`isolation.yml`, job `vfkit-macos`): GitHub's macOS runners are VMs without nested
   virtualization, so the job builds the image and runs the host-side unit cases, and SKIPS the VM
   battery with a warning; it is not counted as passed.
