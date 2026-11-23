@@ -31,6 +31,7 @@ You need:
 | everything | Claude Code (terminal) | already installed |
 | everything | Python 3.8 or newer as `python3` | already on most machines |
 | proofs | Dafny 4.11 | nothing: downloaded automatically on first use (pinned 4.11.0, SHA-256 checked, about 60 MB, into `~/.cache/forge-check`). Or install it yourself (`brew install dafny`); set `FORGE_NO_DOWNLOAD=1` to forbid the download |
+| `/forge:airlock` box only | Docker with Compose v2 | Docker Desktop; nothing else in Forge needs Docker |
 | `/forge build` only | the tools of each language you build for | `py`: python3; `js`: node + npm; `go`: go + goimports; `java`: a JDK; `cs`: dotnet; `rs`: cargo |
 
 Then, at the prompt of a Claude Code terminal session:
@@ -78,6 +79,49 @@ show the last verdicts and the approved contract.
 
 Files it keeps in your project: `.forge/forge.json` (checks), `.forge/approved.json` (your approvals),
 `.forge/last-check.json` (last verdicts).
+
+## The workflow in one place
+
+1. `/forge:scan`, then `/forge:add <n>`: state a rule; Claude asks, writes the spec and your answers as checks.
+2. `/forge approve`: you approve it. `/forge check` proves it; `/forge fuzz` runs your real code against it.
+3. `INVARIANTS.md`: every approved rule in plain words, regenerated on approval, checked in CI.
+4. `/forge:airlock`: Claude drafts `forge.yaml` for an agent box (hidden paths, read-only paths such as `spec/`,
+   `.forge/` and `INVARIANTS.md`, and a rule for each MCP tool), asks you, and writes `./forge-airlock`.
+5. In a terminal: `./forge-airlock up -- claude`. Claude Code works inside the box; when it exits you see the
+   diff, and your repository changes only after you type y. Hidden and read-only paths are never changed.
+
+Steps 1 to 3 need no Docker. Step 5 needs Docker. Details of the box: `airlock/README.md`.
+
+## Airlock: an agent box for your repository
+
+`python3 airlock/forge_airlock.py up -- <command>` (or `./forge-airlock up -- claude` after `/forge:airlock`)
+reads `forge.yaml`, generates the Docker configuration in a temporary folder, stages your repository, builds the
+box's workspace with the hidden paths absent (also from git history), starts the airlock with your MCP servers
+(they hold the keys; secrets are named in `forge.yaml` as `${NAME}` only), runs a breach canary in the box (fail
+closed), and runs the command interactively. MCP tools are default deny; tools that spend money or act on the
+world can be gated with a cap, decided by the compiled escrow verifier of Forge's #91 (its model is PROVED in
+Dafny), kept running as one process. The box reaches only the airlock and the hosts in `agent.egress_allow`.
+With `llm` in `forge.yaml`, `claude` in the box needs NO key: it reaches the model through the airlock, which adds
+the key from your shell and caps the spending per session and per day (no `--pass-env`; `airlock/README.md`).
+
+Honest labels:
+
+| Part | Label |
+| --- | --- |
+| The verifier's verdict on one gate log: cap, money chain, sequence, duplicate id, expiry (#91) | PROVED, about the Dafny model only |
+| The compiled verifier as it runs, its CLI glue, the persistent process | NATIVE CHECK (compiled or hand-written, not proved) |
+| The memo of its pure SHA-256 and key validation (the speed-up: about 300 ms to about 20 ms per gated call) | NATIVE CHECK; "same verdict with and without it" is a FINITE TEST, not proved |
+| Policy engine, path checks, workspace filter, `nosymfollow` mount, canary, egress proxy, sync-back filter | NATIVE CHECK |
+| Every run of `prove_release.sh` | FINITE TEST (one machine, listed inputs) |
+| Isolation | container tier: the box shares the host kernel (on macOS, Docker Desktop's Linux VM); a kernel or runtime escape is out of scope |
+| `llm` model proxy: verifier's verdict on the spending log | PROVED (Dafny model); the token estimate, the reading of the provider's usage report and the proxy are NATIVE CHECK |
+| `--pass-env NAME` | the agent CAN READ that value (and can send it to the allowed hosts); use a separate, spend-capped key |
+| End to end | `end_to_end=false`: tested with mocks, fake keys and the real server-filesystem, not with a real paid service |
+
+`./prove_release.sh` runs all 8 release gates (checker tests, plugin validation and scans; hidden paths incl. a
+concurrent symlink swap; gated MCP incl. crash, timeout and restart; planted breaches; diff sync-back; gate
+latency; this README; the `llm` model proxy against a fake provider) and exits 0 only if all pass. Not tested: see "Not tested" in `airlock/README.md`
+(no real model session in the box, no Linux or Windows host, no real paid upstream).
 
 ## Build: from proof to code your app runs
 
@@ -378,7 +422,7 @@ See `PLAN.md` for what is built and what is not.
 
 ## Limits
 
-- This is a feedback loop, not a security boundary. The mod blocks Claude's Edit and Write tools on
+- Without the airlock this is a feedback loop, not a security boundary. The mod blocks Claude's Edit and Write tools on
   approved specs and on `.forge/approved.json`, but a shell command can still change them.
 - A spec covers only what it says. Files without a spec are not checked.
 - Dafny runs can take seconds to minutes.

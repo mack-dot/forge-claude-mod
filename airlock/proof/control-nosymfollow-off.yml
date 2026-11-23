@@ -1,0 +1,8 @@
+# CONTROL ONLY: the airlock without the nosymfollow mount (the #97 setup), to show what the
+# symlink-swap attack can reach without it. Never use this for real work.
+services:
+  airlock:
+    environment:
+      FORGE_WS_RAW: ""
+    volumes:
+      - ws:/ws
