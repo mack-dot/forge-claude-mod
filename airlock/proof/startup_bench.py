@@ -35,13 +35,15 @@ def main():
         warm = sorted(once(image, rt) for _ in range(n))
         res[rt] = {"cold_ms": round(cold, 1), "warm_n": n, "warm_median_ms": round(statistics.median(warm), 1),
                    "warm_p95_ms": round(warm[min(n - 1, int(round(0.95 * (n - 1))))], 1), "warm_min_ms": round(warm[0], 1)}
-    base = res.get("runc") or res.get(rts[0])
+    base = res.get("runc")  # deltas only when runc ran in the same invocation
     for rt, r in res.items():
-        r["warm_median_over_runc_ms"] = round(r["warm_median_ms"] - base["warm_median_ms"], 1)
-        r["cold_over_runc_ms"] = round(r["cold_ms"] - base["cold_ms"], 1)
+        extra = ""
+        if base and rt != "runc":
+            r["warm_median_over_runc_ms"] = round(r["warm_median_ms"] - base["warm_median_ms"], 1)
+            r["cold_over_runc_ms"] = round(r["cold_ms"] - base["cold_ms"], 1)
+            extra = f"; over runc: cold {r['cold_over_runc_ms']:+.1f} ms, warm median {r['warm_median_over_runc_ms']:+.1f} ms"
         print(f"startup {rt:24s} cold {r['cold_ms']:8.1f} ms  warm median {r['warm_median_ms']:8.1f} ms  "
-              f"p95 {r['warm_p95_ms']:8.1f} ms  (n={n}; median over runc {r['warm_median_over_runc_ms']:+.1f} ms)",
-              file=sys.stderr)
+              f"p95 {r['warm_p95_ms']:8.1f} ms  (n={n}{extra})", file=sys.stderr)
     print(json.dumps(res, indent=1))
 
 

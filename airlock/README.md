@@ -204,6 +204,24 @@ Tests: `tests/run_tests.py` (choice and refusal rules, compose output, probe neg
 plus probe checks). CI: `.github/workflows/isolation.yml` runs all three on ubuntu-latest and
 measures container start overhead (`proof/startup_bench.py`).
 
+Measured (FINITE TEST, GitHub ubuntu-latest, kernel 7.0.0-1020-azure, run 45116333410; gVisor
+20261102.0, Kata 4.3.1 with QEMU, Firecracker v1.17.0):
+
+| | docker (runc) | gvisor (runsc) | microvm (kata) |
+| --- | --- | --- | --- |
+| validate.sh (G2-G4 battery) | 34 of 34 ok, 195 s | 35 of 35 ok, 242 s | 35 of 35 ok, 312 s |
+| `run_up_e2e.py` | 12 of 12 ok | 12 of 12 ok | 12 of 12 ok |
+| agent `/proc/version` | the host kernel | `4.19.0-gvisor` | guest `6.18.56` |
+| container start, cold (first after a Docker restart and cache drop) | 226-281 ms | 940 ms (runc on that runner: 239 ms) | 2849 ms (runc on that runner: 281 ms) |
+| container start, warm median of 10 | 147-164 ms | 159 ms (runc: 151 ms) | 2078 ms (runc: 164 ms) |
+| `up` wall time, one run (answer n) | 10.0 s | 12.8 s | 17.0 s |
+
+The start numbers are `docker run --rm ... python3 -c pass` from the host; each backend ran on its own
+runner, so compare a backend with the runc row of the same runner. A minimal Firecracker v1.17.0 boot
+(Kata's guest kernel, busybox initramfs, 1 vCPU) on the same runner: 426-450 ms over 6 boots, process
+start to guest reboot. On this Mac (macOS 27, Apple silicon), `vz_boot_check.sh` (Alpine 6.12.115 guest):
+1187 ms first boot, 293-380 ms the next 4.
+
 ## Faster gates, same proved verifier
 
 #97 started a new verifier subprocess for every gated call and re-verified the whole log
@@ -340,5 +358,14 @@ against other code) and `agent/protocol_regress.py` in `validate.sh` (domain con
 - Crash between the log append and the PENDING journal line (ORPHAN_SPENT path); a kill of the
   host or of Docker itself; `nosymfollow` on hosts with AppArmor or SELinux enforcing (Linux hosts
   were not tested; only Docker Desktop's VM).
+- Isolation backends: `microvm` and `gvisor` were run on GitHub ubuntu-latest only (no local Linux
+  host); Kata with Cloud Hypervisor or Firecracker as its hypervisor (only QEMU, the default); a
+  non-terminal `up` under Kata (the battery needed `run --interactive=false`; `up` was run under a
+  pseudo-terminal only); G5-G8 of `prove_release.sh` under a non-docker backend; an attack on gVisor or
+  Kata themselves. BLOCKED_NEEDS_HUMAN: `microvm` on macOS needs the agent's image as a VM root
+  file system, a virtio-fs share of the filtered workspace with the `nosymfollow` guarantee, and a
+  network path from the VM to the airlock that keeps the agent network internal; Docker Desktop
+  offers none of these, so it is a design decision (vfkit or Apple's `container` tool, which
+  installs with admin rights), not a missing package. Only the VM boot itself is tested.
 - Everything else listed under "Not tested" in the #97 README still applies, except the symlink
   swap and the mid-call crash, which are now tested (FINITE TEST).
