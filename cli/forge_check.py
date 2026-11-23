@@ -649,10 +649,10 @@ def syntax_errors(root, files):
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'eval', 'syntax_check.mjs')
         r = subprocess.run([node, script] + [inside(root, f) for f in js], stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
-        if r.returncode == 1:
+        if r.returncode == 1 and r.stdout.strip() and not r.stdout.lstrip().startswith(('file:', 'node:')):
             errors += [os.path.relpath(l.split(': ', 1)[0], root) + ': ' + l.split(': ', 1)[-1]
                        for l in r.stdout.strip().split('\n') if l]
-        elif r.returncode != 0:
+        elif r.returncode != 0:  # 3: no TypeScript parser in this Node; anything else: the checker itself failed
             unchecked += ['%s (this Node cannot parse TypeScript; Node 22.13 or later can)' % f for f in js]
     for rel in files:
         if os.path.splitext(rel)[1] in _JS_EXT and node:
@@ -1283,8 +1283,11 @@ _TEST_FILE = re.compile(r'(^|/)(tests?|__tests__|spec)/|[._-](test|spec)\.[A-Za-
 
 def project_files(root):
     """Tracked files (git ls-files), or a walk that skips build, vendor and hidden folders."""
-    r = subprocess.run(['git', '-C', root, 'ls-files', '-z'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    if r.returncode == 0 and r.stdout:
+    try:
+        r = subprocess.run(['git', '-C', root, 'ls-files', '-z'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:  # no git on this machine: walk the folder
+        r = None
+    if r is not None and r.returncode == 0 and r.stdout:
         return [f for f in r.stdout.decode('utf-8', 'replace').split('\0') if f and os.path.isfile(os.path.join(root, f))]
     out = []
     for d, dirs, files in os.walk(root):

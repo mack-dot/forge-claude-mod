@@ -325,6 +325,31 @@ def main():
     extra += 1
     print('%s  approval digest: %d of %d characters, all %d spec clause lines and %d decisions kept' % (
         'ok  ' if ok else 'FAIL', len(dig), len(full), len(spec_lines), len(rows)))
+    # the syntax step on a machine with no git and a Node without a TypeScript parser (found in CI): no false alarm
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, 'p')
+        shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
+        bin_dir = os.path.join(tmp, 'bin')
+        os.makedirs(bin_dir)
+        os.symlink(sys.executable, os.path.join(bin_dir, 'python3'))
+        with open(os.path.join(bin_dir, 'node'), 'w') as f:
+            f.write('#!/bin/sh\nexit 3\n')  # an old Node: syntax_check.mjs exits 3 when it cannot parse TypeScript
+        os.chmod(os.path.join(bin_dir, 'node'), 0o755)
+        env = dict(os.environ, PATH=bin_dir)
+        c = subprocess.run([sys.executable, CLI, 'check', '--root', root, '--json', '--no-write'], env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        try:
+            res = json.loads(c.stdout)
+        except ValueError:
+            res = {'verdicts': {}, 'warnings': ['<no result> ' + c.stderr[-300:]]}
+        ok = (c.returncode == 0 and list(res['verdicts'].values()) == ['VERIFIED']
+              and not any(w.startswith('APP_SYNTAX_ERROR') for w in res.get('warnings', [])))
+        failed += not ok
+        extra += 1
+        print('%s  syntax step: no git and a Node without TypeScript parsing: not checked, no false alarm' % (
+            'ok  ' if ok else 'FAIL'))
+        if not ok:
+            print('      ' + json.dumps(res.get('warnings'))[:400] + c.stderr[-300:])
     # a decision record that names code: approval remembers that code; a later change to it is flagged (never a
     # failed verdict), and an out-of-scope item that names code is offered as the next rule
     with tempfile.TemporaryDirectory() as tmp:
