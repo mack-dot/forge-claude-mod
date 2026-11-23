@@ -16,7 +16,7 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
   its six shipped legacy functions are recorded as reviewed. forge.json re-approved, INVARIANTS.md regenerated.
 - Measured: on a copy of the real app that motivated it, with `body.for` and `householdId`: 290 lines in 205 files,
   0.3 s; the three places found by hand are among the 16 `body.for` lines.
-- Tested: 12 new cases (found; own files never reported; `check` lists it and stays VERIFIED; reviewed → clear;
+- Tested: 13 new cases (found; no git on PATH → the walk is used (found in CI: `check` crashed in a container without git); own files never reported; `check` lists it and stays VERIFIED; reviewed → clear;
   edited line → found again; review of a non-hit refused; negative control with no other use → clear; no terms;
   bad regex; git untracked/ignored/node_modules; a chronicle-shaped TS/Java/Go/Rust project). Not tested: the
   `/forge:bypass` conversation and the register.ts wiring inside Claude Code.

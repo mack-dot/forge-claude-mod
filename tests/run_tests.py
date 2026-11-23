@@ -268,6 +268,13 @@ def bypass_cases():
         rbad = subprocess.run([sys.executable, CLI, 'bypass', '--root', root, '--rule', 'wallet-cap', '--record',
                                'app.py:1', '--note', 'x'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         cases.append(('bypass: a review of a line that is not a hit is refused', rbad.returncode == 2))
+        # no git on PATH (minimal containers; found in CI): the walk is used instead, nothing crashes
+        empty = os.path.join(tmp, 'empty-path')
+        os.makedirs(empty)
+        rng = subprocess.run([sys.executable, CLI, 'bypass', '--root', root, '--json', '--no-write'], env=dict(os.environ, PATH=empty),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        cases.append(('bypass: without git on PATH it walks the folder (still BYPASS_FOUND)',
+                      rng.returncode == 1 and '"BYPASS_FOUND"' in rng.stdout))
 
     with tempfile.TemporaryDirectory() as tmp:  # negative control: nothing outside the rule uses the field
         root = copy(tmp)

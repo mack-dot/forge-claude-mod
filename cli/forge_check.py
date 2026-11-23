@@ -1172,9 +1172,12 @@ def _skipped_path(rel):
 
 def project_files(root):
     """Text files of the project: git's tracked and untracked-but-not-ignored files, else a walk."""
-    r = subprocess.run(['git', '-C', root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'],
-                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    if r.returncode == 0:
+    try:
+        r = subprocess.run(['git', '-C', root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:  # no git on this machine (minimal containers): walk the folder instead
+        r = None
+    if r is not None and r.returncode == 0:
         rels = sorted(set(p for p in r.stdout.decode('utf-8', 'replace').split('\0') if p))
     else:
         rels = []
@@ -1286,8 +1289,8 @@ def outside_of(root):
     """For `check`: the unreviewed bypass hits per check (never changes a verdict). {} when nothing is watched."""
     try:
         out = run_bypass(root)
-    except ConfigError as e:
-        return {}, str(e)
+    except Exception as e:  # the search must never break `check` or change its verdicts
+        return {}, '%s: %s' % (type(e).__name__, e)
     return ({name: [{'file': h['file'], 'line': h['line'], 'function': h['function'], 'term': h['terms'][0],
                      'text': h['text']} for h in r['hits']] for name, r in out['checks'].items()}, None)
 
