@@ -15,6 +15,24 @@ Forge "works" for this trial only if all of these hold:
 
 Report the result against these targets, including every target missed. Never report only the best run.
 
+## Pre-registered metrics (fixed on 2026-11-23, before any outside tester)
+
+These five numbers are reported for every trial, by these names, with no change after the first tester starts.
+
+| Metric | Definition | How it is measured |
+| --- | --- | --- |
+| `completion_rate` | testers who reach `forge ✓ VERIFIED` on one real rule of their own app, divided by testers who started | the sheet below; a tester who stops is counted as not completed |
+| `minutes_to_verified` | minutes from typing the first `/forge` to the first `forge ✓ VERIFIED` | the sheet below; report median and range; testers who did not complete are listed, not averaged in |
+| `unplanted_bugs_found` | disagreements between the tester's own answers (or the differential fuzz) and their existing code, confirmed by the tester as real bugs | the sheet below plus `/forge diff` output; each one with a one-line description |
+| `false_alarms` | failures or disagreements the tester judged not to be a real problem | the sheet below; each with the reason |
+| `drop_off_step` | for every tester who did not complete: the step where they stopped (`install`, `dafny`, `scan`, `add` conversation, `approve`, `check`, `fuzz set-up`, `build`, other) and why | the sheet below |
+
+Results go in `trial-results.csv` (one row per tester, columns below) next to the filled sheets:
+
+```
+tester_role,app_language,completed,minutes_to_verified,unplanted_bugs_found,false_alarms,drop_off_step,notes
+```
+
 Goal: the first real numbers on how long one rule takes with Forge, and where people get stuck.
 One sheet per person. Do not help unless the person is stuck for 5 minutes; write down every help.
 
@@ -29,8 +47,8 @@ One sheet per person. Do not help unless the person is stuck for 5 minutes; writ
 
 ## Run
 
-Start a timer. Optionally type `/forge:scan`. Then type `/forge:add` and your rule in your own words, and
-follow the steps until `/forge check` shows VERIFIED.
+Start a timer. Type `/forge` and follow it: it runs the next step each time (a read-only scan, `/forge:add` for your
+rule, your approval, the proof, the fuzz). Stop the timer at the first `forge ✓ VERIFIED`.
 Then run `/forge mutate` and keep its output.
 Optional second part: `/forge:build-setup`, then `/forge build` until it shows BUILT and your app calls the
 built code.
@@ -53,7 +71,7 @@ built code.
 | Helps given by the observer | |
 | Did the tester read the spec before approving? (observed) | |
 | Could the tester say, afterwards, one thing the spec does NOT guarantee? | |
-| Gave up? At which step, and why | |
+| Gave up? At which step (`drop_off_step`), and why | |
 | `/forge mutate`: planted bugs caught / total | |
 | Survivors: harmless, or a spec gap (one line each) | |
 | Real bugs found: places where the code disagreed with the tester's own answers | |
