@@ -691,7 +691,7 @@ VERDICT_HELP = {
     'ERROR': ('The check could not run (a tool or a file problem; details below).',
               'Ask Claude to find the cause: /forge:doctor.'),
     'TOOLCHAIN_MISSING': ('A tool that this language needs is not installed.',
-                          'Install the tool named below, or remove that language from the check.'),
+                          'Install the missing tool (its install line is shown here), or remove that language from the check.'),
     'NO_FUZZ': ('No fuzz harness: the compiled code would be untested.', 'Ask Claude to set it up: /forge:build-setup.'),
     'FUZZ_NOT_VERIFIED': ('The proof checker did not accept the fuzz harness.', 'Ask Claude to fix it: /forge:build-setup.'),
     'FUZZ_FAILED': ('The compiled proved code failed its own test in one language.',
@@ -832,7 +832,7 @@ def fuzz_target(dafny, work, harness_rel, target, log):
     """Compile and run the harness in one target. Returns (status, normalized output or reason)."""
     missing = missing_tools(target)
     if missing:
-        return 'TOOLCHAIN_MISSING', 'not on PATH: %s. To install: %s' % (', '.join(missing), tool_hint(missing))
+        return 'TOOLCHAIN_MISSING', 'not on PATH: %s. To fix: %s' % (', '.join(missing), tool_hint(missing))
     extra = TARGETS[target][1]
     if target == 'js':
         modules = js_node_path()
@@ -1060,7 +1060,7 @@ def build_one(root, cfg, c, dafny, check_only):
                 entry['emit'] = 'SKIPPED'
                 entry['emit_detail'] = err
                 if entry.get('fuzz') != 'TOOLCHAIN_MISSING':  # else already said, with the install line
-                    fail('TOOLCHAIN_MISSING', '%s: not on PATH: %s. To install: %s'
+                    fail('TOOLCHAIN_MISSING', '%s: not on PATH: %s. To fix: %s'
                          % (t, ', '.join(missing_tools(t)), tool_hint(missing_tools(t))))
                 continue
             if err:
@@ -1298,7 +1298,7 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None, coverage=False, only=
         env = dict(os.environ)
         if df['lang'] == 'js':
             if not shutil.which('node'):
-                res['verdict'], res['detail'] = 'TOOLCHAIN_MISSING', 'node is not on PATH. To install: ' + TOOL_HINTS['node']
+                res['verdict'], res['detail'] = 'TOOLCHAIN_MISSING', 'node is not on PATH. To fix: ' + TOOL_HINTS['node']
                 continue
             modules = js_node_path()
             if not modules:
@@ -1334,7 +1334,7 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None, coverage=False, only=
                 res['verdict'] = 'TOOLCHAIN_MISSING' if missing else 'DIFF_ERROR'
                 hint = tool_hint(missing_tools(target) or {'go': ['go'], 'rs': ['cargo'], 'java': ['javac'],
                                                            'cs': ['dotnet']}[target])
-                res['detail' if missing else 'error'] = str(e) + ('. To install: ' + hint if missing and hint else '')
+                res['detail' if missing else 'error'] = str(e) + ('. To fix: ' + hint if missing and hint else '')
                 continue
         else:
             cmd = list(df['run'])

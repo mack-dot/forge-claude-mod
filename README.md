@@ -54,9 +54,9 @@ You need:
 | --- | --- | --- |
 | everything | Claude Code (terminal) | already installed |
 | everything | Python 3.8 or newer as `python3` | already on most machines |
-| proofs | Dafny 4.11 | nothing: downloaded automatically on first use (pinned 4.11.0, SHA-256 checked, about 60 MB, into `~/.cache/forge-check`). Or install it yourself (`brew install dafny`); set `FORGE_NO_DOWNLOAD=1` to forbid the download |
+| proofs | Dafny 4.11 | nothing: downloaded automatically on first use (pinned 4.11.0, SHA-256 checked, about 60 MB, into `~/.cache/forge-check`; macOS arm64/x64, Linux x64, Windows x64). Elsewhere (for example Linux arm64), or offline, install it yourself (`brew install dafny`); set `FORGE_NO_DOWNLOAD=1` to forbid the download |
 | `/forge airlock` box only (optional) | Docker with Compose v2 | Docker Desktop; nothing else in Forge needs Docker |
-| fuzzing your shipped code | the tools of each language you build for | `py`: python3; `js`: node + npm; `go`: go + goimports; `java`: a JDK; `cs`: dotnet; `rs`: cargo |
+| fuzzing your shipped code | the tools of your code's language (a missing one is named, with its install line) | `py`: python3; `js`: node + npm; `go`: go + goimports; `java`: a JDK; `cs`: dotnet; `rs`: cargo |
 
 Then, at the prompt of a Claude Code terminal session:
 

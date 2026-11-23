@@ -102,7 +102,7 @@ function summary(last: LastCheck | undefined, total: number): string {
   if (!vs.length) return 'forge: no checks · /forge'
   const ok = vs.filter(([, v]) => v === 'VERIFIED').length
   const bad = vs.find(([, v]) => v !== 'VERIFIED')
-  if (!bad) return vs.length === 1 ? `forge ✓ ${vs[0][0]}: model PROVED` : `forge ✓ ${ok}/${vs.length} models PROVED`
+  if (!bad) return vs.length === 1 ? `forge ✓ ${vs[0]?.[0] ?? ""}: model PROVED` : `forge ✓ ${ok}/${vs.length} models PROVED`
   return `forge ✗ ${bad[1]} ${bad[0]} · ${ok}/${vs.length} verified`
 }
 
