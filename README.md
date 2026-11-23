@@ -63,6 +63,7 @@ conversation with Claude; commands with a **space** (`/forge approve`) run a fix
 | Approve it | `/forge approve`, then `/forge approve yes` | Shows exactly what you approve (spec, your answers, decision record, `forge.json`); "yes" approves exactly that, even after a restart. Typing "yes" first only shows it. If a file changed in between, it shows the new version instead. Only you can do this. |
 | Prove it | `/forge check` | Your answers are checked against the spec (`EXAMPLES_FAILED` if the spec says otherwise or leaves one open), then the code against the spec. The status line shows `forge ✓ VERIFIED n/n` or what failed. |
 | Find bugs in your real code | automatic (set up by `/forge add` when the rule already exists in your code), or `/forge fuzz` | Runs your shipped code and the proved rule on fresh random inputs at the end of each turn that changed them (about a second), saves each disagreement as a small repeatable case. `/forge fuzz` on its own is a deep run. See **Fuzz** below. |
+| Find code around the rule | `/forge:bypass` | Claude proposes the fields the rule decides on, searches for code outside the rule that uses them, and asks you about each place. See **Bypass** below. |
 | Measure it | `/forge mutate` | Plants up to 30 small bugs in the proved code, one at a time in a temporary copy, and counts how many the proof catches. A survivor is a change your spec allows: harmless, or a gap in the spec. Changes nothing. |
 | Something failed | `/forge:fix` | Claude explains the verdict and proposes a fix to the code; it never weakens the spec without your word. |
 | Use it in your app | `/forge:build-setup`, then `/forge build` | Compiles the proved code to your languages (`py`, `js`, `go`, `java`, `cs`, `rs`), fuzzes the compiled code in every language (identical output required), and checks that your app imports it. |
@@ -169,6 +170,60 @@ Rust evaluators takes about 7 s.
 
 Labels: the inputs, the evaluators and the core are test code (not proved); a run is a FINITE TEST. It compares
 returned values only; side effects of the code under test are not checked.
+
+## Bypass: code that goes around a proved rule
+
+A proof is only as strong as the guarantee that nothing goes around it. On a real app, a proved read rule decided that
+`body.for` counts only on Companion's rows, but two other functions still trusted `body.for` on any row. A person
+found that by hand. `bypass` finds such places.
+
+Add `"watchedFields"` to a check: the texts that name what the rule decides on (field names such as `body.for` or
+`householdId`, a comparison, function names). A text between slashes is a regular expression
+(`"/spent\\s*\\+\\s*amount[^;{]*<=?\\s*cap/"`); anything else is literal. `/forge:bypass` proposes them from the approved
+spec and decision record. Then:
+
+```
+python3 cli/forge_check.py bypass [--root DIR] [--json]
+```
+
+searches the project's files (git's tracked and untracked-but-not-ignored files; without git, a walk) for each term.
+It skips the rule's own files (spec, implementation and its includes, your answers, decision record, fuzz harness,
+emitted code, diff adapters and inputs, `INVARIANTS.md`), vendored and build folders (`node_modules`, `dist`,
+`build`, `verified`, `vendor`, `target`, `.forge`, …), documentation and lockfiles. It reports every remaining line:
+file:line, the term, the line, and the enclosing function when a cheap heuristic finds it (Python, TS/JS, Go, Java,
+C#, Rust). `/forge:bypass` explains each place and asks you: route it through the proved rule, it is fine (record
+why), or make it part of a new rule. A "fine" answer is stored in the check's `"allowedBypasses"` list as
+`{file, line_text_sha256, note}`, so an edited line shows up again. Both lists are in `forge.json`, so you approve them
+like any other change: every allowed bypass is approved by a person.
+
+**A hard gate.** For a check with `watchedFields`, `check` gives `UNAPPROVED_BYPASS` (exit 1) when its proof passes
+but a line outside the rule matches and is not in its approved `allowedBypasses`; the detail lists the lines. A failed
+proof (or any other verdict) still wins. A check without `watchedFields` behaves as before.
+
+**Specific terms.** Because it is a gate, a term must name the forms that decide, not every mention:
+`.body.for` (a property access), `/\\bhouseholdId\\s*(===|!==|==|!=)/` (a comparison), not a bare `householdId`.
+`bypass --count --rule NAME --set-terms TERM…` previews the number of lines per term and writes nothing.
+
+| Bypass verdict | Meaning | Exit |
+| --- | --- | --- |
+| `BYPASS_CLEAR` | No unreviewed line outside the rule uses its watched fields | 0 |
+| `BYPASS_FOUND` | At least one such line | 1 |
+| `NO_SCOPE_TERMS` | No check has `watchedFields`: nothing was searched (not a pass) | 0 |
+| `UNAPPROVED_BYPASS` (a `check` verdict) | The proof passed, but an unallowed line outside the rule matches | 1 |
+
+`check` runs the same search: the unreviewed places also go under `"outside"` in its JSON and on one line of its
+report (`3 places decide with body.for outside gate-mayread: gate.ts:83 mayRetract, …`).
+`/forge approve yes` prints the count; bare `/forge` offers `/forge:bypass` for a check without watched fields.
+
+Measured on that app (a copy, 205 files searched, about 0.3 s): the bare terms `body.for` and `householdId` match 290
+lines in 25 files (275 of them for `householdId`): too many for a gate. The specific terms `.body.for`,
+`/\\bhouseholdId\\s*(===|!==|==|!=)/` and `/(===|!==|==|!=)\\s*[\\w.]*\\bhouseholdId\\b/` match 19 lines in 10 files,
+and still name the three places found by hand (`gate.ts:83 mayRetract`, `companion.ts:186 retract`,
+`companion.ts:224 forget`).
+
+Limits: a text search per line, not a data-flow analysis (a FINITE TEST of the listed terms). It misses aliases
+(`const f = body.for`), dynamic access (`body[key]`), destructuring (`const { for: f } = body`), a term split over
+lines, and code that decides the same question under other names. The function name is a heuristic on indentation.
 
 ## INVARIANTS.md: every approved rule in one place
 
