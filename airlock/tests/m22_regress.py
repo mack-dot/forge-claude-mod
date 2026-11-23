@@ -128,7 +128,7 @@ def live(doc, role=None):
     A.connect_upstreams()
     A.restart_lock = threading.Lock()
     A.canary, A.canary_lock, A.canary_report = "PASSED", threading.Lock(), None
-    A.canary_token, A.fp_salt, A.llm, A.ws_mount = "t" * 32, b"\x01" * 16, None, "off"
+    A.canary_token, A.fp_salt, A.llm, A.ws_mount, A.desk = "t" * 32, b"\x01" * 16, None, "off", None
     A.ws = {"fingerprints": [], "hidden_names": [], "readonly_files": [], "closed_dirs": []}
     return A
 

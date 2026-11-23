@@ -8,7 +8,11 @@ export FORGE_CANARY_TOKEN="${FORGE_CANARY_TOKEN:-$(python3 -c 'import secrets; p
 OUT="${1:-results/latest}"
 mkdir -p "$OUT"
 export FORGE_DOMAIN=bench FORGE_PHASE=1
-dc() { docker compose -p forgeair-bench -f docker-compose.yml "$@"; }
+# Per-run names: two runs on one Docker host must not share containers, volumes or the image.
+OWN_RUN=0; [ -n "${FORGEAIR_RUN:-}" ] || OWN_RUN=1  # an id we made ourselves: we remove its image at the end
+export FORGEAIR_RUN="${FORGEAIR_RUN:-r$(python3 -c 'import secrets; print(secrets.token_hex(3))')}"
+trap '[ "$OWN_RUN" = 1 ] && docker image rm "forge-airlock-proof:$FORGEAIR_RUN" >/dev/null 2>&1' EXIT
+dc() { docker compose -p "forgeair-$FORGEAIR_RUN-bench" -f docker-compose.yml "$@"; }
 dc --profile bench down -v --remove-orphans >/dev/null 2>&1
 dc up -d --wait airlock mock-http >"$OUT/bench-up.log" 2>&1 || { echo "bench: airlock did not start"; exit 2; }
 dc run --rm agent-bench >"$OUT/bench-proxy.log" 2>&1; rp=$?

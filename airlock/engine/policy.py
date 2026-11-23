@@ -134,6 +134,9 @@ def _int(v, where, lo=0, hi=U64_MAX):
     return v
 
 
+SSH_KEY_TYPES = ("sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com", "ssh-ed25519",
+                 "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "rsa-sha2-256", "rsa-sha2-512",
+                 "ssh-rsa")
 RULE_KEYS = ("equals", "not_equals", "in", "not_in", "regex", "int_min", "int_max", "optional", "type")
 SCALAR = {"string": lambda v: isinstance(v, str), "integer": lambda v: type(v) is int,
           "boolean": lambda v: isinstance(v, bool)}
@@ -218,7 +221,7 @@ class ToolPolicy:
 
     def __init__(self, spec, where, gated):
         base = ("tool",)
-        opt = ("upstream", "arg_rules", "path_args", "strict_args", "allow_args")
+        opt = ("upstream", "arg_rules", "path_args", "strict_args", "allow_args", "require_human_approval")
         gopt = ("log", "unit", "value_field", "cap", "per_call_max", "expires_in_s", "expires_at",
                 "id_field", "id_regex", "checker")
         if gated:
@@ -232,6 +235,11 @@ class ToolPolicy:
         self.raw = self.name  # the name the upstream knows (differs when namespace: true)
         self.role_log = self.role_cap = None  # set by a role with a cap for this tool (an extra, smaller log)
         self.gated = gated
+        # Held until a person signs this exact call with a hardware key (human_approval.py).
+        rha = spec.get("require_human_approval")
+        if rha not in (None, "hardware"):
+            raise PolicyError(f"{where}.require_human_approval must be hardware")
+        self.human_approval = rha == "hardware"
         self.rules = [ArgRule(k, v, f"{where}.arg_rules.{k}") for k, v in (spec.get("arg_rules") or {}).items()]
         pa = spec.get("path_args") or {}
         _keys(pa, f"{where}.path_args", optional=list(pa))
@@ -409,6 +417,9 @@ def pattern_inside(p, b):
     return False
 
 
+ISOLATION_BACKENDS = ("docker", "gvisor", "microvm")  # the same names as airlock/backends
+
+
 class Policy:
     def __init__(self, doc, environ=None, resolve=True, role=None):
         """resolve=True replaces ${NAME} in upstreams with the value from environ (the
@@ -416,7 +427,7 @@ class Policy:
         role: the name of one entry of `roles:` (or None for the base policy). A role can
         only narrow the base policy; an unknown role is a load error (fail closed)."""
         _keys(doc, "forge.yaml", required=("version", "upstreams", "tools"),
-              optional=("paths", "canary", "agent", "llm", "namespace", "roles"))
+              optional=("paths", "canary", "agent", "llm", "human_approval", "isolation", "namespace", "roles"))
         if doc["version"] != 1:
             raise PolicyError("version must be 1")
         if "namespace" in doc and not isinstance(doc["namespace"], bool):
@@ -506,6 +517,25 @@ class Policy:
         if self.namespace:
             for i, n in enumerate(self.deny):
                 self.split_name(n, f"tools.deny[{i}]")
+        # human_approval: the keys that may sign a held call (allowed-signers lines) and how long a call waits
+        ha = doc.get("human_approval")
+        self.approval_signers, self.approval_timeout_s = [], 300
+        if ha is not None:
+            _keys(ha, "human_approval", required=("allowed_signers",), optional=("timeout_s",))
+            lines = ha["allowed_signers"]
+            if not isinstance(lines, list) or not lines or not all(isinstance(x, str) and x.strip() for x in lines):
+                raise PolicyError("human_approval.allowed_signers must be a non-empty list of allowed-signers lines")
+            for x in lines:
+                parts = x.split()
+                if "\n" in x or len(parts) < 3 or not any(t in SSH_KEY_TYPES for t in parts[1:-1]):
+                    raise PolicyError(f"human_approval.allowed_signers: {clip(x)} is not 'principal [options] "
+                                      "keytype base64'")
+            self.approval_signers = list(lines)
+            if "timeout_s" in ha:
+                self.approval_timeout_s = _int(ha["timeout_s"], "human_approval.timeout_s", 1, 3600)
+        if any(tp.human_approval for tp in self.tools.values()) and not self.approval_signers:
+            raise PolicyError("a tool has require_human_approval: hardware, but human_approval.allowed_signers "
+                              "is missing (fail closed)")
         # logs shared by several gated tools must agree on cap and expiry
         self.logs = {}
         for tp in self.tools.values():
@@ -557,6 +587,10 @@ class Policy:
         for hp in self.egress_allow:
             if not isinstance(hp, str) or not re.fullmatch(r"[A-Za-z0-9.-]{1,253}:[0-9]{1,5}", hp):
                 raise PolicyError(f"agent.egress_allow entry {hp!r} must be host:port")
+        # isolation backend of the agent container (forge_airlock.py checks that it is available)
+        self.isolation = doc.get("isolation")
+        if self.isolation is not None and self.isolation not in ISOLATION_BACKENDS:
+            raise PolicyError(f"isolation must be one of {', '.join(ISOLATION_BACKENDS)}, not {self.isolation!r}")
         self.llm = parse_llm(doc.get("llm"))
         self.env_names = sorted(set(env_refs(doc)) | ({self.llm["key_env"]} if self.llm else set()))
         self.llm_key = None

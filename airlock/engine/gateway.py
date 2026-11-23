@@ -121,6 +121,11 @@ class Airlock:
                 self.llm = llm_proxy.LLMGate(self.policy.llm, DATA, os.environ.get("FORGE_LLM_SESSION", "default"))
             except (GateError, OSError, ValueError) as e:
                 die(f"llm gate log: {e}")
+        self.desk = None
+        if self.policy.approval_signers:
+            import human_approval
+            self.desk = human_approval.Desk(self.policy.approval_signers, self.policy.approval_timeout_s,
+                                            os.path.join(STATE, "approvals"))
         self.restart_lock = threading.Lock()
         self.sessions = {}
         self.canary = "PENDING"  # PENDING -> PASSED | BREACH ; one report per airlock lifetime
@@ -183,6 +188,10 @@ class Airlock:
             self._run_checker(tp, name, args)
         if self.canary != "PASSED":
             raise Refusal("FORGE_CANARY_PENDING", "startup canary has not passed; nothing is forwarded yet")
+        if tp.human_approval:  # held until a person signs exactly this call (tool, arguments, step id)
+            if self.desk is None:
+                raise Refusal("FORGE_HUMAN_APPROVAL_REFUSED", "no human_approval.allowed_signers (fail closed)")
+            self.desk.hold(name, fwd, step_id.hex() if tp.gated else None)
         up = self._live_upstream(self.route[name])
         call = {"name": tp.raw, "arguments": fwd}  # the upstream's own tool name
         if not tp.gated:

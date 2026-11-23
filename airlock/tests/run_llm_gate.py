@@ -29,7 +29,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.abspath(os.path.join(HERE, ".."))
-IMAGE = "llm-forge-airlock:local"
+IMAGE = "llm-forge-airlock:" + secrets.token_hex(4)  # per run: a parallel run never loses its image to our rmi
 os.environ["FORGE_AIRLOCK_IMAGE"] = IMAGE
 sys.path.insert(0, PKG)
 sys.path.insert(0, os.path.join(PKG, "engine"))

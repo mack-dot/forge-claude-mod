@@ -11,7 +11,7 @@ RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
 
 FROM python:3.12-slim-bookworm AS airlock
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates \
+ && apt-get install -y --no-install-recommends git ca-certificates openssh-client \
  && rm -rf /var/lib/apt/lists/* \
  && pip install --no-cache-dir PyYAML==6.0.2
 # node, npm and npx (stdio upstreams such as `npx -y <server>` run on the airlock side)
@@ -24,7 +24,7 @@ COPY engine /forge/airlock
 COPY agent /forge/agent
 COPY mocks /forge/mocks
 COPY checkers /forge/checkers
-RUN chmod -R a+rX /forge /opt/mcpfs && node --version && npx --version
+RUN chmod -R a+rX /forge /opt/mcpfs && node --version && npx --version && command -v ssh-keygen
 
 FROM airlock AS agent-claude
 ARG CLAUDE_CODE_VERSION=2.1.330

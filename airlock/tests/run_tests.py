@@ -586,9 +586,76 @@ def test_m22_controls():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_human_approval():
+    """require_human_approval: hardware (tests/human_approval_test.py; software keys made at test time)."""
+    sys.path.insert(0, HERE)
+    import human_approval_test
+    human_approval_test.run(lambda name, ok, detail="": case(name, bool(ok), detail))
+
+
+def test_isolation():
+    """Isolation backends (airlock/backends): choice, fail-closed availability, compose output, probe."""
+    import backends as B
+    import forge_airlock as FA
+    case("isolation: default is docker", B.resolve(None, None) == "docker")
+    case("isolation: --isolation alone is used", B.resolve("gvisor", None) == "gvisor")
+    case("isolation: forge.yaml alone is used", B.resolve(None, "microvm") == "microvm")
+    case("isolation: --isolation that differs from forge.yaml is refused",
+         raises(lambda: B.resolve("docker", "gvisor"), B.BackendError, "differs"))
+    case("isolation: an unknown backend is refused", raises(lambda: B.resolve("lxc", None), B.BackendError, "unknown"))
+    runc = {"runc", "io.containerd.runc.v2"}
+    case("isolation: docker needs no extra runtime", B.runtime_for("docker", runc) is None)
+    case("isolation: negative control: gvisor on a host without runsc is refused (no fall back)",
+         raises(lambda: B.runtime_for("gvisor", runc), B.BackendError, "not available"))
+    case("isolation: negative control: microvm on a host without a kata runtime is refused",
+         raises(lambda: B.runtime_for("microvm", runc), B.BackendError, "not available"))
+    case("isolation: negative control: docker info failure is refused for gvisor",
+         raises(lambda: B.runtime_for("gvisor", None), B.BackendError, "fail closed"))
+    case("isolation: gvisor with runsc registered -> runtime runsc", B.runtime_for("gvisor", runc | {"runsc"}) == "runsc")
+    case("isolation: microvm with kata registered -> runtime kata", B.runtime_for("microvm", runc | {"kata"}) == "kata")
+    pol = Policy(base_doc(isolation="gvisor"), environ={"PAY_KEY": "FAKE_pay_key_not_real_1234"})
+    case("isolation: forge.yaml isolation: gvisor loads", pol.isolation == "gvisor")
+    case("isolation: forge.yaml isolation: an unknown value is refused",
+         raises(lambda: Policy(base_doc(isolation="vm"), environ={"PAY_KEY": "x"}), PolicyError, "isolation"))
+    pol = Policy(base_doc(), environ={"PAY_KEY": "x"})
+    for rt in (None, "runsc", "kata"):
+        doc = FA.compose_doc(pol, "/p/forge.yaml", "/s", "/r", "logs", "img", [], [], agent_runtime=rt)
+        sv = doc["services"]
+        case(f"isolation: compose with agent runtime {rt}: only the agent changes",
+             sv["agent"].get("runtime") == rt and all("runtime" not in v for k, v in sv.items() if k != "agent"))
+    case("isolation: docker has no probe", B.probe_sh("docker") == "")
+    for name in ("gvisor", "microvm"):
+        r = subprocess.run(["sh", "-c", B.probe_sh(name) + "echo RAN"], capture_output=True, text=True,
+                           env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
+        case(f"isolation: negative control: {name} probe with no host kernel string -> exit {B.PROBE_EXIT}, command not run",
+             r.returncode == B.PROBE_EXIT and "RAN" not in r.stdout, (r.returncode, r.stdout, r.stderr))
+
+
+def test_names():
+    """Parallel boxes: the image tag follows the build context's content (two checkouts never share a tag)."""
+    import forge_airlock as FA
+    d = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(d, "engine"))
+        open(os.path.join(d, "engine", "g.py"), "w").write("x = 1\n")
+        a = FA.source_tag(d)
+        os.makedirs(os.path.join(d, "engine", "__pycache__"))
+        open(os.path.join(d, "engine", "__pycache__", "g.pyc"), "wb").write(b"junk")
+        os.makedirs(os.path.join(d, "tests"))
+        open(os.path.join(d, "tests", "t.py"), "w").write("y\n")
+        case("names: source tag ignores __pycache__ and tests (not in the image)", FA.source_tag(d) == a)
+        open(os.path.join(d, "engine", "g.py"), "w").write("x = 2\n")
+        case("names: negative control: changed engine code gives another image tag", FA.source_tag(d) != a)
+        case("names: default image tags carry the source tag, not :local",
+             FA.IMAGE.endswith(":" + FA._TAG) and FA.CLAUDE_IMAGE.endswith(":" + FA._TAG) and ":local" not in FA.IMAGE
+             if "FORGE_AIRLOCK_IMAGE" not in os.environ else True)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static,
-              test_redteam, test_m22, test_m22_controls):
+              test_redteam, test_human_approval, test_isolation, test_names, test_m22, test_m22_controls):
         try:
             t()
         except Exception as e:  # noqa: BLE001

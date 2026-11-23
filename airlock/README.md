@@ -222,6 +222,102 @@ roles:                            # optional; select with `forge up --role junio
   from a copy of the engine and require the matching case to FAIL). Latency per transport:
   `tests/bench_transport.py` (FINITE TEST; numbers in the M2.2 pull request).
 
+## Held calls: `require_human_approval: hardware`
+
+A tool with `require_human_approval: hardware` (in `tools.allow` or `tools.gate`) is held in the airlock until a
+person signs that exact call on the host with a key only a person can use (a FIDO2 security key: touch it; see
+"Signed approvals" in the top-level README for keys and the macOS notes).
+
+```yaml
+tools:
+  allow:
+    - {tool: push_branch, upstream: github, require_human_approval: hardware}
+human_approval:
+  timeout_s: 120            # default 300; a call that is not signed in time is refused
+  allowed_signers:          # allowed-signers lines (OpenSSH format); forge.yaml is read-only in the box
+    - 'you@example.com namespaces="forge-call-approval" sk-ssh-ed25519@openssh.com AAAA...'
+```
+
+On the host, while the box runs: `python3 <plugin>/cli/forge_sign.py call --key ~/.ssh/forge_approval_sk`. It
+lists each held call (tool, step id, the exact arguments the upstream will receive, and their SHA-256), asks
+`yes`, signs with `ssh-keygen -Y sign -n forge-call-approval` and hands the signature to the airlock through
+`docker compose exec` (the folder is on the airlock's state volume; the agent container does not mount it).
+
+- **Signed bytes:** canonical JSON of `{v, run, call, step, tool, args_sha256}`: `run` is fresh per airlock start,
+  `call` is a fresh random id per held call, `step` is the gate's step id (gated tools) or the call id. A signature
+  is good for one call only.
+- **Order:** canary, policy and argument checks first; then the hold; then (gated tools) the verifier's reservation;
+  then the upstream. A held call is not forwarded and spends nothing before the signature verifies.
+- **Refusals:** a key not in `allowed_signers`, a signature over other arguments or another step, a replayed
+  signature, another namespace or garbage: `FORGE_HUMAN_APPROVAL_REFUSED`. No signature in `timeout_s`:
+  `FORGE_HUMAN_APPROVAL_TIMEOUT`. A tool that asks for it without `human_approval.allowed_signers`: the policy is
+  invalid (fail closed).
+- **Client timeouts:** the agent's MCP client waits too. `mcp_cli.py` waits 60 s; keep `timeout_s` below your
+  client's limit.
+
+Tests: `tests/human_approval_test.py` (in `run_tests.py`, no Docker: 16 cases through `Airlock.tools_call` with a
+fake upstream) and `tests/run_human_approval_e2e.py` (Docker, `forge up`: owner-signed call forwarded, rogue-signed
+call refused, unsigned call timed out, none forwarded except the first). LABEL: FINITE TEST with software ed25519
+keys made at test time; a FIDO2 key uses the same `ssh-keygen -Y` path, its touch is not tested. The hold, the
+folder hand-off and the host CLI are NATIVE CHECK; the signature check is OpenSSH's, not proved.
+## Isolation backends (`--isolation`, forge.yaml `isolation:`)
+
+The default box is a Docker container on runc: it shares the kernel of the Docker host with the
+airlock. A kernel escape defeats it. Two other backends change ONLY the agent container's runtime
+(the airlock, egress proxy and exporter stay on runc; code: `backends/__init__.py`):
+
+| `isolation:` | Agent runs under | Needs |
+| --- | --- | --- |
+| `docker` (default) | runc, the host kernel | Docker with Compose v2 |
+| `gvisor` | gVisor `runsc`: the agent's system calls go to gVisor's user-space kernel | Linux Docker host, runsc registered: `runsc install` |
+| `microvm` | a Kata Containers VM per agent container (own guest kernel, KVM) | Linux Docker host with `/dev/kvm`, Kata registered as runtime `kata` |
+
+```
+./forge-airlock up --isolation gvisor -- claude     # or in forge.yaml:  isolation: gvisor
+```
+
+Fail closed, never a silent fall back to docker:
+- If the runtime is not registered with the Docker daemon (`docker info`), `up` refuses (exit 2).
+  A `--isolation` that differs from forge.yaml `isolation:` is refused too (exit 2).
+- Before the canary, a probe in the agent container compares its `/proc/version` with the airlock's
+  (runc: the host kernel). Equal, or for gvisor no "gVisor" in `dmesg`: the command does not run
+  (exit 10). The probe is a finite check of "which kernel answers", not a proof that the runtime has no escape.
+- gVisor's netstack and a Kata guest do not reach Docker's embedded DNS (a NAT rule in the network
+  namespace). For these backends `up` writes the airlock's (and egress proxy's) address into the
+  agent's `/etc/hosts`; the canary still treats any other resolvable name as a breach.
+
+macOS: Docker Desktop has no runsc and no Kata runtime, so `gvisor` and `microvm` are refused there
+(tested). The macOS microvm design is Apple Virtualization.framework: `backends/vz_boot_check.sh`
+boots a minimal Linux microVM through vfkit (pinned, SHA-256 checked, no sudo) as the positive
+control of that design. Running the agent itself in such a VM is NOT built (see "Not tested").
+
+Tests: `tests/run_tests.py` (choice and refusal rules, compose output, probe negative control),
+`tests/run_up_e2e.py` (missing backend refused; runc posing as gvisor caught by the probe; with
+`FORGE_E2E_ISOLATION=<backend>` the whole e2e under that backend), and `proof/validate.sh` with
+`FORGE_ISOLATION=<backend>` (the G2-G4 battery with every agent-side container under that runtime,
+plus probe checks). CI: `.github/workflows/isolation.yml` runs all three on ubuntu-latest and
+measures container start overhead (`proof/startup_bench.py`).
+
+Measured (FINITE TEST, GitHub ubuntu-latest, kernel 7.0.0-1020-azure, two green runs 45116333410 and
+45121073630; gVisor 20261102.0, Kata 4.3.1 with QEMU, Firecracker v1.17.0; values are run 1 / run 2):
+
+| | docker (runc) | gvisor (runsc) | microvm (kata) |
+| --- | --- | --- | --- |
+| validate.sh (G2-G4 battery) | 34 of 34 ok, 195 / 257 s | 35 of 35 ok, 242 / 280 s | 35 of 35 ok, 312 / 289 s |
+| `run_up_e2e.py` | 12 of 12 ok (both runs) | 12 of 12 ok (both) | 12 of 12 ok (both) |
+| agent `/proc/version` | the host kernel | `4.19.0-gvisor` | guest `6.18.56` |
+| container start, cold (first after a Docker restart and cache drop) | 226 / 300 ms | 940 / 371 ms (runc on that runner: 239 / 279 ms) | 2849 / 2306 ms (runc: 281 / 418 ms) |
+| container start, warm median of 10 | 147 / 179 ms | 159 / 188 ms (runc: 151 / 176 ms) | 2078 / 2137 ms (runc: 164 / 110 ms) |
+| `up` wall time, one run (answer n) | 10.0 / 13.8 s | 12.8 / 15.3 s | 17.0 / 15.9 s |
+
+The start numbers are `docker run --rm ... python3 -c pass` from the host; each backend ran on its own
+runner, so compare a backend with the runc row of the same runner: gVisor adds about 8-13 ms warm and
+90-700 ms cold; Kata adds about 1.9-2.0 s warm and 1.9-2.6 s cold. A minimal Firecracker v1.17.0 boot
+(Kata's guest kernel, busybox initramfs, 1 vCPU) on the same runner: 426-450 / 644-712 ms over 6 boots,
+process start to guest reboot. One Kata job hung for 29 minutes in the start benchmark right after a
+Docker restart (run 45117987521, cancelled; the step now has time limits). On this Mac (macOS 27,
+Apple silicon), `vz_boot_check.sh` (Alpine 6.12.115 guest): 1187 ms first boot, 293-380 ms the next 4.
+
 ## Faster gates, same proved verifier
 
 #97 started a new verifier subprocess for every gated call and re-verified the whole log
@@ -329,10 +425,12 @@ against other code) and `agent/protocol_regress.py` in `validate.sh` (domain con
 | "memo on gives the same verdict as memo off" | FINITE TEST (24 logs x 2) plus the purity argument above |
 | Everything else in `engine/`, `forge_airlock.py`, the canary, the egress proxy, the sync filter, the draft heuristics | NATIVE CHECK |
 | Every run and number in this README | FINITE TEST (one machine) |
-| Isolation | container tier: the box shares the host kernel (on macOS, Docker Desktop's Linux VM) |
+| Isolation (default `docker`) | container tier: the box shares the host kernel (on macOS, Docker Desktop's Linux VM) |
+| Isolation `gvisor` / `microvm` | NATIVE CHECK: the runtime choice and the in-box probe; the runtimes themselves are third-party code, not proved |
 | Hosts in `agent.egress_allow` | reachable: the box can send data there |
 | `--pass-env NAME` | the agent can read that value |
 | `llm`: spending caps | the verifier's verdict on the log is PROVED; estimate, settlement and proxy are NATIVE CHECK |
+| `require_human_approval: hardware` | NATIVE CHECK (hold, hand-off, host CLI); signature check by OpenSSH `ssh-keygen -Y verify`; FINITE TEST with software keys |
 
 ## Not tested
 
@@ -362,5 +460,14 @@ against other code) and `agent/protocol_regress.py` in `validate.sh` (domain con
 - Crash between the log append and the PENDING journal line (ORPHAN_SPENT path); a kill of the
   host or of Docker itself; `nosymfollow` on hosts with AppArmor or SELinux enforcing (Linux hosts
   were not tested; only Docker Desktop's VM).
+- Isolation backends: `microvm` and `gvisor` were run on GitHub ubuntu-latest only (no local Linux
+  host); Kata with Cloud Hypervisor or Firecracker as its hypervisor (only QEMU, the default); a
+  non-terminal `up` under Kata (the battery needed `run --interactive=false`; `up` was run under a
+  pseudo-terminal only); G5-G8 of `prove_release.sh` under a non-docker backend; an attack on gVisor or
+  Kata themselves. BLOCKED_NEEDS_HUMAN: `microvm` on macOS needs the agent's image as a VM root
+  file system, a virtio-fs share of the filtered workspace with the `nosymfollow` guarantee, and a
+  network path from the VM to the airlock that keeps the agent network internal; Docker Desktop
+  offers none of these, so it is a design decision (vfkit or Apple's `container` tool, which
+  installs with admin rights), not a missing package. Only the VM boot itself is tested.
 - Everything else listed under "Not tested" in the #97 README still applies, except the symlink
   swap and the mid-call crash, which are now tested (FINITE TEST).
