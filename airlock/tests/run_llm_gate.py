@@ -29,8 +29,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.abspath(os.path.join(HERE, ".."))
-IMAGE = "llm-forge-airlock:" + secrets.token_hex(4)  # per run: a parallel run never loses its image to our rmi
-RUN = secrets.token_hex(3)  # every Docker object of this run is named llm-<RUN>-*; the cleanup check counts only those
+RUN = secrets.token_hex(3)  # every Docker name of this run carries it (parallel runs never collide)
+IMAGE = "llm-forge-airlock:" + RUN  # per run: a parallel run never loses its image to our rmi
 os.environ["FORGE_AIRLOCK_IMAGE"] = IMAGE
 sys.path.insert(0, PKG)
 sys.path.insert(0, os.path.join(PKG, "engine"))
@@ -96,10 +96,10 @@ def part1(tmp):
     json.dump(doc, open(ppath, "w"), indent=1)  # JSON is YAML
     pol = Policy(doc, resolve=False)
     stage = F.stage_repo(repo, os.path.join(run_dir, "source"))
-    tag = secrets.token_hex(3)
-    project, logs = f"llm-{RUN}-gate-{tag}", f"llm-{RUN}-gate-logs-{tag}"
+    tag = RUN + secrets.token_hex(2)
+    project, logs = f"llm-gate-{tag}", f"llm-gate-logs-{tag}"
     cdoc = F.compose_doc(pol, ppath, stage, run_dir, logs, IMAGE, ["LLM_KEY_SHA256", "LLM_KEY_LEN"], [],
-                         own_agent_image=True, llm_session=f"llm-{RUN}-gate-{tag}")
+                         own_agent_image=True, llm_session=f"llm-gate-{tag}")
     cdoc["services"]["fakeprov"] = {
         "image": IMAGE, "command": ["python3", "-I", "/forge/mocks/fake_provider.py", "9000"],
         "environment": [f"EXPECTED_KEY={KEY}"], "networks": ["outnet"],
@@ -258,7 +258,7 @@ def part1(tmp):
 
 # ---------------------------------------------------------------- part 2: forge up
 def part2(tmp):
-    fake = f"llm-{RUN}-fakeprov-up-{secrets.token_hex(3)}"
+    fake = f"llm-fakeprov-up-{RUN}{secrets.token_hex(2)}"
     r = sh(["docker", "run", "-d", "--name", fake, "-e", f"EXPECTED_KEY={KEY}", "-p", "127.0.0.1::9000", IMAGE,
             "python3", "-I", "/forge/mocks/fake_provider.py", "9000"])
     try:
@@ -267,7 +267,7 @@ def part2(tmp):
         make_repo(repo)
         json.dump(policy(f"http://host.docker.internal:{port}"), open(os.path.join(repo, "forge.yaml"), "w"), indent=1)
         env = dict(os.environ, LLM_TEST_KEY=KEY, LLM_KEY_SHA256=hashlib.sha256(KEY.encode()).hexdigest(),
-                   FORGE_AIRLOCK_PREFIX=f"llm-{RUN}-up", FORGE_AIRLOCK_IMAGE=IMAGE)
+                   FORGE_AIRLOCK_PREFIX=f"llm-up-{RUN}", FORGE_AIRLOCK_IMAGE=IMAGE)
         env.pop("ANTHROPIC_API_KEY", None)
         fa = [sys.executable, os.path.join(PKG, "forge_airlock.py")]
         t = time.time()
@@ -319,8 +319,8 @@ def real_smoke():
         print("real smoke: SKIPPED (ANTHROPIC_API_KEY is not set)")
         return 0
     tmp = tempfile.mkdtemp(prefix="llm-smoke-")
-    tag = secrets.token_hex(3)
-    project, logs = f"llm-{RUN}-smoke-{tag}", f"llm-{RUN}-smoke-logs-{tag}"
+    tag = RUN + secrets.token_hex(2)
+    project, logs = f"llm-smoke-{tag}", f"llm-smoke-logs-{tag}"
     try:
         repo, run_dir = os.path.join(tmp, "repo"), os.path.join(tmp, "run")
         make_repo(repo)
@@ -375,9 +375,10 @@ def main():
         part2(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-        left = sh(["sh", "-c", f"docker ps -aq --filter name=llm-{RUN}- | wc -l; docker volume ls -q | grep -c '^llm-{RUN}-'; "
-                               f"docker network ls -q --filter name=llm-{RUN}- | wc -l"]).stdout.split()
-        case(f"cleanup: llm-{RUN}-* containers/volumes/networks left: {'/'.join(left)}", left == ["0", "0", "0"], left)
+        left = sh(["sh", "-c", f"docker ps -a --filter name=llm- --format '{{{{.Names}}}}' | grep -c {RUN}; "
+                               f"docker volume ls -q | grep '^llm-' | grep -c {RUN}; "
+                               f"docker network ls --format '{{{{.Name}}}}' | grep '^llm-' | grep -c {RUN}"]).stdout.split()
+        case(f"cleanup: this run's ({RUN}) llm-* containers/volumes/networks left: {'/'.join(left)}", left == ["0", "0", "0"], left)
         sh(["docker", "rmi", IMAGE])
     print("timings (s): " + ", ".join(f"{k} {v}" for k, v in TIMES))
     print(f"llm gate: {sum(RESULTS)}/{len(RESULTS)} ok in {time.time() - T0:.1f} s")
