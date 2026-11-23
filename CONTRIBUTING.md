@@ -4,6 +4,8 @@
 
 - `cli/forge_check.py` — the checker (`check`, `build`, `approve`, `spec`). Python 3.8+, standard
   library only. Every verdict is decided here, for the mod and for CI.
+- `cli/js_wrapper.py` — writes the ES module of the `js` target at build time (exports, pinned bignumber.js,
+  helpers). Its output must stay deterministic: `build --check` compares it with a fresh build.
 - `hooks/register.ts` — the Claude Code mod: commands, status line, guard. It calls the checker; it must
   not decide a verdict itself.
 - `action.yml` — the GitHub Action. `examples/wallet-cap` — a complete small project.

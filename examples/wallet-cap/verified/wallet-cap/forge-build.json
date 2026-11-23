@@ -107,7 +107,9 @@
       "emit": "OK",
       "files": {
         "wallet_cap-js.dtr": "33e4925279473fa9ea977fae65f26c421556864e3c646b177bf3492fce5b6103",
-        "wallet_cap.js": "780c516c89af679d1d26c71e5ced82efa11dc8c350b35f845aecd40a356080f5"
+        "wallet_cap.d.mts": "2e5fe68b6829fa54e433fde9a653f8bc08c083be3503370f2eafc60dcc805851",
+        "wallet_cap.js": "780c516c89af679d1d26c71e5ced82efa11dc8c350b35f845aecd40a356080f5",
+        "wallet_cap.mjs": "341b35d568739b6bb222ed17780e693c46167d58d8c365c7ebe3a4ab73d4d967"
       },
       "fuzz": "PASSED",
       "fuzz_output_lines": 4585,

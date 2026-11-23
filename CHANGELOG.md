@@ -2,6 +2,37 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## Unreleased
+- New (`js` target): `build` also writes `<name>.mjs` and `<name>.d.mts` next to the emitted `<name>.js`: one ES
+  module with real exports, a private pinned copy of bignumber.js 9.3.1 (SHA-256 checked) and helpers
+  (`toDafnyString`/`fromDafnyString` with a bounded cache of frozen seqs, `toDafnyInt`/`fromDafnyInt`, seq and set
+  helpers). No `new Function`, no `eval`, no file reading, no npm install in the app (owner feedback #6: chronicle
+  needed a `new Function` loader, bignumber.js and string conversions on every call). The runtime's string literals
+  use the same cache. Code: `cli/js_wrapper.py`, two small hooks in `cli/forge_check.py`.
+- New (build): the js fuzz harness also runs through its own generated module under
+  `node --disallow-code-generation-from-strings` and must print the same output as the plain emitted script.
+- Upgrade: run `build` once; a committed js build without the module is `STALE_BUILD`.
+- `/forge:build-setup` tells Claude to import the module instead of writing a loader, with a template wrapper.
+- New (build): optional `"serviceTest": {"command": [...], "cwd": "."}` per check. `build` and `build --check` run
+  it with `FORGE_TRACE` set; the generated js module writes one line per process on its first call. Verdicts
+  `NOT_CALLED` (the command passed, no call traced) and `SERVICE_TEST_FAILED`; the number of calling processes is
+  recorded. Only the js module is traced (not the py target, not an app's own loader of the `.js` file).
+- Measured (one machine, Node 24.3.0, warm, medians of 5 passes, 3 runs): wallet `Spend` 2,000 x 10 calls: old
+  loader 6.34–6.42 ms, module 6.48–6.73 ms (no gain: ints use bignumber.js in both); a chronicle rule, 2,000 calls
+  with 10 limits each, on a copy of chronicle: old wrapper 62.6–81.9 ms, module 26.7–41.3 ms, 0 of 8,000 decisions
+  differ. Chronicle's test suite on the copy with gate.ts on the module: 228 pass, 1 skipped, 1 fail (a folder left
+  out of the copy), the same as with the old wrapper. Its `test/service.test.ts` as serviceTest: `NOT_CALLED` with
+  the old `new Function` wrapper (not traced), `BUILT` with 1 calling process on the module wrapper.
+- Tested: 62 cases (12 new): the module imports under `--disallow-code-generation-from-strings` and a copy that
+  calls `new Function` does not; the generator is deterministic and refuses `new Function`, `eval` and other
+  `require`s; same results as the old loader on 5,000 wallet fuzz inputs and the 4 decisions, and an edited module
+  disagrees; string/seq/set/int helpers equal the old loader with the cache on, off and at 16 entries, and a cache
+  that returns a wrong seq is caught; a hand edit of the module is `STALE_BUILD`; the build's harness-module check
+  fails on a different output; serviceTest `BUILT` / `NOT_CALLED` / `SERVICE_TEST_FAILED`.
+- Not tested: browsers and Cloudflare Workers themselves (only Node with code generation from strings forbidden);
+  Windows; `--unicode-char false` builds (the helpers then pass JS strings through, untested).
+- Later option, not built: Rust output compiled to WebAssembly.
+
 ## 0.12.2 — 2026-11-22
 - Fixed (fuzzer): different bugs that give the same wrong answer were reported as one. The fuzzer kept one example
   per kind of wrong answer and stopped at 5 per candidate, so on chronicle's original code three real fail-open bugs

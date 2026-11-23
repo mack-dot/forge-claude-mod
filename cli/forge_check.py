@@ -511,6 +511,10 @@ def fuzz_target(dafny, work, harness_rel, target, log):
             return 'FAILED', 'dafny translate js: exit %s\n%s' % (code, read_text(log)[-600:])
         env = dict(os.environ, NODE_PATH=modules)
         code = run_to_file(['node', os.path.splitext(harness_rel)[0] + '.js'], work, log, env)
+        if code == 0:  # the same harness through the generated ES module (js_wrapper.py) must print the same
+            err = js_module_check(work, harness_rel, read_text(log), log)
+            if err:
+                return 'FAILED', err
     else:
         code = run_to_file([dafny, 'run', '--no-verify', '--target:' + target] + extra + [harness_rel], work, log)
     text = read_text(log)
@@ -520,7 +524,24 @@ def fuzz_target(dafny, work, harness_rel, target, log):
     return 'PASSED', '\n'.join(lines)
 
 
-def emit_target(dafny, work, files, target, out_dir, name, log):
+def js_module_check(work, harness_rel, plain_output, log):
+    """Runs the harness as the generated ES module, with code generation from strings forbidden (no eval, no new
+    Function), and requires the output of the plain emitted script. Returns None or a reason."""
+    import js_wrapper
+    folder, base = os.path.split(os.path.join(work, os.path.splitext(harness_rel)[0]))
+    err = js_wrapper.write_module(folder, base)
+    if err:
+        return err
+    code = run_to_file(['node', '--disallow-code-generation-from-strings', os.path.join(folder, base + '.mjs')],
+                       work, log, dict(os.environ, NODE_PATH=''))
+    if code != 0:
+        return 'the generated ES module of the harness: exit %s\n%s' % (code, read_text(log)[-600:])
+    if read_text(log) != plain_output:
+        return 'the generated ES module of the harness printed other output than the emitted script'
+    return None
+
+
+def emit_target(dafny, work, files, target, out_dir, name, log, check=None):
     extra = TARGETS[target][1]
     cmd = [dafny, 'translate', target, '--no-verify', '--include-runtime'] + extra + \
           ['--output', os.path.join(out_dir, name)] + files
@@ -533,6 +554,9 @@ def emit_target(dafny, work, files, target, out_dir, name, log):
         with open(os.path.join(out_dir, name + '-go', 'go.mod'), 'w', encoding='utf-8') as f:
             f.write('// Written by forge: keeps this compiled proved code out of the surrounding Go module.\n'
                     'module forgeverified\n\ngo 1.21\n')
+    if target == 'js':  # one ES module with real exports next to the emitted script (cli/js_wrapper.py)
+        import js_wrapper
+        return js_wrapper.write_module(out_dir, name, check)
     return None
 
 
@@ -601,7 +625,7 @@ def build_one(root, cfg, c, dafny, check_only):
         for t in bd['targets']:
             entry = res['targets'].setdefault(t, {})
             err = emit_target(dafny, work, c['files'], t, os.path.join(fresh, t), name,
-                              os.path.join(tmp, 'emit-%s.log' % t))
+                              os.path.join(tmp, 'emit-%s.log' % t), c['name'])
             if err:
                 entry['emit'] = 'FAILED'
                 entry['emit_detail'] = err
@@ -630,7 +654,39 @@ def build_one(root, cfg, c, dafny, check_only):
                  % (u['file'], u['contains']))
     if not bd.get('usedBy'):
         res['notes'].append('no "usedBy": nothing checks that the app calls the built code')
+    # 4. does a service test of the app call the built code? (a live trace, js target)
+    if bd.get('serviceTest'):
+        service_test(root, c, res, fail)
     return res
+
+
+def service_test(root, c, res, fail):
+    """Runs the check's "serviceTest" command with FORGE_TRACE set. The generated js module writes one line per
+    process on its first call. SERVICE_TEST_FAILED if the command fails, NOT_CALLED if no call was traced."""
+    st = c['build']['serviceTest']
+    cmd = st.get('command') if isinstance(st, dict) else None
+    if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
+        fail('SERVICE_TEST_FAILED', '"serviceTest" needs "command": [program, args...]')
+        return
+    fd, trace = tempfile.mkstemp(prefix='forge-trace-')
+    os.close(fd)
+    try:
+        log = trace + '.log'
+        code = run_to_file(cmd, inside(root, st.get('cwd', '.')), log, dict(os.environ, FORGE_TRACE=trace))
+        calls = sum(1 for line in read_text(trace).split('\n') if line.split('\t')[0] == c['name'])
+        res['service_test'] = {'command': cmd, 'exit': code, 'calls': calls}
+        if code != 0:
+            fail('SERVICE_TEST_FAILED', 'serviceTest %s: exit %s\n%s' % (' '.join(cmd), 'timeout' if code is None
+                                                                       else code, read_text(log)[-400:]))
+        elif calls == 0:
+            fail('NOT_CALLED', 'serviceTest %s passed, but no process called the built code (the generated js '
+                 'module traces its first call; a loader that evaluates the .js file is not traced)' % ' '.join(cmd))
+        else:
+            res['notes'].append('serviceTest: %d process(es) called the built code' % calls)
+    finally:
+        for f in (trace, trace + '.log'):
+            if os.path.exists(f):
+                os.remove(f)
 
 
 def run_build(root, check_only):
