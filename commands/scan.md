@@ -22,4 +22,6 @@ Work quickly: list the files, search for decision words (limit, cap, allow, deny
 5. Write the same numbered table to `.forge/candidates.md` (create `.forge/` if needed), so the person can pick a row by number.
 6. End with exactly: "To protect one, type `/forge:add <number>` (for example `/forge:add 1`). Claude will read it back to you to confirm or reword. Nothing in your code changes until you approve." 
 
+Later, once a rule is proved, `/forge:bypass` lists code that goes around it (decides the same question without calling it).
+
 Focus, if the person gave one: $ARGUMENTS

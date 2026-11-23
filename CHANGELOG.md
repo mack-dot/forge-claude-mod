@@ -2,6 +2,25 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## Unreleased
+- Added: `forge_check.py bypass` finds code that goes around a proved rule: lines outside the rule's own files that
+  use the check's `"watchedFields"` (literal text or `/regex/`), with file:line, term, text and enclosing function.
+  Verdicts `BYPASS_CLEAR` (exit 0), `BYPASS_FOUND` (exit 1), `NO_SCOPE_TERMS` (exit 0, nothing searched). Places the
+  person reviewed are kept in `"watchedReviewed"` by the SHA-256 of the line, so an edited line is reported again.
+  `bypass --rule NAME --set-terms …` and `--record FILE:LINE --note …` write them (forge.json changes: approve again).
+- Added: `check` lists the unreviewed places under `"outside"` in its JSON and in one report line; verdicts unchanged.
+- Added: `/forge:bypass` (a conversation): proposes the watched fields from the approved spec and decision record,
+  explains each place, and asks per place: route it through the proved rule, it is fine (record why), or a new rule.
+  `/forge approve yes` prints the count; bare `/forge` offers `/forge:bypass` for a check without watched fields.
+- Changed: the example has `gift_card.py` (`can_send_gift` checks the cap itself, kept on purpose) and watched fields;
+  its six shipped legacy functions are recorded as reviewed. forge.json re-approved, INVARIANTS.md regenerated.
+- Measured: on a copy of the real app that motivated it, with `body.for` and `householdId`: 290 lines in 205 files,
+  0.3 s; the three places found by hand are among the 16 `body.for` lines.
+- Tested: 12 new cases (found; own files never reported; `check` lists it and stays VERIFIED; reviewed → clear;
+  edited line → found again; review of a non-hit refused; negative control with no other use → clear; no terms;
+  bad regex; git untracked/ignored/node_modules; a chronicle-shaped TS/Java/Go/Rust project). Not tested: the
+  `/forge:bypass` conversation and the register.ts wiring inside Claude Code.
+
 ## 0.12.2 — 2026-11-22
 - Fixed (fuzzer): different bugs that give the same wrong answer were reported as one. The fuzzer kept one example
   per kind of wrong answer and stopped at 5 per candidate, so on chronicle's original code three real fail-open bugs

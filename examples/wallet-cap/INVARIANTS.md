@@ -74,6 +74,7 @@ abstract module WalletSpec {
 - Bound to the spec by the exact first lines of `impl/Wallet.dfy`
 - Compiled to: py, js, go, rs, java (into `verified/wallet-cap/`; compiled code is a NATIVE CHECK)
 - Used by: `app.py`
+- Code outside the rule is searched (`bypass`) for: `/spent\s*\+\s*amount[^;{\n]*<=?\s*(\w+\.)?cap\b/`; 6 place(s) reviewed as fine
 - Fuzzed against the shipped code (py): `legacy_wallet.py`, `app.py`
 - Fuzzed against the shipped code (js): `legacy_wallet.ts`
 - Fuzzed against the shipped code (go): `legacygo/legacy.go`

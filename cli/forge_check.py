@@ -11,6 +11,8 @@ Usage:
   forge_check.py mutate  [--root DIR] [--json] [--max N]
   forge_check.py diff    [--root DIR] [--json] [--inputs N] [--budget-ms MS] [--seed S]
   forge_check.py invariants [--root DIR] [--check]   (INVARIANTS.md: every approved rule in plain words)
+  forge_check.py bypass  [--root DIR] [--json]       (code outside the rule that reads its "watchedFields")
+  forge_check.py bypass  --rule NAME --set-terms TERM...  |  --rule NAME --record FILE:LINE --note TEXT
 
 `diff` compares code under test (the shipped app function, the wrapper around the proved code) with the
 compiled proved rule on fresh random inputs (see forge_diff.py for the line protocol). A disagreement is
@@ -1001,6 +1003,9 @@ def invariants_text(root):
             code.append('- Compiled to: %s (into `%s/%s/`; compiled code is a NATIVE CHECK)' % (', '.join(targets), c['build']['out'], name))
         for u in (c.get('build') or {}).get('usedBy', []):
             code.append('- Used by: `%s`' % u['file'])
+        if c.get('watchedFields'):
+            code.append('- Code outside the rule is searched (`bypass`) for: %s; %d place(s) reviewed as fine' % (
+                ', '.join('`%s`' % t for t in c['watchedFields']), len(c.get('watchedReviewed') or [])))
         for d in diff_entries(c):
             code.append('- Fuzzed against the shipped code (%s): %s' % (d['lang'], ', '.join('`%s`' % w for w in d.get('watch') or []) or d.get('adapter')))
         sec += ['### Code', ''] + code + ['']
@@ -1070,13 +1075,302 @@ def write_json(root, rel, value):
         f.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
 
 
+# ---------------------------------------------------------------------------- bypass
+# A proof covers the proved function only. Code elsewhere that decides the same question itself (reads the same
+# field, repeats the same comparison) goes AROUND the rule. `bypass` searches the project for the check's
+# "watchedFields" outside the rule's own files and reports every place the person has not reviewed yet.
+# LIMIT: a text search per line, not a data-flow analysis. It misses aliases (`const f = body.for`), dynamic
+# access (`body[key]`), terms split over lines, and code that decides the same question under other names.
+
+LAST_BYPASS = DIR + '/last-bypass.json'
+BYPASS_SKIP_DIRS = {'.git', 'node_modules', 'dist', 'build', 'verified', DIR, 'vendor', 'third_party',
+                    'third-party', '.venv', 'venv', '__pycache__', 'target', '.next', 'coverage', 'bower_components'}
+# Documentation does not run, and lockfiles are generated: neither can go around a rule.
+BYPASS_SKIP_EXT = ('.md', '.markdown', '.rst', '.txt', '.adoc', '.lock', '.map', '.svg', '.min.js')
+BYPASS_SKIP_NAMES = {'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'Cargo.lock', 'go.sum', 'poetry.lock'}
+BYPASS_MAX_BYTES = 1 << 20
+_BRACE_LANGS = ('.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.java', '.cs', '.kt', '.scala',
+                '.swift', '.php', '.c', '.cc', '.cpp', '.h', '.hpp', '.dart')
+_DEF_PATTERNS = [
+    re.compile(r'^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)'),                                        # Python
+    re.compile(r'\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)\s*[(<]'),                                 # JS/TS
+    re.compile(r'^\s*(?:export\s+)?(?:(?:const|let|var)\s+|(?:(?:public|private|protected|static|readonly)\s+)*)'
+               r'([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s*)?(?:function\b|(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*'
+               r'(?::[^=]+)?=>)'),                                                              # JS/TS arrow
+    re.compile(r'^\s*([A-Za-z_$][\w$]*)\s*:\s*(?:async\s*)?(?:function\b|(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>)'),
+    re.compile(r'^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)'),                                   # Go
+    re.compile(r'^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const|extern)\s+)*fn\s+([A-Za-z_]\w*)'),  # Rust
+]
+_NOT_NAMES = {'if', 'for', 'while', 'switch', 'catch', 'return', 'new', 'else', 'do', 'try', 'using', 'lock',
+              'foreach', 'await', 'typeof', 'sizeof', 'throw', 'yield', 'function', 'public', 'private',
+              'protected', 'internal', 'static', 'final', 'abstract', 'async', 'override', 'virtual', 'sealed',
+              'synchronized', 'readonly', 'export', 'default', 'super', 'this', 'when', 'match', 'fixed'}
+
+
+def _indent(line):
+    return len(line) - len(line.lstrip(' \t'))
+
+
+def _method_name(line, next_line):
+    """A method or function header in a brace language (Java, C#, a TS/JS class or object). A cheap heuristic."""
+    s = line.strip()
+    if not s or s.endswith(';') or s.startswith(('//', '*', '/*', '#', '@', '}', '=')):
+        return None
+    if not (s.endswith('{') or (s.endswith(')') or re.search(r'\)\s*:\s*[^=;{]+$', s)) and next_line.startswith('{')):
+        return None
+    if re.match(r'(?:if|for|while|switch|catch|return|else|new|await|throw|yield|do|try|using|lock|foreach)\b', s):
+        return None
+    for m in re.finditer(r'([A-Za-z_$][\w$]*)\s*(?:<[^()]*>)?\s*\(', s):
+        if m.group(1) in _NOT_NAMES:
+            continue
+        if '=' in s[:m.start()].replace('=>', '').replace('==', ''):
+            return None  # an assignment from a call, not a definition
+        return m.group(1)
+    return None
+
+
+def enclosing_function(lines, idx, path):
+    """Name of the function that holds lines[idx], or None: the nearest less-indented definition line above it."""
+    brace = path.endswith(_BRACE_LANGS)
+
+    def name_of(j):
+        for p in _DEF_PATTERNS:
+            m = p.search(lines[j])
+            if m and m.group(1) not in _NOT_NAMES:
+                return m.group(1)
+        if brace:
+            nxt = next((lines[k].strip() for k in range(j + 1, min(j + 4, len(lines))) if lines[k].strip()), '')
+            return _method_name(lines[j], nxt)
+        return None
+
+    own = name_of(idx)
+    if own:
+        return own
+    threshold = _indent(lines[idx])
+    for j in range(idx - 1, -1, -1):
+        text = lines[j]
+        if not text.strip() or re.match(r'^\s*[{}()\[\];,]*\s*$', text) or text.strip().startswith(('//', '#', '*', '/*')):
+            continue
+        ind = _indent(text)
+        if ind >= threshold:
+            continue
+        name = name_of(j)
+        if name:
+            return name
+        threshold = ind
+        if ind == 0:
+            return None
+    return None
+
+
+def _skipped_path(rel):
+    parts = rel.replace(os.sep, '/').split('/')
+    name = parts[-1]
+    return (any(p in BYPASS_SKIP_DIRS for p in parts[:-1]) or name in BYPASS_SKIP_NAMES
+            or name.lower().endswith(BYPASS_SKIP_EXT))
+
+
+def project_files(root):
+    """Text files of the project: git's tracked and untracked-but-not-ignored files, else a walk."""
+    r = subprocess.run(['git', '-C', root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'],
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if r.returncode == 0:
+        rels = sorted(set(p for p in r.stdout.decode('utf-8', 'replace').split('\0') if p))
+    else:
+        rels = []
+        for folder, dirs, files in os.walk(root):
+            dirs[:] = sorted(d for d in dirs if d not in BYPASS_SKIP_DIRS)
+            for name in sorted(files):
+                rels.append(os.path.relpath(os.path.join(folder, name), root).replace(os.sep, '/'))
+    out = []
+    for rel in rels:
+        path = os.path.join(root, rel)
+        if _skipped_path(rel) or not os.path.isfile(path) or os.path.getsize(path) > BYPASS_MAX_BYTES:
+            continue
+        with open(path, 'rb') as f:
+            if b'\0' in f.read(8192):
+                continue  # binary
+        out.append(rel)
+    return out
+
+
+def scope_matchers(c):
+    terms = c.get('watchedFields') or []
+    if not isinstance(terms, list) or not all(isinstance(t, str) and t.strip() for t in terms):
+        raise ConfigError('check %s: "watchedFields" must be a list of non-empty strings (a /regex/ between '
+                          'slashes, else literal text)' % c['name'])
+    out = []
+    for t in terms:
+        try:
+            is_re = len(t) > 2 and t.startswith('/') and t.endswith('/')
+            out.append((t, re.compile(t[1:-1] if is_re else re.escape(t))))
+        except re.error as e:
+            raise ConfigError('check %s: watched field %r is not a valid regular expression: %s' % (c['name'], t, e))
+    for e in c.get('watchedReviewed') or []:
+        if not (isinstance(e, dict) and isinstance(e.get('file'), str)
+                and re.match(r'^[0-9a-f]{64}$', str(e.get('line_text_sha256', '')))):
+            raise ConfigError('check %s: each "watchedReviewed" entry needs "file" and "line_text_sha256" (64 hex '
+                              'digits)' % c['name'])
+    return out
+
+
+def rule_own_files(root, cfg, c):
+    """Project-relative files (and folders, ending in /) that belong to the rule itself: never reported."""
+    files = set(contract_files(c)) | set(c['files'])
+    bd = c.get('build') or {}
+    if bd.get('fuzz'):
+        files.add(bd['fuzz'])
+    dfy = [f for f in files if f.endswith('.dfy') and os.path.isfile(inside(root, f))]
+    try:
+        files |= set(include_closure(root, dfy))
+    except ConfigError:
+        pass
+    for d in diff_entries(c):
+        files |= {d[k] for k in ('inputs', 'adapter') if d.get(k)}
+    files.add(os.path.relpath(invariants_path(root, cfg), os.path.realpath(root)))
+    norm = {os.path.normpath(f).replace(os.sep, '/') for f in files}
+    if bd.get('out'):
+        norm.add(os.path.normpath(bd['out']).replace(os.sep, '/') + '/')
+    return norm
+
+
+def line_sha(text):
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def run_bypass(root):
+    cfg = load_config(root)
+    approved = read_json(os.path.join(root, APPROVED), {}) or {}
+    out = {'at': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'), 'checks': {},
+           'no_terms': [], 'config_approved': approved.get(CONFIG) == sha256(os.path.join(root, CONFIG))}
+    with_terms = [c for c in cfg['checks'] if c.get('watchedFields')]
+    out['no_terms'] = [c['name'] for c in cfg['checks'] if not c.get('watchedFields')]
+    files = project_files(root) if with_terms else []
+    cache = {}
+    for c in with_terms:
+        matchers = scope_matchers(c)
+        own = rule_own_files(root, cfg, c)
+        watched = {w for d in diff_entries(c) for w in d.get('watch') or []}
+        reviewed = c.get('watchedReviewed') or []
+        res = out['checks'][c['name']] = {'terms': [t for t, _ in matchers], 'hits': [], 'reviewed': 0,
+                                          'outdated_reviews': [], 'files_searched': 0}
+        used = set()
+        for rel in files:
+            if rel in own or any(o.endswith('/') and rel.startswith(o) for o in own):
+                continue
+            res['files_searched'] += 1
+            if rel not in cache:
+                cache[rel] = read_text(os.path.join(root, rel)).replace('\r\n', '\n').split('\n')
+            lines = cache[rel]
+            for i, text in enumerate(lines):
+                terms = [t for t, rx in matchers if rx.search(text)]
+                if not terms:
+                    continue
+                h = line_sha(text)
+                match = [k for k, e in enumerate(reviewed) if e['file'] == rel and e['line_text_sha256'] == h]
+                if match:
+                    used.update(match)
+                    res['reviewed'] += 1
+                    continue
+                res['hits'].append({'file': rel, 'line': i + 1, 'terms': terms, 'text': text.strip()[:200],
+                                    'function': enclosing_function(lines, i, rel), 'line_text_sha256': h,
+                                    'fuzzed_file': rel in watched})
+        res['outdated_reviews'] = [e for k, e in enumerate(reviewed) if k not in used]
+    k = sum(len(r['hits']) for r in out['checks'].values())
+    out['unreviewed'] = k
+    out['verdict'] = 'NO_SCOPE_TERMS' if not with_terms else 'BYPASS_FOUND' if k else 'BYPASS_CLEAR'
+    return out
+
+
+def outside_of(root):
+    """For `check`: the unreviewed bypass hits per check (never changes a verdict). {} when nothing is watched."""
+    try:
+        out = run_bypass(root)
+    except ConfigError as e:
+        return {}, str(e)
+    return ({name: [{'file': h['file'], 'line': h['line'], 'function': h['function'], 'term': h['terms'][0],
+                     'text': h['text']} for h in r['hits']] for name, r in out['checks'].items()}, None)
+
+
+def outside_lines(outside):
+    lines = []
+    for name, hits in outside.items():
+        if hits:
+            terms = sorted({h['term'] for h in hits})
+            lines.append('%d place%s decide%s with %s outside %s: %s' % (
+                len(hits), '' if len(hits) == 1 else 's', 's' if len(hits) == 1 else '', ', '.join(terms), name,
+                ', '.join('%s:%d%s' % (h['file'], h['line'], ' ' + h['function'] if h['function'] else '') for h in hits[:12])
+                + (', … and %d more (forge_check.py bypass lists all)' % (len(hits) - 12) if len(hits) > 12 else '')))
+    if lines:
+        lines.append('(not reviewed yet; /forge:bypass explains each one. A proof covers only the proved rule.)')
+    return lines
+
+
+def bypass_report(out):
+    if out['verdict'] == 'NO_SCOPE_TERMS':
+        return ('forge bypass: NO_SCOPE_TERMS: no check has "watchedFields", so nothing was searched. /forge:bypass '
+                'proposes them from the approved rule.')
+    k = out['unreviewed']
+    lines = ['forge bypass %s %s: %d place%s outside the rule not reviewed yet' % (
+        '✗' if k else '✓', out['verdict'], k, '' if k == 1 else 's')]
+    for name, r in out['checks'].items():
+        lines.append('  %s: %d file(s) searched for %s; %d hit(s), %d reviewed as fine' % (
+            name, r['files_searched'], ', '.join(r['terms']), len(r['hits']) + r['reviewed'], r['reviewed']))
+        for h in r['hits']:
+            lines.append('    %s:%d  %s[%s]%s  %s' % (h['file'], h['line'], 'in %s  ' % h['function'] if h['function'] else '',
+                                                    ', '.join(h['terms']), '  (a fuzzed file)' if h['fuzzed_file'] else '',
+                                                    h['text']))
+        for e in r['outdated_reviews']:
+            lines.append('    outdated review (the line changed or is gone): %s: %s' % (e['file'], e.get('note', '')))
+    if out['no_terms']:
+        lines.append('  no "watchedFields" yet (not searched): ' + ', '.join(out['no_terms']))
+    if not out['config_approved']:
+        lines.append('  NOTE: %s is not approved as it is now, so these terms and reviews are not approved either '
+                     '(/forge approve).' % CONFIG)
+    if k:
+        lines.append('Each place may decide the same question as the proved rule without going through it. '
+                     '/forge:bypass explains each one and records your answer.')
+    lines.append('A text search (FINITE TEST of the listed terms): it misses aliases, dynamic field access and '
+                 'other names for the same question.')
+    return '\n'.join(lines)
+
+
+def _bypass_edit(root, rule, set_terms, record, note):
+    """Writes watchedFields or a watchedReviewed entry into forge.json (the person approves it again after)."""
+    cfg = load_config(root)
+    c = next((x for x in cfg['checks'] if x['name'] == rule), None)
+    if c is None:
+        raise ConfigError('no check named %s' % rule)
+    if set_terms is not None:
+        c['watchedFields'] = list(set_terms)
+        scope_matchers(c)
+        what = 'watchedFields of %s: %s' % (rule, ', '.join(set_terms))
+    else:
+        m = re.match(r'^(.+):(\d+)$', record or '')
+        if not m or not (note or '').strip():
+            raise ConfigError('--record needs FILE:LINE and --note "why this place is fine"')
+        rel, n = os.path.normpath(m.group(1)).replace(os.sep, '/'), int(m.group(2))
+        hit = next((h for h in run_bypass(root)['checks'].get(rule, {}).get('hits', [])
+                    if h['file'] == rel and h['line'] == n), None)
+        if hit is None:
+            raise ConfigError('%s:%d is not an unreviewed bypass hit of %s (run bypass first)' % (rel, n, rule))
+        c.setdefault('watchedReviewed', []).append({'file': rel, 'line_text_sha256': hit['line_text_sha256'],
+                                                   'note': note.strip()})
+        what = 'reviewed %s:%d for %s' % (rel, n, rule)
+    with open(os.path.join(root, CONFIG), 'w', encoding='utf-8') as f:
+        f.write(json.dumps(cfg, indent=2, ensure_ascii=False) + '\n')
+    return 'wrote %s (%s). %s changed: the person approves it again (/forge approve, then /forge approve yes).' % (
+        CONFIG, what, CONFIG)
+
+
 def main(argv=None):
     # Dafny's bundled .NET runtime stops on Linux systems without the ICU library (minimal images, many servers):
     # "Couldn't find a valid ICU package". Dafny does not need culture data, so run it without (found in a clean
     # python:3.12-slim container).
     os.environ.setdefault('DOTNET_SYSTEM_GLOBALIZATION_INVARIANT', '1')
     p = argparse.ArgumentParser(prog='forge_check.py', description='Forge proof check')
-    p.add_argument('command', choices=['check', 'approve', 'spec', 'build', 'setup', 'mutate', 'diff', 'invariants'])
+    p.add_argument('command', choices=['check', 'approve', 'spec', 'build', 'setup', 'mutate', 'diff', 'invariants',
+                                       'bypass'])
     p.add_argument('--root', default='.', help='project folder (default: current folder)')
     p.add_argument('--json', action='store_true', help='print the result as JSON')
     p.add_argument('--base', help='git ref; any change to forge.json, approved.json or a spec '
@@ -1090,9 +1384,24 @@ def main(argv=None):
     p.add_argument('--seed', type=int, help='diff: random seed (default: a fresh one each run)')
     p.add_argument('--check', action='store_true', help='build: write nothing; the emitted code on '
                                                         'disk must equal a fresh build')
+    p.add_argument('--rule', help='bypass: the check whose watchedFields or watchedReviewed to write')
+    p.add_argument('--set-terms', nargs='+', metavar='TERM', help='bypass --rule NAME: write its watchedFields')
+    p.add_argument('--record', metavar='FILE:LINE', help='bypass --rule NAME: record a hit as reviewed (with --note)')
+    p.add_argument('--note', help='bypass --record: why that place is fine, in the person\'s words')
     a = p.parse_args(argv)
     root = os.path.abspath(a.root)
     try:
+        if a.command == 'bypass':
+            if a.set_terms is not None or a.record:
+                if not a.rule:
+                    raise ConfigError('--set-terms and --record need --rule NAME')
+                print(_bypass_edit(root, a.rule, a.set_terms, a.record, a.note))
+                return 0
+            out = run_bypass(root)
+            if not a.no_write:
+                write_json(root, LAST_BYPASS, out)
+            print(json.dumps(out, indent=2, ensure_ascii=False) if a.json else bypass_report(out))
+            return 1 if out['verdict'] == 'BYPASS_FOUND' else 0
         if a.command == 'invariants':
             text = invariants_text(root)
             path = invariants_path(root, load_config(root))
@@ -1171,9 +1480,13 @@ def main(argv=None):
                 all(b['verdict'] == 'BUILT' for b in result['build'].values())
             return 0 if ok else 1
         result = run_checks(root, a.base)
+        result['outside'], outside_error = outside_of(root)
+        if outside_error:
+            result['outside_error'] = outside_error
         if not a.no_write:
             write_json(root, LAST, result)
-        print(json.dumps(result, indent=2, ensure_ascii=False) if a.json else report(result))
+        text = report(result) + ''.join('\n' + l for l in outside_lines(result['outside']))
+        print(json.dumps(result, indent=2, ensure_ascii=False) if a.json else text)
         return 0 if all(v == 'VERIFIED' for v in result['verdicts'].values()) else 1
     except ConfigError as e:
         if a.json:

@@ -75,6 +75,41 @@
             "legacyjava/LegacyWallet.java"
           ]
         }
+      ],
+      "watchedFields": [
+        "/spent\\s*\\+\\s*amount[^;{\\n]*<=?\\s*(\\w+\\.)?cap\\b/"
+      ],
+      "watchedReviewed": [
+        {
+          "file": "legacy_wallet.py",
+          "line_text_sha256": "9a9826c699da3bc005890658ae01de17f0e3d514158d2f4d6d6a74c4b57b270d",
+          "note": "The shipped function that the differential fuzz compares with the proved rule (kept with planted bugs); its bugs are reported by diff, not here."
+        },
+        {
+          "file": "legacy_wallet.rs",
+          "line_text_sha256": "64133f061c4a6bc9afee6dcdef19fb90dfe336e3daa2aae6db1c8e2df41451e4",
+          "note": "The shipped function that the differential fuzz compares with the proved rule (kept with planted bugs); its bugs are reported by diff, not here."
+        },
+        {
+          "file": "legacy_wallet.ts",
+          "line_text_sha256": "0311fa62d623eb5c0b9afefa98a9a05974b1e6d0811bb4ca82ee0d93fb730d07",
+          "note": "The shipped function that the differential fuzz compares with the proved rule (kept with planted bugs); its bugs are reported by diff, not here."
+        },
+        {
+          "file": "legacygo/legacy.go",
+          "line_text_sha256": "26e71f95a456edf87fe08191ad82548319d2f258e1d25a297f2e4fa3357b0559",
+          "note": "The shipped function that the differential fuzz compares with the proved rule (kept with planted bugs); its bugs are reported by diff, not here."
+        },
+        {
+          "file": "legacyjava/LegacyWallet.java",
+          "line_text_sha256": "8d422d1c021e6ecf29c78cf5a3a47959a6839cccd835c943b5b19fa35215dd5e",
+          "note": "The shipped function that the differential fuzz compares with the proved rule (kept with planted bugs); its bugs are reported by diff, not here."
+        },
+        {
+          "file": "legacycs/LegacyWallet.cs",
+          "line_text_sha256": "c41d5bfa6002c0ae002dde0c0277b7c6667d626600ea94ed5bd087c307b59f38",
+          "note": "The shipped C# copy of the function, kept with planted bugs; fuzzed against the proved rule in the all-targets CI job only."
+        }
       ]
     }
   ]
