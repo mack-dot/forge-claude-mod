@@ -537,6 +537,132 @@ def bypass_cases():
     return cases
 
 
+THREAD = os.path.join(HERE, '..', 'examples', 'thread-visibility')
+
+
+def thread_visibility_cases():
+    """The recursive-rule acid test on a synthetic thread (examples/thread-visibility): reply chains that may form
+    cycles, takedowns and flags that pass down the chain. Planted bugs in the shipped code and in the Dafny model must
+    each be caught (negative controls), and the correct code must stay quiet."""
+    cases = []
+    APP, IMPL_T, RULES = 'thread_app.py', 'impl/Thread.dfy', 'spec/ThreadRules.dfy'
+
+    def fresh(tmp):
+        root = os.path.join(tmp, 'p')
+        shutil.copytree(THREAD, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
+        return root
+
+    def run(root, *args):
+        r = subprocess.run([sys.executable, CLI] + list(args) + ['--root', root, '--json'], stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True)
+        try:
+            return r.returncode, json.loads(r.stdout)
+        except ValueError:
+            return r.returncode, {'error': (r.stderr or r.stdout)[-300:]}
+
+    def diff(root, *extra):
+        code, out = run(root, 'diff', '--seed', '7', *extra)
+        return code, (out.get('checks') or {}).get('thread-visibility', out)
+
+    def failing(res):
+        return sorted(f['id'].split()[0] for f in (res.get('decisions') or {}).get('failing', []))
+
+    def reapprove(root):
+        shown = json.loads(subprocess.run([sys.executable, CLI, 'spec', '--root', root, '--json'],
+                                          stdout=subprocess.PIPE, universal_newlines=True).stdout)['hashes']
+        subprocess.run([sys.executable, CLI, 'approve', '--root', root, '--hashes', json.dumps(shown)],
+                       stdout=subprocess.DEVNULL, check=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = fresh(tmp)
+        code, out = run(root, 'check')
+        cases.append(('thread: the recursive model with cycles is proved (VERIFIED)',
+                      code == 0 and list(out.get('verdicts', {}).values()) == ['VERIFIED']))
+        code, res = diff(root)
+        cases.append(('thread: negative control, the correct shipped code and wrapper agree (DIFF_OK, 9 of 9 decisions)',
+                      code == 0 and res.get('verdict') == 'DIFF_OK' and (res.get('decisions') or {}).get('agree') == 9
+                      and (res.get('messy') or {}).get('inputs', 0) > 50 and res.get('inputs', 0) >= 20))
+        planted = [
+            ('the walk forgets its visited set: a cycle hangs', "and ref not in seen:", ":", None),
+            ('a reply ignores its parent chain', "and all(fine(a) for a in ancestors(it))]", "]",
+             ['D1', 'D3', 'D4', 'D5']),
+            ('only the direct parent is looked at', "all(fine(a) for a in ancestors(it))", "all(fine(a) for a in ancestors(it)[:1])",
+             ['D3']),
+        ]
+        for name, old, new, want in planted:
+            shutil.copy(os.path.join(THREAD, APP), os.path.join(root, APP))
+            shutil.rmtree(os.path.join(root, '.forge', 'regressions'), ignore_errors=True)
+            edit(root, APP, old, new)
+            t0 = time.time()
+            code, res = diff(root)
+            if want is None:
+                ok = code == 1 and res.get('verdict') == 'DIFF_ERROR' and 'no answer within' in res.get('error', '') \
+                    and time.time() - t0 < 30
+            else:
+                ok = code == 1 and res.get('verdict') == 'DISAGREE' and failing(res) == want
+            cases.append(('thread: planted bug caught by the fuzz: %s' % name, ok))
+        shutil.copy(os.path.join(THREAD, APP), os.path.join(root, APP))
+
+    for name, old, new in [
+            ('the Dafny walk without its visited set does not verify (termination)',
+             'while ref != "" && ref !in seen && ref in m', 'while ref != "" && ref in m'),
+            ('a Dafny model that ignores the ancestors does not verify',
+             'ok := forall a :: a in up ==> a.id !in taken && !a.flagged && Member(v, a);', 'ok := true;')]:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = fresh(tmp)
+            edit(root, IMPL_T, old, new)
+            code, out = run(root, 'check')
+            cases.append(('thread: planted bug caught by the proof: %s' % name,
+                          code == 1 and list(out.get('verdicts', {}).values()) == ['FAILED']))
+
+    # The spec includes spec/ThreadRules.dfy. A change there changes what the approved spec means: before 0.13.1 it
+    # left the spec's own hash unchanged, and check said VERIFIED (the model calls the weakened predicate).
+    with tempfile.TemporaryDirectory() as tmp:
+        root = fresh(tmp)
+        edit(root, RULES, '(actor == target.author || actor == "mod")', '(actor == target.author || actor != "")')
+        code, out = run(root, 'check')
+        cases.append(('thread: a weakened rule in a file the spec includes is SPEC_CHANGED, not VERIFIED',
+                      code == 1 and list(out.get('verdicts', {}).values()) == ['SPEC_CHANGED']
+                      and 'ThreadRules.dfy' in json.dumps(out.get('detail'))))
+        reapprove(root)
+        code, res = diff(root, '--inputs', '0')
+        cases.append(('thread: after that change is approved, the old build is BUILD_STALE (an included file counts)',
+                      code == 1 and res.get('verdict') == 'BUILD_STALE'))
+
+    # A slow evaluator and a known failing decision must not use the whole end-of-turn budget: fresh inputs are
+    # still searched (before 0.13.1: shrinking the decision took ~300 calls, and nested inputs gave hundreds of messy
+    # pairs at 12 per input).
+    with tempfile.TemporaryDirectory() as tmp:
+        root = fresh(tmp)
+        edit(root, APP, "all(fine(a) for a in ancestors(it))", "all(fine(a) for a in ancestors(it)[:1])")
+        edit(root, APP, 'def visible_ids(viewer, items):\n', 'def visible_ids(viewer, items):\n    __import__("time").sleep(0.004)\n')
+        code, res = diff(root)
+        cases.append(('thread: a slow candidate with a failing decision still gets fresh inputs in the 1.5 s budget',
+                      failing(res) == ['D3'] and res.get('inputs', 0) >= 25 and (res.get('messy') or {}).get('inputs', 0) > 0))
+    return cases
+
+
+def next_rule_cases():
+    """The next-rule hint skips an out-of-scope item whose subject another check states as its own rule."""
+    sys.path.insert(0, os.path.join(HERE, '..', 'cli'))
+    import forge_check
+    cases = []
+    with tempfile.TemporaryDirectory() as root:
+        os.makedirs(os.path.join(root, 'd'))
+        open(os.path.join(root, 'app.py'), 'w').write('def load_thread(x):\n    return x\n')
+        open(os.path.join(root, 'd', 'a.md'), 'w').write(
+            '# a\n\n## The rule\n\nPosts.\n\n## Out of scope (not guaranteed)\n\n- `load_thread()` (app.py): assumed.\n')
+        cfg = {'checks': [{'name': 'a', 'spec': 's.dfy', 'files': ['i.dfy'], 'decisions': 'd/a.md'}]}
+        alone = forge_check.next_rules(root, cfg)
+        open(os.path.join(root, 'd', 'b.md'), 'w').write(
+            '# b\n\n## The rule\n\nCode: `load_thread()` in app.py.\n\n## Out of scope (not guaranteed)\n\n- nothing\n')
+        cfg['checks'].append({'name': 'b', 'spec': 's2.dfy', 'files': ['i2.dfy'], 'decisions': 'd/b.md'})
+        both = forge_check.next_rules(root, cfg)
+        cases.append(('next rule: negative control, an item that names code is suggested',
+                      (alone.get('a') or {}).get('code') == ['app.py']))
+        cases.append(('next rule: not suggested once another check states that code as its rule', 'a' not in both))
+    return cases
+
 def main():
     failed = 0
     # one shared Rust build folder for every test project (compiled dependencies are reused)
@@ -957,6 +1083,10 @@ def main():
             extra += 1
             print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
     for name, ok in bypass_cases():
+        failed += not ok
+        extra += 1
+        print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
+    for name, ok in thread_visibility_cases() + next_rule_cases():
         failed += not ok
         extra += 1
         print('%s  %s' % ('ok  ' if ok else 'FAIL', name))

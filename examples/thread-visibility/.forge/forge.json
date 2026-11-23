@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "thread-visibility",
+      "spec": "spec/ThreadSpec.dfy",
+      "files": [
+        "impl/Thread.dfy"
+      ],
+      "examples": "spec/ThreadExamples.dfy",
+      "decisions": ".forge/decisions/thread-visibility.md",
+      "binding": {
+        "file": "impl/Thread.dfy",
+        "prefix": "include \"../spec/ThreadSpec.dfy\"\n\nmodule Thread refines ThreadSpec {"
+      },
+      "build": {
+        "targets": [
+          "py"
+        ],
+        "out": "verified",
+        "fuzz": "fuzz/ThreadFuzz.dfy"
+      },
+      "diff": {
+        "lang": "py",
+        "inputs": "diff/thread_inputs.py",
+        "adapter": "diff/thread_diff.py",
+        "watch": [
+          "thread_app.py",
+          "thread_wrapper.py"
+        ]
+      }
+    }
+  ]
+}
