@@ -1,11 +1,13 @@
 import type { Register } from 'claude-code'
 
 // Forge in Claude Code.
-//   /forge          guided setup: shows the next step and asks Claude to walk you through it
-//   /forge check    proves every check in .forge/forge.json with Dafny; verdict in the status line
-//   /forge approve  you (not the agent) approve the current spec files
+//   /forge          the next step of the beginner loop: a read-only scan, your answers, your approval, then the
+//                   proof, the fuzz of your shipped code and INVARIANTS.md (automatic), with ONE suggested next step
+//   /forge approve  you (not the agent) read and approve the rule; `/forge approve yes` approves it and runs the rest
 //                   (/forge approve yes --hardware [--key KEY]: also sign the approval with a security key)
+//   /forge check    proves every check in .forge/forge.json with Dafny; verdict in the status line
 //   /forge status   prints the last verdicts
+//   /forge more     every other command (advanced tools stay out of the day-1 surface)
 // Files in the project: .forge/forge.json (checks), .forge/approved.json (your approvals),
 // .forge/last-check.json (last verdicts).
 // LIMIT: this is a feedback loop, not a security boundary. The guard blocks Claude's
@@ -29,7 +31,9 @@ type Check = {
   diff?: DiffEntry | DiffEntry[]
   watchedFields?: string[]
 }
-type LastDiff = { checks: Record<string, { verdict: string; inputs?: number; disagreements?: unknown[] }> }
+type LastDiff = {
+  checks: Record<string, { verdict: string; inputs?: number; disagreements?: unknown[]; decisions?: { failing?: unknown[] } }>
+}
 type Config = { version: 1; checks: Check[]; dafny?: string }
 type Verdict = string
 type LastCheck = {
@@ -73,17 +77,22 @@ async function sha256($: Api, path: string): Promise<string | undefined> {
   return r.exitCode === 0 ? r.stdout.split(/\s+/)[0] : undefined
 }
 
-// Finds Dafny the same way CI does, and downloads the pinned release once if none is found.
-async function findDafny($: Api, root: string, _configured?: string): Promise<string | undefined> {
+// Finds Dafny the same way CI does, and downloads the pinned release once if none is found. On failure, `error` is
+// the checker's one line that says exactly what to do (offline, no pinned download for this machine, ...).
+async function findDafny($: Api, root: string): Promise<{ path?: string; error?: string }> {
   const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'setup', '--root', root, '--json'], {
     cwd: root,
     timeoutMs: 600_000,
-  })
+  }).catch(() => ({ exitCode: -1, stdout: '', stderr: 'python3 did not start' }))
   try {
-    const out = JSON.parse(r.stdout) as { dafny: string | null; version: string | null }
-    return out.version && out.dafny ? out.dafny : undefined
+    const out = JSON.parse(r.stdout) as { dafny?: string | null; version?: string | null; error?: string | null }
+    if (out.version && out.dafny) return { path: out.dafny }
+    return { error: out.error ?? 'Dafny did not run.' }
   } catch {
-    return undefined
+    const why = (r.stderr || r.stdout || '').trim().split('\n').pop() ?? ''
+    return { error: /python3/.test(why) || r.exitCode === 127 || r.exitCode === -1
+      ? 'Forge needs Python 3.8 or newer as `python3`. Install it (https://www.python.org/downloads/), then type /forge again.'
+      : why.slice(0, 300) || `the checker stopped (exit ${r.exitCode}).` }
   }
 }
 
@@ -117,6 +126,7 @@ function scopeText(last: LastCheck | undefined, diff: LastDiff | undefined, cfg:
   return t
 }
 
+let lastStatus: string | undefined // the line last shown, so /forge can print it as the result
 async function refreshStatus($: Api) {
   const root: string = await $.session.root()
   const cfg = await readJson<Config>($, join(root, CONFIG))
@@ -128,7 +138,8 @@ async function refreshStatus($: Api) {
   if (isDiffing) text += ' · fuzzing…'
   else if (diff && Object.keys(diff.checks).length) {
     const rs = Object.values(diff.checks)
-    const bad = rs.reduce((n, r) => n + (r.disagreements?.length ?? 0), 0)
+    // A failing recorded answer is a disagreement too (CI counts both the same way: cli/forge_ci.py).
+    const bad = rs.reduce((n, r) => n + (r.disagreements?.length ?? 0) + (r.decisions?.failing?.length ?? 0), 0)
     const inputs = rs.reduce((n, r) => n + (r.inputs ?? 0), 0)
     const broken = rs.find(r => !['DIFF_OK', 'DISAGREE'].includes(r.verdict))
     text += broken
@@ -138,7 +149,8 @@ async function refreshStatus($: Api) {
         : ` · fuzzed ${inputs.toLocaleString('en-US')} cases, wrapper NOT proved`
   }
   if (!isChecking && !isDiffing) text += scopeText(last, diff, cfg)
-  $.ui.status(cfg || last ? text : undefined)
+  lastStatus = cfg || last ? text : undefined
+  $.ui.status(lastStatus)
 }
 
 // The verdicts come from cli/forge_check.py, the same checker CI runs.
@@ -167,7 +179,8 @@ async function runChecks($: Api): Promise<string> {
   isStale = false
   await refreshStatus($)
   const names = Object.keys(last.verdicts)
-  const lines = names.map(n => `${last.verdicts[n] === 'VERIFIED' ? '✓' : '✗'} ${n}: ${last.verdicts[n]}`)
+  const help = (last as { help?: Record<string, string> }).help ?? {}
+  const lines = names.map(n => `${last.verdicts[n] === 'VERIFIED' ? '✓' : '✗'} ${n}: ${last.verdicts[n]}${help[n] ? `\n  ${help[n]}` : ''}`)
   const fails = names.filter(n => last.verdicts[n] !== 'VERIFIED').map(n => `\n--- ${n} ---\n${last.detail[n]}`)
   return [summary(last, names.length), ...lines, ...fails].join('\n')
 }
@@ -215,7 +228,7 @@ async function showForApproval($: Api, lead: string, isFull = false): Promise<st
   const how = isSigned
     ? '/forge approve yes --hardware (signs with FORGE_APPROVAL_KEY or --key KEY; touch your security key when it blinks)'
     : '/forge approve yes'
-  return `${lead}\n\n${text}\n\nFor a plain-words explanation: /forge:explain\nTo approve exactly this: ${how}`
+  return `${lead}\n\n${text}\n\nTo approve exactly this, type: ${how}\nThen Forge proves the rule and tests your shipped code against it, by itself.\n(Questions first? /forge:explain explains every line in plain words. Only you can approve; Claude cannot.)`
 }
 
 async function approve($: Api, isConfirmed: boolean, isFull = false, hardware: string[] = []): Promise<string> {
@@ -239,7 +252,9 @@ async function approve($: Api, isConfirmed: boolean, isFull = false, hardware: s
       timeoutMs: 60_000,
     })
     const outside = await bypassCount($, root)
-    return `${r.stdout.trim()}\n${inv.exitCode === 0 ? inv.stdout.trim() + ' (commit it with the approval)' : 'INVARIANTS.md was not updated: ' + (inv.stderr || inv.stdout).trim()}${outside}\nNext: /forge check`
+    const head = `Approved by you:\n${r.stdout.trim()}\n${inv.exitCode === 0 ? inv.stdout.trim() + '; commit it with the approval' : 'INVARIANTS.md was not updated: ' + (inv.stderr || inv.stdout).trim()}${outside}`
+    // The rest of the beginner loop runs by itself: the proof, the build the fuzz needs, the fuzz, one status line.
+    return `${head}\n\n${await withFill($, await proveAndFuzz($))}`
   }
   // Something changed since it was shown: show the new version, so the next "yes" approves that.
   return showForApproval($, `${(r.stdout || r.stderr).trim()}\nHere is the current version:`)
@@ -262,42 +277,134 @@ async function bypassCount($: Api, root: string): Promise<string> {
 // /forge:add, /forge:explain, /forge:fix, /forge:build-setup, /forge:doctor). A command.run hook cannot
 // start a Claude turn: the host refuses $.prompt.submit there.
 
-// Bare /forge runs whatever comes next, so a beginner needs only this one command.
+// Bare /forge runs whatever comes next, so a beginner needs only this one command (and `/forge approve yes`).
+// The day-1 loop has four steps; everything else is under `/forge more`.
 async function wizard($: Api): Promise<{ text: string; fill?: string }> {
   const root: string = await $.session.root()
   const cfg = await readJson<Config>($, join(root, CONFIG))
-  const dafny = await findDafny($, root, cfg?.dafny)
+  const dafny = await findDafny($, root)
   const approved = (await readJson<Record<string, string>>($, join(root, APPROVED))) ?? {}
 
-  if (!dafny)
-    return { text: 'Forge: Dafny (the proof checker) could not be set up automatically.', fill: '/forge:doctor ' }
+  if (!dafny.path)
+    return { text: `Forge needs Dafny, the proof checker, and could not set it up:\n${dafny.error}\nThen type /forge again.` }
   if (!cfg?.checks?.length) {
     const hasCandidates = await $.fs.exists(join(root, '.forge/candidates.md'))
     return hasCandidates
-      ? { text: 'Forge: pick a rule from your last scan (.forge/candidates.md) by its number. Nothing in your code changes until you approve.', fill: '/forge:add ' }
-      : { text: 'Forge: first, a read-only scan of this codebase for the rules worth protecting (nothing is changed).', fill: '/forge:scan ' }
+      ? { text: 'Forge · step 2 of 4: pick a rule from the scan by its number (for example 1). Claude says it back to you and asks a few questions with real numbers. Nothing in your app changes.', fill: '/forge:add ' }
+      : { text: 'Forge · step 1 of 4: Claude reads your code and lists up to 5 rules worth protecting (it changes nothing).', fill: '/forge:scan ' }
   }
   const unapproved = cfg.checks.filter(c => [c.spec, c.examples, c.decisions].some(f => f && !approved[f]))
   if (unapproved.length || !approved[CONFIG])
-    return { text: await showForApproval($, 'Forge: read what you are about to approve (only you can):') }
-  // Approved: prove it, then fuzz the untouched shipped code against the proved rule (if set up).
+    return { text: await showForApproval($, 'Forge · step 3 of 4: read what you are about to approve.') }
+  return proveAndFuzz($)
+}
+
+// Step 4, after an approval (and on every bare /forge after that): prove the rule, build the compiled rule if the
+// fuzz needs it, fuzz the untouched shipped code against it, then one honest status line and at most ONE next step.
+async function proveAndFuzz($: Api): Promise<{ text: string; fill?: string }> {
+  const root: string = await $.session.root()
+  const cfg = await readJson<Config>($, join(root, CONFIG))
   const proof = await runChecks($)
   const last = await readJson<LastCheck>($, join(root, LAST))
   const bad = Object.entries(last?.verdicts ?? {}).filter(([, v]) => v !== 'VERIFIED')
-  if (bad.length) return { text: `${proof}\n\nForge: something is not verified. Claude can explain and propose a fix:`, fill: '/forge:fix ' }
-  const hasDiff = cfg.checks.some(c => c.diff)
-  const fuzz = hasDiff ? await runDiff($) : ''
-  const next = hasDiff
-    ? 'Every disagreement above is a bug in your shipped code or a gap in the rule. Your app files are unchanged.\nOptional next steps: switch your app to the proved code (ask Claude: "switch my app to the proved rule"); /forge add for another rule; /forge mutate; /forge invariants.'
-    : 'Next: fuzz your shipped code against the proved rule. Claude sets it up without changing your app files:'
-  // A proof covers the proved function only: offer the search for code that decides the same question elsewhere.
-  const unwatched = cfg.checks.filter(c => !c.watchedFields?.length).map(c => c.name)
-  const bypass = unwatched.length
-    ? `\nNot searched yet for code that goes around the rule (${unwatched.join(', ')}): /forge:bypass`
-    : ''
-  const fill = hasDiff ? (unwatched.length ? '/forge:bypass ' : undefined) : '/forge:fuzz '
-  return { text: `${proof}${fuzz ? '\n\n' + fuzz : ''}\n\n${next}${bypass}`, fill }
+  if (!last || bad.length)
+    return { text: `${proof}\n\nNext: Claude explains what failed and proposes a fix (press Enter).`, fill: '/forge:fix ' }
+  let fuzz = ''
+  if (cfg?.checks.some(c => c.diff)) {
+    fuzz = await runDiff($)
+    if (/: (BUILD_STALE|NO_BUILD):/.test(fuzz) && cfg.checks.some(c => c.build)) {
+      // The fuzz runs against the compiled proved rule: compile it (same checker as CI), then fuzz.
+      const built = await runBuild($, false)
+      const lines = built.split('\n')
+      const at = lines.findIndex(l => /^[✓✗] build /.test(l))
+      const buildPart = at >= 0 ? lines.slice(at).join('\n') : built
+      fuzz = /^✗ build /m.test(buildPart) ? buildPart : `${buildPart}\n\n${await runDiff($)}`
+    }
+  }
+  await refreshStatus($)
+  const status = lastStatus ?? ''
+  const next = await nextStep($, cfg, fuzz)
+  return { text: `${proof}${fuzz ? '\n\n' + fuzz : ''}\n\nStatus: ${status}\n${next.text}`, fill: next.fill }
 }
+
+// At most one suggestion, and only when it is relevant. Optional tools are offered once per session, in order.
+const offered = new Set<string>()
+async function nextStep($: Api, cfg: Config | undefined, fuzz: string): Promise<{ text: string; fill?: string }> {
+  const root: string = await $.session.root()
+  const diff = await readJson<LastDiff>($, join(root, '.forge/last-diff.json'))
+  const results = Object.values(diff?.checks ?? {})
+  if (/^✗ build /m.test(fuzz))
+    return { text: 'Next: the compiled rule could not be built (the reason and the fix are above). Then type /forge again.' }
+  if (results.some(r => r.verdict === 'DISAGREE'))
+    return {
+      text: 'Next: your shipped code disagrees with the proved rule (each one is a bug, or a gap in the rule). Press Enter: Claude explains each one. Your app files stay unchanged until you say yes.',
+      fill: 'Explain each disagreement in the last Forge fuzz report in plain words, and propose a fix. Do not change any file until I say yes.',
+    }
+  const broken = results.find(r => !['DIFF_OK', 'DISAGREE'].includes(r.verdict))
+  if (broken)
+    return broken.verdict === 'NO_BUILD'
+      ? { text: 'Next: the fuzz needs the rule compiled for your language. Press Enter: Claude sets it up.', fill: '/forge:build-setup ' }
+      : { text: `Next: the fuzz did not run (${broken.verdict}; the reason and the fix are above). Then type /forge again.` }
+  if (!cfg?.checks.some(c => c.diff))
+    return {
+      text: 'Next: test your shipped code against the proved rule on thousands of random inputs. Press Enter: Claude connects them (your app files stay unchanged).',
+      fill: '/forge:fuzz ',
+    }
+  const optional: Array<{ id: string; when: () => Promise<boolean>; text: string; fill: string }> = [
+    {
+      id: 'airlock',
+      when: async () => !(await $.fs.exists(join(root, 'forge.yaml'))),
+      text: 'Want to keep secret files away from the agent too? /forge airlock (optional; needs Docker)',
+      fill: '/forge:airlock ',
+    },
+    {
+      id: 'bypass',
+      when: async () => cfg?.checks.some(c => !c.watchedFields?.length) ?? false,
+      text: 'Want Forge to look for other code that decides the same thing without the proved rule? /forge:bypass (optional)',
+      fill: '/forge:bypass ',
+    },
+  ]
+  for (const o of optional) {
+    if (offered.has(o.id) || !(await o.when())) continue
+    offered.add(o.id)
+    return { text: o.text, fill: o.fill }
+  }
+  return { text: 'Done: every rule is proved and your shipped code agrees with it on every input tried. Other tools: /forge more' }
+}
+
+// Puts the one next step in the prompt box, so the person only presses Enter. A command.run hook cannot start a
+// Claude turn itself (the host refuses $.prompt.submit there).
+async function withFill($: Api, step: { text: string; fill?: string }): Promise<string> {
+  if (!step.fill) return step.text
+  const isFilled = await $.prompt.fill({ text: step.fill }).then(() => true, () => false)
+  const isCommand = step.fill.startsWith('/')
+  if (isFilled) return isCommand && !/Press Enter/.test(step.text) ? `${step.text}\nPress Enter to run ${step.fill.trim()}` : step.text
+  return `${step.text}\nType: ${step.fill.trim()}`
+}
+
+// `/forge more`: the basic commands first, then the advanced ones (kept out of the day-1 surface).
+const MORE = `Forge · the basics
+  /forge                   the next step: scan → your answers → approve → proof and fuzz
+  /forge approve           read what you would approve; /forge approve yes approves it
+  /forge check             prove the rules again
+  /forge status            the last result
+  /forge:explain           Claude explains an approved rule in plain words
+  /forge:fix               Claude explains a failed check and proposes a fix
+  /forge:doctor            Claude finds out why Forge does not run here
+
+More, when you need them
+  /forge:add <rule>        protect a rule in your own words, without a scan
+  /forge:fuzz              connect a rule to your shipped code, or a deep fuzz run (50,000 inputs)
+  /forge diff              a quick fuzz run now (it also runs by itself after an edit)
+  /forge build             compile the proved rule for your app (/forge:build-setup sets it up)
+  /forge:bypass            find code that decides the same thing without the proved rule
+  /forge invariants        write INVARIANTS.md: every approved rule in plain words
+  /forge spec              show the approved rules
+  /forge mutate            plant small bugs in the proved code: does the proof catch them?
+  /forge mutate app        plant small bugs in your shipped code: does the fuzz catch them?
+  /forge:airlock           run Claude in a box: secret files hidden, MCP tools capped (needs Docker)
+  /forge approve yes --hardware   sign the approval with a security key
+Details: README.md and docs/ in the plugin (CI Action: docs/ci.md; airlock: docs/airlock.md).`
 
 // Files whose change should trigger the differential fuzz: the proved code, the files that import it, the
 // adapters, and each diff entry's "watch" list (the shipped code under test).
@@ -370,8 +477,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'forge',
-      description: 'Forge proof gate: next step, or check / approve / build / spec / status (conversations: /forge:scan, /forge:add, /forge:bypass)',
-      argumentHint: '[check|approve|approve yes [--hardware]|build|diff|invariants|mutate|mutate app|spec|status]',
+      description: 'Forge: the next step to prove the rules your code must never break (/forge more lists every command)',
+      argumentHint: '[approve | approve yes | check | status | more]',
     })
     const r = await next(e)
     void refreshStatus($).catch(() => undefined)
@@ -381,6 +488,7 @@ export const register: Register = on => {
 
   on('command.run', { command: 'forge' }, async ($, e) => {
     const arg = e.args.trim().split(/\s+/)[0] ?? ''
+    if (arg === 'more' || arg === 'help') return { text: MORE }
     if (arg === 'check') return { text: await runChecks($) }
     if (arg === 'build') {
       const root: string = await $.session.root()
@@ -430,7 +538,7 @@ export const register: Register = on => {
     }
     // Steps where Claude talks with the person are Markdown commands (/forge:scan …). A command.run hook
     // cannot start a Claude turn, so put the right command in the prompt box: the person presses Enter.
-    const moved = ['scan', 'add', 'explain', 'fix', 'doctor', 'build-setup', 'fuzz', 'bypass']
+    const moved = ['scan', 'add', 'explain', 'fix', 'doctor', 'build-setup', 'fuzz', 'bypass', 'airlock']
     if (moved.includes(arg)) {
       const rest = e.args.trim().slice(arg.length).trim()
       const line = `/forge:${arg}${rest ? ' ' + rest : ' '}`
@@ -441,11 +549,7 @@ export const register: Register = on => {
       return { text: isFilled ? `Press Enter to run ${line.trim()}.` : `Type ${line.trim()} (Claude runs it as a conversation).` }
     }
     const step = await wizard($)
-    if (step.fill) {
-      const isFilled = await $.prompt.fill({ text: step.fill }).then(() => true, () => false)
-      return { text: `${step.text}\n${isFilled ? 'Press Enter to run ' : 'Type '}${step.fill.trim()}` }
-    }
-    return { text: step.text }
+    return { text: await withFill($, step) }
   })
 
   // End of a Claude turn: if an edit touched a file the differential fuzz covers, run it (well under two

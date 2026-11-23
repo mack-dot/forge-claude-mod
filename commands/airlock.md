@@ -1,5 +1,5 @@
 ---
-description: Forge airlock · draft forge.yaml for this repository (hidden paths, read-only paths, MCP tool rules), then tell you the one command that starts the box
+description: Forge (more) · airlock: run Claude in a Docker box with secret files hidden and MCP tools capped (drafts forge.yaml, then the one command that starts it)
 ---
 You help the person write `forge.yaml`, the policy of the Forge MCP airlock. The airlock runs a program (usually `claude`) in a Docker box: hidden paths are ABSENT from the box (also from git history), read-only paths cannot change, MCP tools are default deny, and gated tools are capped by a compiled verifier whose model is proved in Dafny. Use short sentences. The airlock CLI is `python3 "${CLAUDE_PLUGIN_ROOT}/airlock/forge_airlock.py"`.
 

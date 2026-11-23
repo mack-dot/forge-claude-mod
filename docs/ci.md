@@ -4,6 +4,69 @@ The GitHub Action (`action.yml`) runs `cli/forge_ci.py`, which calls `cli/forge_
 verdict comes from `forge_check.py`; `forge_ci.py` only chooses what to run, prints the normal reports (one log
 group per gate) and writes the job summary and a JSON report.
 
+[Back to the README](../README.md)
+
+## Quick start
+
+The same checker runs in CI with no configuration. Commit `.forge/` (and the emitted code and `INVARIANTS.md`), then
+copy [`examples/workflows/forge.yml`](../examples/workflows/forge.yml) to `.github/workflows/forge.yml`:
+
+```yaml
+name: forge
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+permissions:
+  contents: read
+jobs:
+  forge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mack-dot/forge-claude-mod@main   # pin the commit hash of the release you reviewed
+```
+
+With no inputs, the Action reads `.forge/forge.json`, installs Dafny and only the toolchains the checks use (Node
+for `js` or JS/TS app files, Go for `go`; Java, Rust and .NET come from the runner), and fails the job if any gate fails:
+
+| Gate | Runs | Fails with |
+| --- | --- | --- |
+| `check` | always | the proof (`FAILED`), `NOT_APPROVED`, `SPEC_CHANGED`, `CONFIG_CHANGED`, `BINDING_BROKEN`, `UNSOUND_CONSTRUCT` (included files too), `EXAMPLES_FAILED`, `UNAPPROVED_BYPASS` |
+| approvals against the base | when the event has a base: the pull request's base branch, the merge group's base commit, or the commit before a push | `APPROVAL_CHANGED` |
+| `build --check` | when a check has a `build` entry | `STALE_BUILD`, `APP_SYNTAX_ERROR`, `NOT_CALLED`, a target's fuzz |
+| `invariants --check` | always | `INVARIANTS_STALE` |
+| diff sweep | when a check has `diff` entries: 50,000 inputs per entry, a 600 s budget per entry, seed = the workflow run ID | `DISAGREE`, `THROWS_ON_MESSY_INPUT`, `TOOLCHAIN_MISSING` |
+
+The job summary has one status line per rule in the same scope-honest words as the Claude Code status line
+(`model PROVED · fuzzed 50,000 cases, wrapper NOT proved · 0 bypasses (6 allowed by a person) · build BUILT ·
+INVARIANTS.md current`), a table with each gate's verdicts, the bypass count, the fuzz counts and time, and the
+exact commands (base commit and seed included) that reproduce the run on your machine. A re-run of the same
+workflow run uses the same seed. On an event without a base (for example `workflow_dispatch`), the summary says
+`APPROVAL_CHANGED` was NOT checked.
+
+Inputs, all optional: `root`, `base` (a git ref, or `none` only for repositories whose approvals are test
+fixtures), `build`/`diff` (`auto` or `false`), `invariants` (`true` or `false`), `diff-inputs`,
+`diff-budget-seconds`, `diff-seed`, `dafny-version`, `node-version`, `go-version`. Outputs: `result` (`pass` or
+`fail`) and `report` (a JSON file with every verdict). More below.
+
+`APPROVAL_CHANGED` means a person with the right to approve specs must review the change. To make this a lock,
+require the job in branch protection and protect `.forge/` and `.github/` with CODEOWNERS.
+
+Without Claude Code, from a shell (Python 3.8+, Dafny on PATH or `FORGE_DAFNY`):
+
+```
+python3 cli/forge_check.py setup     # find Dafny or download the pinned release
+python3 cli/forge_check.py check     # exit 0 only if every check is VERIFIED
+python3 cli/forge_check.py spec      # show what an approval covers
+python3 cli/forge_check.py approve   # a person approves, at a terminal
+python3 cli/forge_check.py build     # compile, fuzz in every target, emit (see below)
+python3 cli/forge_check.py mutate    # plant small bugs, count how many the proof catches
+```
+
+`examples/wallet-cap` is a small complete project. `tests/run_tests.py` drives every verdict.
+
 ## Zero configuration
 
 Copy [`examples/workflows/forge.yml`](../examples/workflows/forge.yml) to `.github/workflows/forge.yml`. With no

@@ -1,5 +1,5 @@
 ---
-description: Forge · find code that goes around a proved rule (decides the same question without calling it)
+description: Forge (more) · find code that goes around a proved rule (decides the same question without calling it)
 argument-hint: "[check name]"
 ---
 Forge rule: the person approves a short spec once; after that, code may change only if Dafny proves it still meets the spec. Use short sentences. Never write `.forge/approved.json`, never run `forge_check.py approve`, and never type `/forge approve yes` for the person: approval is their act. The checker is `python3 "${CLAUDE_PLUGIN_ROOT}/cli/forge_check.py"`.

@@ -12,7 +12,7 @@
 #   G5 diff sync-back: allowed edits applied on y, none on n, hidden and read-only edits rejected,
 #      also their case / Unicode-normalization / trailing dot-space aliases and case-only renames
 #   G6 gated-call latency before (subprocess per call) and after (persistent verifier), >= 100 calls
-#   G7 README: the unified workflow and its honest labels
+#   G7 README: the unified workflow and its honest labels (the README, and the docs pages it links)
 #   G8 llm model proxy (fake provider, fake key): no key in the box, SSE, settlement = reported usage,
 #      error / cut stream / kill keep the reservation, 20 concurrent stop at the cap, restart, forge up
 # Label: FINITE TEST (one machine, the listed inputs). Container tier: shares the host kernel.
@@ -167,12 +167,21 @@ gate G8 "llm proxy: no key in box, SSE, settle, error/cut/kill keep, 20 parallel
 t=$SECONDS
 python3 - <<'PY'; g=$?
 import sys
-t = open("README.md", encoding="utf-8").read()
+import glob, re
+readme = open("README.md", encoding="utf-8").read()
+# The README itself (above the fold) keeps the honesty labels; the depth lives in docs/*.md, each linked from it.
+top = ["/forge", "/forge approve", "INVARIANTS.md", "PROVED", "NATIVE CHECK", "FINITE TEST", "not proved",
+       "end_to_end=false"]
+docs = sorted(glob.glob("docs/*.md"))
+unlinked = [d for d in docs if "](" + d + ")" not in readme]
+t = readme + "".join(open(d, encoding="utf-8").read() for d in docs)
 need = ["/forge:scan", "/forge:add", "/forge approve", "INVARIANTS.md", "/forge:airlock", "up -- claude",
         "shares the host kernel", "--pass-env", "CAN READ", "end_to_end=false", "PROVED", "NATIVE CHECK",
         "FINITE TEST", "memo", "not proved", "#91", "nosymfollow", "prove_release.sh", "Not tested"]
-miss = [x for x in need if x not in t]
-print("     README phrases missing: " + (", ".join(miss) if miss else "none") + f" ({len(need)} required)")
+miss = [x for x in need if x not in t] + ["README: " + x for x in top if x not in readme]
+miss += ["docs page not linked from the README: " + d for d in unlinked]
+print("     README + docs phrases missing: " + (", ".join(miss) if miss else "none")
+      + f" ({len(need)} required in the README or its docs, {len(top)} in the README itself, {len(docs)} docs pages linked)")
 sys.exit(1 if miss else 0)
 PY
 gate G7 "README: unified workflow and honest labels" $g $((SECONDS-t))

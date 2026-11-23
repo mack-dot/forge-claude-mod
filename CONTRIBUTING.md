@@ -21,7 +21,8 @@ claude plugin validate .            # needs Claude Code
 ## Rules
 
 1. A new way to pass that should fail is a soundness bug. Add a test case that fails first, then fix it.
-2. Every new verdict gets a test case and a row in the README table.
+2. Every new verdict gets a test case, a row in its table in `docs/`, and an entry in `VERDICT_HELP` in
+   `cli/forge_check.py` (one plain sentence and one next action; `tests/run_tests.py` fails without it).
 3. Do not round claims up. PROVED means Dafny proved a statement about the model. Compiled code is a
    NATIVE CHECK. A fuzz run is a FINITE TEST. Say what was not tested.
 4. No new runtime dependency for the checker.

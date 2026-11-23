@@ -1,5 +1,5 @@
 ---
-description: Forge · set up /forge build (languages, fuzz harness, wiring into your app)
+description: Forge (more) · compile the proved rule for your app's languages (sets up /forge build)
 argument-hint: "[languages, e.g. py js]"
 ---
 Forge rule: the person approves a short spec once; after that, code may change only if Dafny proves it still meets the spec. Use short sentences. Never write `.forge/approved.json`, never run `forge_check.py approve`, and never type `/forge approve yes` for the person: approval is their act. The checker is `python3 "${CLAUDE_PLUGIN_ROOT}/cli/forge_check.py"`.
@@ -39,4 +39,4 @@ Set up `build` for the checks in `.forge/forge.json` that have no "build" entry.
    Results: `P.fromDafnyString(x)`, `P.fromDafnyInt(x)` (a number when it is a safe integer, else a BigInt), `P.fromDafnySeq(x, each)`; a datatype value has `is_<Ctor>` and `dtor_<field>`, and is built with `P.<Type>.create_<Ctor>(...)`. A function that is not exported by its bare name (shown in a comment at the end of the module) is `P.<Module>.__default.<Name>`. Never keep a Dafny value from a call in a place that the app changes. Run the wrapper once under `node --disallow-code-generation-from-strings` to show it works where `new Function` is forbidden (strict CSP, Cloudflare Workers).
    Then add the wrapper to the check's fuzz as a messy candidate (`/forge fuzz`, step 4: `wrapper` and `failClosed` in the adapter, messy on). Do NOT change any existing app file and do NOT add "usedBy" yet: the app keeps running its own code, and the fuzz compares it with the proved rule. Say plainly that the wrapper is unproved. Tell the person the switch is a separate step they can ask for later ("switch my app to the proved rule"): then change the call site, add "usedBy", and they approve again.
    If the app has a test that goes through the app's own entry point to the wrapper (a service or end-to-end test), propose `"serviceTest": {"command": [...], "cwd": "."}` in the build entry, added together with "usedBy" at the switch: `build` then fails with NOT_CALLED when that test never calls the proved code.
-4. Tell the person that forge.json changed, so they run `/forge approve`, then `/forge approve yes`, then `/forge build`.
+4. Tell the person, as the one next step: "Type `/forge` to read the change and approve it (`/forge approve yes`); Forge then builds and tests by itself."

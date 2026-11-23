@@ -1,19 +1,21 @@
 ---
-description: Forge · turn one rule, in your own words, into an approved, proved spec
+description: Forge · step 2 · protect one rule: Claude asks plain questions with real numbers, then writes it down for your approval
 argument-hint: "[the rule in your own words]"
 ---
 Forge rule: the person approves a short spec once; after that, code may change only if Dafny proves it still meets the spec. Use short sentences. Never write `.forge/approved.json`, never run `forge_check.py approve`, and never type `/forge approve yes` for the person: approval is their act. The checker is `python3 "${CLAUDE_PLUGIN_ROOT}/cli/forge_check.py"`.
 
 You are running the Forge rule conversation in the current project. Follow these steps in order.
 
+TALK PLAINLY: the person may be new to Forge. With them, do not use the words Dafny, spec, module, refines, binding, ensures, requires, lemma, harness, adapter, evaluator or candidate, and do not show a verdict code without one plain sentence. Say "the rule", "the proof checker", "your answers" and "the test that runs your code against the proved rule". File names are fine when you list what you wrote.
+
 AUDIT MODE FIRST: until the person has approved and explicitly asked to switch their app over, do NOT modify any existing file of their application. Only create new files (spec/, impl/, diff/, fuzz/, .forge/) and edit .forge/forge.json. Their shipped code is what gets fuzzed against the proved rule; it must stay as it is.
 
 0. SET UP. Run `python3 "${CLAUDE_PLUGIN_ROOT}/cli/forge_check.py" setup --json` and note the "dafny" path (it downloads Dafny once if needed). If it fails, explain the error in two lines and stop.
 1. ASK FIRST. The person's rule, if they already gave it: "$ARGUMENTS". If it is a number, read that row of `.forge/candidates.md` (written by /forge:scan), say the rule back in one plain sentence, and ask the person to confirm it or reword it in their own words; use their final wording. If it is empty, ask them to say, in their own words, one rule their software must never break. Do not suggest a rule and do not read the code before they answer. Only if they say they do not know, look at the code and offer up to three candidates (or suggest `/forge:scan`), and let them pick or rephrase.
-2. CLASSIFY and say it plainly:
-   - pure rule (limits, prices, permissions, state changes, parsing): can be PROVED in a Dafny model;
-   - rule mixed with I/O (database, network, time): split the rule out; only the rule is proved;
-   - taste or judgment (UI, ML output, "good"): cannot be proved; say so, suggest tests or review, stop.
+2. CLASSIFY and say it plainly (in these words, not "pure" or "I/O"):
+   - a rule about values (limits, prices, permissions, state changes, parsing): "Forge can prove this rule";
+   - a rule mixed with a database, the network or the clock: "Forge proves the rule part; the database or network part stays tested only";
+   - taste or judgment (UI, ML output, "good"): "Forge cannot prove this"; suggest tests or review, stop.
 3. READ the code where this rule lives now (if any), so your questions use their real names and units.
 4. DEFAULTS. Show a short checklist of fail-closed defaults (money in whole integer units; invalid input rejected with no change; time passed in as a value; no floats) and ask them to confirm or change.
 5. QUESTIONS. Ask only real choices where both answers are sensible, always with concrete numbers ("cap $50.00, spent $40.00, spend $20.00: reject, or cut to $10.00?"). Use AskUserQuestion, at most 4 questions per call, as many rounds as needed. No fixed number of questions. Cover: zero and negative values, exactly at each limit, one past each limit, units, which error wins when two apply, repeats and retries, ordering in time. Stop only when nothing is open.
@@ -25,4 +27,4 @@ AUDIT MODE FIRST: until the person has approved and explicitly asked to switch t
 8. CHECK before handing over: run `<dafny> verify spec/<Name>Examples.dfy`; it must exit 0. If it fails, the spec contradicts or leaves open one of their answers: fix the spec, never the answer, unless the person changes their answer.
 9. IMPLEMENT the rule in `impl/<Name>.dfy`: it starts with `include "../spec/<Name>Spec.dfy"`, a blank line, then `module <Name> refines <Name>Spec {`. Never use assume, {:verify false}, {:axiom} or {:extern}. Add the check to `.forge/forge.json` (create it if missing): {"version": 1, "checks": [{"name": "<check-name>", "spec": "spec/<Name>Spec.dfy", "files": ["impl/<Name>.dfy"], "examples": "spec/<Name>Examples.dfy", "decisions": ".forge/decisions/<check-name>.md", "binding": {"file": "impl/<Name>.dfy", "prefix": "<the exact first lines up to and including the module line>"}}]}. Run `<dafny> verify impl/<Name>.dfy` until it passes.
 10. CONNECT TO THE REAL CODE (automatic fuzzing). If the rule already exists in the person's code (step 3), in any language, set up the differential fuzz right now, exactly as the `/forge:fuzz` command file describes (`${CLAUDE_PLUGIN_ROOT}/commands/fuzz.md`, its set-up part): a "build" entry for the code's language with a fuzz harness, `diff/<check>_inputs.py` with every decision from step 6c, the evaluator for the code's language, and the "diff" entry with "watch". Keep the code under test unchanged. Then the end-of-turn fuzz starts by itself once the person has approved and run `/forge build`. If the rule does not exist in code yet, skip this step.
-11. HAND OVER: list the decisions in a short table, name what is out of scope, and tell the person to type `/forge approve` to read everything, then `/forge approve yes`, then `/forge check`, then (if step 10 ran) `/forge build`; after that the fuzz runs by itself at the end of each turn that changes the watched code. Never approve for them.
+11. HAND OVER: list the answers in a short table (question | answer), name what is not covered, and end with exactly ONE next step: "Type `/forge` to read what you are about to approve. Then type `/forge approve yes`: Forge proves the rule, tests your shipped code against it, and writes INVARIANTS.md by itself." Never approve for them.
