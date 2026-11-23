@@ -13,6 +13,7 @@ Usage:
   forge_check.py invariants [--root DIR] [--check]   (INVARIANTS.md: every approved rule in plain words)
   forge_check.py bypass  [--root DIR] [--json]       (code outside the rule that reads its "watchedFields")
   forge_check.py bypass  --rule NAME --set-terms TERM...  |  --rule NAME --record FILE:LINE --note TEXT
+  forge_check.py bypass  --count [--rule NAME --set-terms TERM...]   (lines per term; with terms: a preview)
 
 `diff` compares code under test (the shipped app function, the wrapper around the proved code) with the
 compiled proved rule on fresh random inputs (see forge_diff.py for the line protocol). A disagreement is
@@ -1004,8 +1005,8 @@ def invariants_text(root):
         for u in (c.get('build') or {}).get('usedBy', []):
             code.append('- Used by: `%s`' % u['file'])
         if c.get('watchedFields'):
-            code.append('- Code outside the rule is searched (`bypass`) for: %s; %d place(s) reviewed as fine' % (
-                ', '.join('`%s`' % t for t in c['watchedFields']), len(c.get('watchedReviewed') or [])))
+            code.append('- Code outside the rule is searched (`bypass`) for: %s; %d allowed bypass(es), each approved here (UNAPPROVED_BYPASS for any other)' % (
+                ', '.join('`%s`' % t for t in c['watchedFields']), len(c.get('allowedBypasses') or [])))
         for d in diff_entries(c):
             code.append('- Fuzzed against the shipped code (%s): %s' % (d['lang'], ', '.join('`%s`' % w for w in d.get('watch') or []) or d.get('adapter')))
         sec += ['### Code', ''] + code + ['']
@@ -1209,10 +1210,10 @@ def scope_matchers(c):
             out.append((t, re.compile(t[1:-1] if is_re else re.escape(t))))
         except re.error as e:
             raise ConfigError('check %s: watched field %r is not a valid regular expression: %s' % (c['name'], t, e))
-    for e in c.get('watchedReviewed') or []:
+    for e in c.get('allowedBypasses') or []:
         if not (isinstance(e, dict) and isinstance(e.get('file'), str)
                 and re.match(r'^[0-9a-f]{64}$', str(e.get('line_text_sha256', '')))):
-            raise ConfigError('check %s: each "watchedReviewed" entry needs "file" and "line_text_sha256" (64 hex '
+            raise ConfigError('check %s: each "allowedBypasses" entry needs "file" and "line_text_sha256" (64 hex '
                               'digits)' % c['name'])
     return out
 
@@ -1241,8 +1242,12 @@ def line_sha(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 
-def run_bypass(root):
+def run_bypass(root, override=None):
+    """override: {check name: terms} to search with instead of its watchedFields (a preview; nothing is written)."""
     cfg = load_config(root)
+    for c in cfg['checks']:
+        if override and c['name'] in override:
+            c['watchedFields'] = list(override[c['name']])
     approved = read_json(os.path.join(root, APPROVED), {}) or {}
     out = {'at': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'), 'checks': {},
            'no_terms': [], 'config_approved': approved.get(CONFIG) == sha256(os.path.join(root, CONFIG))}
@@ -1254,7 +1259,7 @@ def run_bypass(root):
         matchers = scope_matchers(c)
         own = rule_own_files(root, cfg, c)
         watched = {w for d in diff_entries(c) for w in d.get('watch') or []}
-        reviewed = c.get('watchedReviewed') or []
+        reviewed = c.get('allowedBypasses') or []
         res = out['checks'][c['name']] = {'terms': [t for t, _ in matchers], 'hits': [], 'reviewed': 0,
                                           'outdated_reviews': [], 'files_searched': 0}
         used = set()
@@ -1289,7 +1294,7 @@ def outside_of(root):
     """For `check`: the unreviewed bypass hits per check (never changes a verdict). {} when nothing is watched."""
     try:
         out = run_bypass(root)
-    except Exception as e:  # the search must never break `check` or change its verdicts
+    except Exception as e:  # the search must never crash `check`; checks with watchedFields fail closed (main)
         return {}, '%s: %s' % (type(e).__name__, e)
     return ({name: [{'file': h['file'], 'line': h['line'], 'function': h['function'], 'term': h['terms'][0],
                      'text': h['text']} for h in r['hits']] for name, r in out['checks'].items()}, None)
@@ -1309,6 +1314,36 @@ def outside_lines(outside):
     return lines
 
 
+def bypass_counts(out):
+    """--count: unreviewed lines per term, to judge a term set before saving it."""
+    lines = []
+    for name, r in out['checks'].items():
+        lines.append('%s: %d unreviewed line(s) in %d file(s) (%d file(s) searched; %d allowed)' % (
+            name, len(r['hits']), len({h['file'] for h in r['hits']}), r['files_searched'], r['reviewed']))
+        for t in r['terms']:
+            hs = [h for h in r['hits'] if t in h['terms']]
+            lines.append('  %5d  %s  (%d file(s))' % (len(hs), t, len({h['file'] for h in hs})))
+    return '\n'.join(lines) or 'no check has "watchedFields" (pass --rule NAME --set-terms … --count to preview)'
+
+
+def gate_bypass(result, outside, error):
+    """The hard gate: a check whose proof passed, but with code outside the rule that uses its watchedFields and is
+    not in its approved allowedBypasses, is UNAPPROVED_BYPASS. A proof failure (or any other verdict) still wins."""
+    for name, verdict in list(result['verdicts'].items()):
+        if verdict != 'VERIFIED':
+            continue
+        hits = outside.get(name) or []
+        if hits:
+            result['verdicts'][name] = 'UNAPPROVED_BYPASS'
+            result['detail'][name] = ('the proof passed, but %d place(s) outside the rule use its watchedFields and are '
+                                      'not in its approved allowedBypasses:\n%s\nRoute each through the proved rule, '
+                                      'or allow it (/forge:bypass) and approve forge.json again.' % (
+                                          len(hits), '\n'.join('  %s:%d%s  [%s]  %s' % (
+                                              h['file'], h['line'], '  in ' + h['function'] if h['function'] else '',
+                                              h['term'], h['text']) for h in hits[:40])
+                                          + ('\n  … and %d more (forge_check.py bypass)' % (len(hits) - 40) if len(hits) > 40 else '')))
+
+
 def bypass_report(out):
     if out['verdict'] == 'NO_SCOPE_TERMS':
         return ('forge bypass: NO_SCOPE_TERMS: no check has "watchedFields", so nothing was searched. /forge:bypass '
@@ -1317,14 +1352,14 @@ def bypass_report(out):
     lines = ['forge bypass %s %s: %d place%s outside the rule not reviewed yet' % (
         '✗' if k else '✓', out['verdict'], k, '' if k == 1 else 's')]
     for name, r in out['checks'].items():
-        lines.append('  %s: %d file(s) searched for %s; %d hit(s), %d reviewed as fine' % (
+        lines.append('  %s: %d file(s) searched for %s; %d hit(s), %d allowed (allowedBypasses)' % (
             name, r['files_searched'], ', '.join(r['terms']), len(r['hits']) + r['reviewed'], r['reviewed']))
         for h in r['hits']:
             lines.append('    %s:%d  %s[%s]%s  %s' % (h['file'], h['line'], 'in %s  ' % h['function'] if h['function'] else '',
                                                     ', '.join(h['terms']), '  (a fuzzed file)' if h['fuzzed_file'] else '',
                                                     h['text']))
         for e in r['outdated_reviews']:
-            lines.append('    outdated review (the line changed or is gone): %s: %s' % (e['file'], e.get('note', '')))
+            lines.append('    outdated allowed bypass (the line changed or is gone): %s: %s' % (e['file'], e.get('note', '')))
     if out['no_terms']:
         lines.append('  no "watchedFields" yet (not searched): ' + ', '.join(out['no_terms']))
     if not out['config_approved']:
@@ -1339,7 +1374,7 @@ def bypass_report(out):
 
 
 def _bypass_edit(root, rule, set_terms, record, note):
-    """Writes watchedFields or a watchedReviewed entry into forge.json (the person approves it again after)."""
+    """Writes watchedFields or a allowedBypasses entry into forge.json (the person approves it again after)."""
     cfg = load_config(root)
     c = next((x for x in cfg['checks'] if x['name'] == rule), None)
     if c is None:
@@ -1357,7 +1392,7 @@ def _bypass_edit(root, rule, set_terms, record, note):
                     if h['file'] == rel and h['line'] == n), None)
         if hit is None:
             raise ConfigError('%s:%d is not an unreviewed bypass hit of %s (run bypass first)' % (rel, n, rule))
-        c.setdefault('watchedReviewed', []).append({'file': rel, 'line_text_sha256': hit['line_text_sha256'],
+        c.setdefault('allowedBypasses', []).append({'file': rel, 'line_text_sha256': hit['line_text_sha256'],
                                                    'note': note.strip()})
         what = 'reviewed %s:%d for %s' % (rel, n, rule)
     with open(os.path.join(root, CONFIG), 'w', encoding='utf-8') as f:
@@ -1387,14 +1422,23 @@ def main(argv=None):
     p.add_argument('--seed', type=int, help='diff: random seed (default: a fresh one each run)')
     p.add_argument('--check', action='store_true', help='build: write nothing; the emitted code on '
                                                         'disk must equal a fresh build')
-    p.add_argument('--rule', help='bypass: the check whose watchedFields or watchedReviewed to write')
+    p.add_argument('--rule', help='bypass: the check whose watchedFields or allowedBypasses to write')
     p.add_argument('--set-terms', nargs='+', metavar='TERM', help='bypass --rule NAME: write its watchedFields')
     p.add_argument('--record', metavar='FILE:LINE', help='bypass --rule NAME: record a hit as reviewed (with --note)')
+    p.add_argument('--count', action='store_true', help='bypass: only count unreviewed lines per term (with --rule '
+                                                        'NAME --set-terms …: a preview; nothing is written)')
     p.add_argument('--note', help='bypass --record: why that place is fine, in the person\'s words')
     a = p.parse_args(argv)
     root = os.path.abspath(a.root)
     try:
         if a.command == 'bypass':
+            if a.count:
+                if a.set_terms is not None and not a.rule:
+                    raise ConfigError('--set-terms needs --rule NAME')
+                out = run_bypass(root, {a.rule: a.set_terms} if a.set_terms is not None else None)
+                print(json.dumps({n: {'unreviewed': len(r['hits']), 'per_term': {t: sum(t in h['terms'] for h in r['hits'])
+                                  for t in r['terms']}} for n, r in out['checks'].items()}) if a.json else bypass_counts(out))
+                return 0
             if a.set_terms is not None or a.record:
                 if not a.rule:
                     raise ConfigError('--set-terms and --record need --rule NAME')
@@ -1486,6 +1530,11 @@ def main(argv=None):
         result['outside'], outside_error = outside_of(root)
         if outside_error:
             result['outside_error'] = outside_error
+            for c in load_config(root)['checks']:
+                if c.get('watchedFields') and result['verdicts'].get(c['name']) == 'VERIFIED':
+                    result['verdicts'][c['name']] = 'ERROR'
+                    result['detail'][c['name']] = 'the bypass search did not run: ' + outside_error
+        gate_bypass(result, result['outside'], outside_error)
         if not a.no_write:
             write_json(root, LAST, result)
         text = report(result) + ''.join('\n' + l for l in outside_lines(result['outside']))

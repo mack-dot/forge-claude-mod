@@ -203,9 +203,18 @@ def static_checks():
 
 
 def bypass_cases():
-    """`bypass`: code outside the rule that reads the rule's watched fields. The example plants one such place,
-    gift_card.py's can_send_gift, which decides "does the spend fit under the cap?" itself."""
+    """`bypass` and the UNAPPROVED_BYPASS gate of `check`: code outside the rule that reads the rule's watched fields.
+    Each case plants gift_card.py, whose can_send_gift decides "does the spend fit under the cap?" itself."""
     cases = []
+
+    def check(root):
+        r = subprocess.run([sys.executable, CLI, 'check', '--root', root, '--json', '--no-write'],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        try:
+            out = json.loads(r.stdout)
+        except ValueError:
+            out = {'verdicts': {'?': '<no result: %s>' % (r.stderr or r.stdout)[-200:]}, 'detail': {}}
+        return r.returncode, list(out['verdicts'].values()), out
 
     def run(root, *args):
         r = subprocess.run([sys.executable, CLI, 'bypass', '--root', root] + list(args),
@@ -218,9 +227,15 @@ def bypass_cases():
     def hits(out):
         return [h for r in out.get('checks', {}).values() for h in r['hits']]
 
-    def copy(tmp, name='p'):
+    def copy(tmp, name='p', plant=True):
         root = os.path.join(tmp, name)
         shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
+        if plant:
+            open(os.path.join(root, 'gift_card.py'), 'w').write(
+                '"""Gift sends, added later by another team, outside the proved rule."""\n\n\n'
+                'def can_send_gift(cap, spent, amount):\n'
+                '    if spent + amount <= cap:  # decides the cap itself: a negative gift passes\n'
+                '        return True\n    return False\n')
         return root
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -234,22 +249,17 @@ def bypass_cases():
         term = re.compile(json.load(open(os.path.join(root, CONFIG)))['checks'][0]['watchedFields'][0][1:-1])
         own = [IMPL, 'fuzz/WalletFuzz.dfy', 'INVARIANTS.md', 'verified/wallet-cap/py/wallet_cap-py/Wallet.py']
         occurs = [f for f in own if term.search(open(os.path.join(root, f), encoding='utf-8').read())]
-        reported = {h['file'] for h in found} | {e['file'] for e in json.load(open(os.path.join(root, CONFIG)))['checks'][0]['watchedReviewed']}
+        reported = {h['file'] for h in found} | {e['file'] for e in json.load(open(os.path.join(root, CONFIG)))['checks'][0]['allowedBypasses']}
         cases.append(('bypass: the rule\'s own files (impl, fuzz harness, emitted code, INVARIANTS.md) never appear',
                       len(occurs) >= 3 and not set(own) & reported
                       and not any(f.startswith(('spec/', 'impl/', 'fuzz/', 'diff/', 'verified/', '.forge/')) for f in reported)))
-        # check reports the same place, without changing a verdict
-        c = subprocess.run([sys.executable, CLI, 'check', '--root', root, '--json', '--no-write'],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-        try:
-            chk = json.loads(c.stdout)
-        except ValueError:
-            chk = {}
+        # the hard gate: the proof passes, but an unapproved reader exists
+        cexit, verdicts, chk = check(root)
         outside = (chk.get('outside') or {}).get('wallet-cap', [])
-        cases.append(('bypass: check lists it under "outside" and stays VERIFIED',
-                      c.returncode == 0 and list(chk.get('verdicts', {}).values()) == ['VERIFIED']
+        cases.append(('gate: a new unapproved reader gives UNAPPROVED_BYPASS (exit 1), listed under "outside"',
+                      cexit == 1 and verdicts == ['UNAPPROVED_BYPASS'] and 'gift_card.py:5' in chk['detail'].get('wallet-cap', '')
                       and [(h['file'], h['function'], h['line']) for h in outside] == [('gift_card.py', 'can_send_gift', found[0]['line'] if found else -1)]
-                      and set(outside[0]) == {'file', 'line', 'function', 'term', 'text'} if outside else False))
+                      and (set(outside[0]) == {'file', 'line', 'function', 'term', 'text'} if outside else False)))
         # the person says "it is fine": recorded with the line's hash; forge.json changed, so approval is needed again
         line = found[0]['line'] if found else 0
         r = subprocess.run([sys.executable, CLI, 'bypass', '--root', root, '--rule', 'wallet-cap', '--record',
@@ -257,14 +267,19 @@ def bypass_cases():
         code2, out2 = run(root, '--json')
         c2 = subprocess.run([sys.executable, CLI, 'check', '--root', root, '--json', '--no-write'],
                             stdout=subprocess.PIPE, universal_newlines=True)
-        cases.append(('bypass: after the person reviews it (scope recorded by hash), BYPASS_CLEAR; forge.json needs approval again',
+        cases.append(('bypass: after the person allows it (recorded by line hash), BYPASS_CLEAR; forge.json needs approval again',
                       r.returncode == 0 and code2 == 0 and out2.get('verdict') == 'BYPASS_CLEAR'
                       and list(json.loads(c2.stdout)['verdicts'].values()) == ['CONFIG_CHANGED']))
+        reapprove(root)
+        cexit, verdicts, _ = check(root)
+        cases.append(('gate: after it is in allowedBypasses and re-approved, VERIFIED (exit 0)', cexit == 0 and verdicts == ['VERIFIED']))
         edit(root, 'gift_card.py', 'if spent + amount <= cap:', 'if spent + amount <= cap and amount != 0:')
         code3, out3 = run(root, '--json')
-        cases.append(('bypass: editing the reviewed line makes it BYPASS_FOUND again (outdated review shown)',
+        cases.append(('bypass: editing the allowed line makes it BYPASS_FOUND again (outdated entry shown)',
                       code3 == 1 and [h['file'] for h in hits(out3)] == ['gift_card.py']
                       and len(out3['checks']['wallet-cap']['outdated_reviews']) == 1))
+        cexit, verdicts, _ = check(root)
+        cases.append(('gate: editing the allowed line gives UNAPPROVED_BYPASS again', cexit == 1 and verdicts == ['UNAPPROVED_BYPASS']))
         rbad = subprocess.run([sys.executable, CLI, 'bypass', '--root', root, '--rule', 'wallet-cap', '--record',
                                'app.py:1', '--note', 'x'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         cases.append(('bypass: a review of a line that is not a hit is refused', rbad.returncode == 2))
@@ -276,9 +291,22 @@ def bypass_cases():
         cases.append(('bypass: without git on PATH it walks the folder (still BYPASS_FOUND)',
                       rng.returncode == 1 and '"BYPASS_FOUND"' in rng.stdout))
 
-    with tempfile.TemporaryDirectory() as tmp:  # negative control: nothing outside the rule uses the field
+    with tempfile.TemporaryDirectory() as tmp:  # a proof failure still wins over the gate
         root = copy(tmp)
-        os.remove(os.path.join(root, 'gift_card.py'))
+        bug(root)
+        cexit, verdicts, _ = check(root)
+        cases.append(('gate: a failing proof with an unapproved reader is still FAILED', cexit == 1 and verdicts == ['FAILED']))
+    with tempfile.TemporaryDirectory() as tmp:  # negative control: no watchedFields, the same reader: behaviour unchanged
+        root = copy(tmp)
+        cfg = json.load(open(os.path.join(root, CONFIG)))
+        cfg['checks'][0].pop('watchedFields')
+        json.dump(cfg, open(os.path.join(root, CONFIG), 'w'))
+        reapprove(root)
+        cexit, verdicts, chk = check(root)
+        cases.append(('gate: negative control, no watchedFields: VERIFIED (exit 0), nothing outside',
+                      cexit == 0 and verdicts == ['VERIFIED'] and chk.get('outside') == {}))
+    with tempfile.TemporaryDirectory() as tmp:  # negative control: nothing outside the rule uses the field
+        root = copy(tmp, plant=False)
         code, out = run(root, '--json')
         cases.append(('bypass: negative control, no other use: BYPASS_CLEAR', code == 0 and out.get('verdict') == 'BYPASS_CLEAR'
                       and not hits(out) and out['checks']['wallet-cap']['reviewed'] == 6))
@@ -295,8 +323,7 @@ def bypass_cases():
 
     # git file list: untracked files count, ignored files and vendored folders do not
     with tempfile.TemporaryDirectory() as tmp:
-        root = copy(tmp)
-        os.remove(os.path.join(root, 'gift_card.py'))
+        root = copy(tmp, plant=False)
         open(os.path.join(root, '.gitignore'), 'w').write('ignored/\n')
         git(root, 'init', '-q')
         git(root, 'add', '.')
@@ -337,6 +364,16 @@ def bypass_cases():
         cases.append(('bypass: chronicle-shaped: mayRetract and forget (TS), retract in Java/Go/Rust named; docs skipped',
                       code == 1 and got == [('src/Svc.java', 'retract'), ('src/gate.ts', 'forget'), ('src/gate.ts', 'mayRetract'),
                                             ('src/svc.go', 'Retract'), ('src/svc.rs', 'retract')]))
+        before = open(os.path.join(root, CONFIG)).read()
+        rc = subprocess.run([sys.executable, CLI, 'bypass', '--root', root, '--count', '--json', '--rule', 'gate-mayread',
+                             '--set-terms', '.body.for', 'not_in_this_project'], stdout=subprocess.PIPE, universal_newlines=True)
+        try:
+            pv = json.loads(rc.stdout).get('gate-mayread', {})
+        except ValueError:
+            pv = {}
+        cases.append(('bypass: --count previews other terms (lines per term) and writes nothing',
+                      rc.returncode == 0 and pv.get('per_term') == {'.body.for': 5, 'not_in_this_project': 0}
+                      and open(os.path.join(root, CONFIG)).read() == before))
         txt = subprocess.run([sys.executable, CLI, 'check', '--root', root, '--no-write'], stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, universal_newlines=True).stdout
         cases.append(('bypass: check text names the places ("N places decide with body.for outside gate-mayread")',

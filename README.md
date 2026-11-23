@@ -192,23 +192,34 @@ emitted code, diff adapters and inputs, `INVARIANTS.md`), vendored and build fol
 `build`, `verified`, `vendor`, `target`, `.forge`, …), documentation and lockfiles. It reports every remaining line:
 file:line, the term, the line, and the enclosing function when a cheap heuristic finds it (Python, TS/JS, Go, Java,
 C#, Rust). `/forge:bypass` explains each place and asks you: route it through the proved rule, it is fine (record
-why), or make it part of a new rule. A "fine" answer is stored in the check's `"watchedReviewed"` list as
+why), or make it part of a new rule. A "fine" answer is stored in the check's `"allowedBypasses"` list as
 `{file, line_text_sha256, note}`, so an edited line shows up again. Both lists are in `forge.json`, so you approve them
-like any other change.
+like any other change: every allowed bypass is approved by a person.
+
+**A hard gate.** For a check with `watchedFields`, `check` gives `UNAPPROVED_BYPASS` (exit 1) when its proof passes
+but a line outside the rule matches and is not in its approved `allowedBypasses`; the detail lists the lines. A failed
+proof (or any other verdict) still wins. A check without `watchedFields` behaves as before.
+
+**Specific terms.** Because it is a gate, a term must name the forms that decide, not every mention:
+`.body.for` (a property access), `/\\bhouseholdId\\s*(===|!==|==|!=)/` (a comparison), not a bare `householdId`.
+`bypass --count --rule NAME --set-terms TERM…` previews the number of lines per term and writes nothing.
 
 | Bypass verdict | Meaning | Exit |
 | --- | --- | --- |
 | `BYPASS_CLEAR` | No unreviewed line outside the rule uses its watched fields | 0 |
 | `BYPASS_FOUND` | At least one such line | 1 |
 | `NO_SCOPE_TERMS` | No check has `watchedFields`: nothing was searched (not a pass) | 0 |
+| `UNAPPROVED_BYPASS` (a `check` verdict) | The proof passed, but an unallowed line outside the rule matches | 1 |
 
-`check` runs the same search: the unreviewed places go under `"outside"` in its JSON and on one line of its report
-(`3 places decide with body.for outside gate-mayread: gate.ts:83 mayRetract, …`). They never change a verdict.
+`check` runs the same search: the unreviewed places also go under `"outside"` in its JSON and on one line of its
+report (`3 places decide with body.for outside gate-mayread: gate.ts:83 mayRetract, …`).
 `/forge approve yes` prints the count; bare `/forge` offers `/forge:bypass` for a check without watched fields.
 
-Measured on that app (a copy; `watchedFields` `body.for` and `householdId`): 290 unreviewed lines in 205 files in
-0.3 s, 16 of them for `body.for`, including the three found by hand (`gate.ts:83 mayRetract`, `companion.ts:186
-retract`, `companion.ts:224 forget`). `householdId` alone gives 274 lines: a common field name is a long review.
+Measured on that app (a copy, 205 files searched, about 0.3 s): the bare terms `body.for` and `householdId` match 290
+lines in 25 files (275 of them for `householdId`): too many for a gate. The specific terms `.body.for`,
+`/\\bhouseholdId\\s*(===|!==|==|!=)/` and `/(===|!==|==|!=)\\s*[\\w.]*\\bhouseholdId\\b/` match 19 lines in 10 files,
+and still name the three places found by hand (`gate.ts:83 mayRetract`, `companion.ts:186 retract`,
+`companion.ts:224 forget`).
 
 Limits: a text search per line, not a data-flow analysis (a FINITE TEST of the listed terms). It misses aliases
 (`const f = body.for`), dynamic access (`body[key]`), destructuring (`const { for: f } = body`), a term split over

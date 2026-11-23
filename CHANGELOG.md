@@ -6,20 +6,30 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
 - Added: `forge_check.py bypass` finds code that goes around a proved rule: lines outside the rule's own files that
   use the check's `"watchedFields"` (literal text or `/regex/`), with file:line, term, text and enclosing function.
   Verdicts `BYPASS_CLEAR` (exit 0), `BYPASS_FOUND` (exit 1), `NO_SCOPE_TERMS` (exit 0, nothing searched). Places the
-  person reviewed are kept in `"watchedReviewed"` by the SHA-256 of the line, so an edited line is reported again.
-  `bypass --rule NAME --set-terms …` and `--record FILE:LINE --note …` write them (forge.json changes: approve again).
-- Added: `check` lists the unreviewed places under `"outside"` in its JSON and in one report line; verdicts unchanged.
-- Added: `/forge:bypass` (a conversation): proposes the watched fields from the approved spec and decision record,
-  explains each place, and asks per place: route it through the proved rule, it is fine (record why), or a new rule.
-  `/forge approve yes` prints the count; bare `/forge` offers `/forge:bypass` for a check without watched fields.
-- Changed: the example has `gift_card.py` (`can_send_gift` checks the cap itself, kept on purpose) and watched fields;
-  its six shipped legacy functions are recorded as reviewed. forge.json re-approved, INVARIANTS.md regenerated.
-- Measured: on a copy of the real app that motivated it, with `body.for` and `householdId`: 290 lines in 205 files,
-  0.3 s; the three places found by hand are among the 16 `body.for` lines.
-- Tested: 13 new cases (found; no git on PATH → the walk is used (found in CI: `check` crashed in a container without git); own files never reported; `check` lists it and stays VERIFIED; reviewed → clear;
-  edited line → found again; review of a non-hit refused; negative control with no other use → clear; no terms;
-  bad regex; git untracked/ignored/node_modules; a chronicle-shaped TS/Java/Go/Rust project). Not tested: the
-  `/forge:bypass` conversation and the register.ts wiring inside Claude Code.
+  person allows are kept in `"allowedBypasses"` (in forge.json, so a person approves each) by the SHA-256 of the line,
+  so an edited line is reported again. `bypass --rule NAME --set-terms …` and `--record FILE:LINE --note …` write
+  them; `bypass --count [--rule NAME --set-terms …]` previews lines per term and writes nothing.
+- Added: a hard gate in `check`: a check with `"watchedFields"` whose proof passes is `UNAPPROVED_BYPASS` (exit 1)
+  while an unallowed line outside the rule matches; the detail lists the lines. A failed proof still wins; a check
+  without `"watchedFields"` behaves as before. The lines also go under `"outside"` in the JSON and on one report line.
+  If the search itself fails, a check with `"watchedFields"` is `ERROR` (fail closed).
+- Added: `/forge:bypass` (a conversation): proposes SPECIFIC watched fields (property access, comparisons) from the
+  approved spec and decision record, shows the measured count per term before saving, explains each place, and
+  asks per place: route it through the proved rule, it is fine (record why), or a new rule. `/forge approve yes`
+  prints the count; bare `/forge` offers `/forge:bypass` for a check without watched fields.
+- Changed: the example has watched fields; its six shipped legacy functions are allowed bypasses (they are the code
+  the fuzz compares). forge.json re-approved, INVARIANTS.md regenerated. The planted second spender
+  (`gift_card.py`, `can_send_gift`) lives in the tests, so the example stays VERIFIED under the gate.
+- Fixed (found in CI): `check` crashed where git is not installed; the search now walks the folder.
+- Measured: on a copy of the real app that motivated it (205 files searched, about 0.3 s): bare `body.for` and
+  `householdId` match 290 lines in 25 files; the specific set `.body.for`, `/\bhouseholdId\s*(===|!==|==|!=)/`,
+  `/(===|!==|==|!=)\s*[\w.]*\bhouseholdId\b/` matches 19 lines in 10 files and still names the three places found
+  by hand (`gate.ts:83 mayRetract`, `companion.ts:186 retract`, `companion.ts:224 forget`).
+- Tested: 18 new cases (found; own files never reported; UNAPPROVED_BYPASS for a new reader; allowed and re-approved
+  → VERIFIED; edited allowed line → UNAPPROVED_BYPASS again; a failed proof still FAILED; negative control without
+  watchedFields → VERIFIED; no other use → clear; no terms; bad regex; review of a non-hit refused; no git on PATH;
+  git untracked/ignored/node_modules; `--count` preview; a chronicle-shaped TS/Java/Go/Rust project). Not tested:
+  the `/forge:bypass` conversation and the register.ts wiring inside Claude Code.
 
 ## 0.12.2 — 2026-11-22
 - Fixed (fuzzer): different bugs that give the same wrong answer were reported as one. The fuzzer kept one example

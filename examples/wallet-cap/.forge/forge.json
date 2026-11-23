@@ -79,7 +79,7 @@
       "watchedFields": [
         "/spent\\s*\\+\\s*amount[^;{\\n]*<=?\\s*(\\w+\\.)?cap\\b/"
       ],
-      "watchedReviewed": [
+      "allowedBypasses": [
         {
           "file": "legacy_wallet.py",
           "line_text_sha256": "9a9826c699da3bc005890658ae01de17f0e3d514158d2f4d6d6a74c4b57b270d",
