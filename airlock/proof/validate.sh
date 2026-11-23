@@ -12,7 +12,9 @@ cd "$(dirname "$0")"
 # F7: one token for the canary endpoints of this run (airlock + canary only)
 export FORGE_CANARY_TOKEN="${FORGE_CANARY_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_hex(24))')}"
 # Per-run names: two runs on one Docker host must not share containers, volumes or the image.
+OWN_RUN=0; [ -n "${FORGEAIR_RUN:-}" ] || OWN_RUN=1  # an id we made ourselves: we remove its image at the end
 export FORGEAIR_RUN="${FORGEAIR_RUN:-r$(python3 -c 'import secrets; print(secrets.token_hex(3))')}"
+trap '[ "$OWN_RUN" = 1 ] && docker image rm "forge-airlock-proof:$FORGEAIR_RUN" >/dev/null 2>&1' EXIT
 OUT="${1:-results/latest}"
 mkdir -p "$OUT"
 : > "$OUT/summary.txt"
@@ -82,7 +84,7 @@ if [ "$ISO" = docker ]; then
 else
   rec "isolation: $ISO agent passes the probe (own kernel$([ "$ISO" = gvisor ] && echo ', gVisor in dmesg'))" "$rc" 0 $((SECONDS-t))
   t=$SECONDS
-  docker run --rm --runtime runc -e FORGE_HOST_KERNEL forge-airlock-proof:local sh -c "$PROBE true" >"$OUT/iso-probe-control.log" 2>&1
+  docker run --rm --runtime runc -e FORGE_HOST_KERNEL "forge-airlock-proof:$FORGEAIR_RUN" sh -c "$PROBE true" >"$OUT/iso-probe-control.log" 2>&1
   rec "isolation: negative control: the same probe in a runc container -> exit 87" $? 87 $((SECONDS-t))
 fi
 unset FORGE_HOST_KERNEL
@@ -91,7 +93,7 @@ dc --profile controls down -v --remove-orphans >/dev/null 2>&1
 for DOM in ${DOMAINS:-codebase visible quota concurrency crash}; do
   export FORGE_DOMAIN=$DOM FORGE_PHASE=1
   OVR="$OUT/compose.mounts.$DOM.yml"
-  docker run --rm -v "$PWD/policies:/p:ro" forge-airlock-proof:local \
+  docker run --rm -v "$PWD/policies:/p:ro" "forge-airlock-proof:$FORGEAIR_RUN" \
     python3 -I /forge/airlock/render_mounts.py "/p/$DOM.yaml" >"$OVR"
   echo "== domain $DOM (forge.yaml = policies/$DOM.yaml)"
   dc --profile controls down -v --remove-orphans >/dev/null 2>&1

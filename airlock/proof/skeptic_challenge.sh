@@ -8,11 +8,13 @@ cd "$(dirname "$0")"
 export FORGE_CANARY_TOKEN="${FORGE_CANARY_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_hex(24))')}"
 export FORGE_DOMAIN=skeptic FORGE_PHASE=1
 # Per-run names: two runs on one Docker host must not share containers, volumes or the image.
+OWN_RUN=0; [ -n "${FORGEAIR_RUN:-}" ] || OWN_RUN=1  # an id we made ourselves: we remove its image at the end
 export FORGEAIR_RUN="${FORGEAIR_RUN:-r$(python3 -c 'import secrets; print(secrets.token_hex(3))')}"
+trap '[ "$OWN_RUN" = 1 ] && docker image rm "forge-airlock-proof:$FORGEAIR_RUN" >/dev/null 2>&1' EXIT
 dc() { docker compose -p "forgeair-$FORGEAIR_RUN-skeptic" -f docker-compose.yml "$@"; }
 OVR="$(mktemp -t forge-skeptic-mounts.XXXXXX)"
 dc build -q || exit 2
-docker run --rm -v "$PWD/policies:/p:ro" forge-airlock-proof:local \
+docker run --rm -v "$PWD/policies:/p:ro" "forge-airlock-proof:$FORGEAIR_RUN" \
   python3 -I /forge/airlock/render_mounts.py /p/skeptic.yaml >"$OVR"
 dc down -v --remove-orphans >/dev/null 2>&1
 echo "starting airlock + mock upstream ..."
