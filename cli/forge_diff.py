@@ -26,6 +26,8 @@ proved rule, in any language, through a small line protocol:
       disagreement of kind THROWS_ON_MESSY_INPUT.
   Forge ships evaluators for JavaScript/TypeScript (cli/eval/node_eval.mjs) and Python (cli/eval/py_eval.py).
   Any other language (Go, Rust, Java, C#, ...) plugs in as a "cmd" entry: a program that speaks the protocol.
+  State machines (many events per case, with retries, replays, reordering and restarts) use the trace mode of the
+  same evaluators: see cli/forge_trace.py.
 
 This core does the rest: fresh seeds, the decisions, replay of saved cases, shrinking (the failure signature
 stays fixed, so a disagreement cannot slide into a different bug), one saved case per kind of failure, and a
@@ -257,6 +259,7 @@ class Evaluator:
         self.candidates = hello['candidates']
         self.messy = [n for n in hello.get('messy') or [] if n in self.candidates]
         self.has_undefined = hello.get('undefined') is True
+        self.trace_mode = hello.get('trace') is True  # the adapter exports machines (cli/forge_trace.py)
 
     def _stderr(self):
         try:

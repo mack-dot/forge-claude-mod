@@ -2,6 +2,22 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## Unreleased
+
+- New (diff): **stateful trace fuzz** (`cli/forge_trace.py`) for models of the form `Step(State, Event, now)`. A
+  `"trace"` block on a `js` or `py` diff entry gives seeded multi-event traces with the clock moving and injected
+  retries, replays, reorders and restarts (save, then load). Model and candidates run in lockstep; verdict and state
+  are compared after every step; a failing trace is shrunk by delta debugging (drop events, then simplify times and
+  fields) and printed with an `again:` command. Failing traces are saved and replay first.
+- New example `examples/subscription-machine` (Dafny model proved, py and js built) with a correct shipped step
+  function and four planted multi-event bugs.
+- Tested (`tests/run_tests.py`, 9 new cases): all four planted bugs caught and shrunk to 2, 4, 2 and 2 steps in JS and
+  Python; the correct code 0 disagreements over 50,000 traces per language; the repro command finds the same trace;
+  saved traces replay; negative controls (`max_len: 1` finds nothing; `restart: 0` hides the restart bug); an
+  unknown `trace` key is a configuration error.
+- Not tested: trace mode for the Go, Rust, Java and C# evaluators (not built); time going backwards
+  (`time_backwards`) has no test case.
+
 ## 0.13.0 — 2026-11-23
 
 One release with the owner's chronicle feedback and the airlock:

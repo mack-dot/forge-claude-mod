@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "name": "subscription-machine",
+      "spec": "spec/SubscriptionSpec.dfy",
+      "files": [
+        "impl/Subscription.dfy"
+      ],
+      "binding": {
+        "file": "impl/Subscription.dfy",
+        "prefix": "include \"../spec/SubscriptionSpec.dfy\"\n\nmodule Subscription refines SubscriptionSpec {"
+      },
+      "build": {
+        "targets": [
+          "py",
+          "js"
+        ],
+        "out": "verified",
+        "fuzz": "fuzz/SubscriptionFuzz.dfy"
+      },
+      "diff": [
+        {
+          "name": "js",
+          "lang": "js",
+          "inputs": "diff/subscription_events.py",
+          "adapter": "diff/subscription_trace.mjs",
+          "trace": {
+            "count": 2000,
+            "budget_ms": 10000,
+            "max_len": 10
+          },
+          "watch": [
+            "app/subscription.ts"
+          ]
+        },
+        {
+          "name": "py",
+          "lang": "py",
+          "inputs": "diff/subscription_events.py",
+          "adapter": "diff/subscription_trace.py",
+          "trace": {
+            "count": 2000,
+            "budget_ms": 10000,
+            "max_len": 10
+          },
+          "watch": [
+            "app/subscription.py"
+          ]
+        }
+      ]
+    }
+  ]
+}
