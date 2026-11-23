@@ -199,11 +199,12 @@ class Steer:
     # -- inputs
     def next(self, rng):
         for _ in range(2):
-            inp = self._next(rng)
+            inp, how = self._next(rng)
             key = forge_diff.canon(inp)
             if key not in self.made or self.mode == 'blind':
                 break
             self.counts['repeats_avoided'] += 1
+        self.counts[how] += 1  # the input actually used (a repeat that was tried again is not counted)
         if len(self.made) > 100000:
             self.made.clear()
         self.made.add(key)
@@ -211,17 +212,13 @@ class Steer:
 
     def _next(self, rng):
         if self.mode == 'blind':
-            self.counts['fresh'] += 1
-            return self.gen.generate(rng)
+            return self.gen.generate(rng), 'fresh'
         if self.mode == 'dict':  # no corpus: a fresh input with dictionary values put in
-            self.counts['mutated'] += 1
-            return self._mutate(self.gen.generate(rng), rng)
+            return self._mutate(self.gen.generate(rng), rng), 'mutated'
         if not self.corpus or rng.float() < FRESH:
-            self.counts['fresh'] += 1
-            return self.gen.generate(rng)
+            return self.gen.generate(rng), 'fresh'
         base = rng.pick(self.corpus[-8:]) if rng.float() < 0.5 else rng.pick(self.corpus)
-        self.counts['mutated'] += 1
-        return self._mutate(copy.deepcopy(base), rng)
+        return self._mutate(copy.deepcopy(base), rng), 'mutated'
 
     def _mutate(self, inp, rng):
         ls = _leaves(inp)
