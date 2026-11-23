@@ -3,8 +3,8 @@
 
 A check may name its governed decision in forge.json:
 
-  "callers": {"decision": "src/gate.ts:canShip",          the function the app calls for this question
-              "wrapper":  "src/gate-proved.ts:provedCanShip",  the function that calls the proved code (optional;
+  "callers": {"decision": "src/policy.ts:canShip",        the function the app calls for this question
+              "wrapper":  "src/policy-proved.ts:provedCanShip",  the function that calls the proved code (optional;
                                                                 default: the decision itself is the wrapper)
               "replaced": ["src/old.ts:legacyCanShip"]}        the old logic the proved rule replaces (optional)
   "allowedCallers": [{"file": ..., "line_text_sha256": ..., "note": ...}]   places a person reviewed and allowed
