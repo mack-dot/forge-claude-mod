@@ -11,6 +11,9 @@ Usage:
   forge_check.py mutate  [--root DIR] [--json] [--max N]
   forge_check.py diff    [--root DIR] [--json] [--inputs N] [--budget-ms MS] [--seed S]
   forge_check.py invariants [--root DIR] [--check]   (INVARIANTS.md: every approved rule in plain words)
+  forge_check.py bypass  [--root DIR] [--json]       (code outside the rule that reads its "watchedFields")
+  forge_check.py bypass  --rule NAME --set-terms TERM...  |  --rule NAME --record FILE:LINE --note TEXT
+  forge_check.py bypass  --count [--rule NAME --set-terms TERM...]   (lines per term; with terms: a preview)
 
 `diff` compares code under test (the shipped app function, the wrapper around the proved code) with the
 compiled proved rule on fresh random inputs (see forge_diff.py for the line protocol). A disagreement is
@@ -104,6 +107,36 @@ class ConfigError(Exception):
 def sha256(path):
     with open(path, 'rb') as f:
         return hashlib.sha256(f.read()).hexdigest()
+
+
+# Sections of a decision record that state nothing binding: editing them needs no new approval. Everything else
+# (the rule in the person's words, the confirmed defaults, the choices table) is hashed.
+NON_NORMATIVE = ('out of scope', 'notes', 'background', 'history')
+
+
+def normative_text(text):
+    keep, skip = [], False
+    for line in text.replace('\r\n', '\n').split('\n'):
+        m = re.match(r'#{2,6}\s+(.*)', line)
+        if m:
+            skip = m.group(1).strip().lower().startswith(NON_NORMATIVE)
+        if not skip:
+            keep.append(line.rstrip())
+    return '\n'.join(keep).strip() + '\n'
+
+
+def contract_hash(path):
+    """The hash an approval stores. A Markdown decision record is hashed without its non-normative sections
+    (Out of scope, Notes), so fixing a note does not need a new approval; every other file byte for byte."""
+    if path.endswith('.md'):
+        return 'n:' + hashlib.sha256(normative_text(read_text(path)).encode('utf-8')).hexdigest()
+    return sha256(path)
+
+
+def approved_matches(approved, rel, path):
+    """Approvals written before 0.13 hold the full-file hash of a decision record: accept both."""
+    h = approved.get(rel)
+    return h is not None and (h == contract_hash(path) or h == sha256(path))
 
 
 def read_json(path, default=None):
@@ -298,9 +331,17 @@ def include_closure(root, files):
 
 
 def changed_since(root, base, paths):
-    """Protected paths that differ from the git ref `base`. None if git cannot tell."""
+    """Protected paths that differ from the git ref `base`. None if git cannot tell. A decision record counts as
+    changed only if its normative part changed (see contract_hash)."""
     out = []
     for rel in paths:
+        if rel.endswith('.md') and os.path.isfile(inside(root, rel)):
+            old = subprocess.run(['git', '-C', root, 'show', '%s:%s' % (base, rel)], stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, universal_newlines=True)
+            if old.returncode == 0:
+                if normative_text(old.stdout) != normative_text(read_text(inside(root, rel))):
+                    out.append(rel)
+                continue
         r = subprocess.run(['git', '-C', root, 'diff', '--quiet', base, '--', rel],
                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         if r.returncode == 1:
@@ -351,7 +392,7 @@ def run_checks(root, base=None):
         if unapproved:
             put('NOT_APPROVED', '%s never approved. Read and approve.' % ', '.join(unapproved))
             continue
-        changed = [f for f in contract_files(c) if approved[f] != sha256(inside(root, f))]
+        changed = [f for f in contract_files(c) if not approved_matches(approved, f, inside(root, f))]
         if changed:
             put('SPEC_CHANGED', '%s changed after approval. Read the new version and approve it.'
                 % ', '.join(changed))
@@ -425,6 +466,8 @@ def run_checks(root, base=None):
         'at': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
         'verdicts': verdicts,
         'detail': detail,
+        'warnings': stale_records(root, cfg) + app_syntax_warnings(root, cfg),
+        'next_rule': next_rules(root, cfg),
     }
 
 
@@ -433,7 +476,7 @@ def summary(result):
     ok = sum(1 for x in v.values() if x == 'VERIFIED')
     bad = [(n, x) for n, x in v.items() if x != 'VERIFIED']
     if not bad:
-        return 'forge ✓ VERIFIED %d/%d' % (ok, len(v))
+        return 'forge ✓ VERIFIED %d/%d (model PROVED; wrappers and other app code NOT proved)' % (ok, len(v))
     return 'forge ✗ %s %s · %d/%d verified' % (bad[0][1], bad[0][0], ok, len(v))
 
 
@@ -444,6 +487,14 @@ def report(result):
     for name, verdict in result['verdicts'].items():
         if verdict != 'VERIFIED':
             lines.append('\n--- %s ---\n%s' % (name, result['detail'][name]))
+    lines += ['! ' + w for w in result.get('warnings', [])]
+    for name, n in (result.get('next_rule') or {}).items():
+        lines.append('next rule for %s: "%s" (%s) is assumed by this rule but not proved. /forge:add it to close '
+                     'the gap.' % (name, n['item'], ', '.join(n['code'])))
+    if result['verdicts'] and all(x == 'VERIFIED' for x in result['verdicts'].values()):
+        lines.append('VERIFIED covers: the Dafny model meets the approved spec. Not covered: Dafny\'s compilers (the '
+                     'build fuzzes them), the wrapper that turns app values into model values, and any app code that '
+                     'decides the same question without calling the model.')
     return '\n'.join(lines)
 
 
@@ -511,6 +562,10 @@ def fuzz_target(dafny, work, harness_rel, target, log):
             return 'FAILED', 'dafny translate js: exit %s\n%s' % (code, read_text(log)[-600:])
         env = dict(os.environ, NODE_PATH=modules)
         code = run_to_file(['node', os.path.splitext(harness_rel)[0] + '.js'], work, log, env)
+        if code == 0:  # the same harness through the generated ES module (js_wrapper.py) must print the same
+            err = js_module_check(work, harness_rel, read_text(log), log)
+            if err:
+                return 'FAILED', err
     else:
         code = run_to_file([dafny, 'run', '--no-verify', '--target:' + target] + extra + [harness_rel], work, log)
     text = read_text(log)
@@ -520,7 +575,24 @@ def fuzz_target(dafny, work, harness_rel, target, log):
     return 'PASSED', '\n'.join(lines)
 
 
-def emit_target(dafny, work, files, target, out_dir, name, log):
+def js_module_check(work, harness_rel, plain_output, log):
+    """Runs the harness as the generated ES module, with code generation from strings forbidden (no eval, no new
+    Function), and requires the output of the plain emitted script. Returns None or a reason."""
+    import js_wrapper
+    folder, base = os.path.split(os.path.join(work, os.path.splitext(harness_rel)[0]))
+    err = js_wrapper.write_module(folder, base)
+    if err:
+        return err
+    code = run_to_file(['node', '--disallow-code-generation-from-strings', os.path.join(folder, base + '.mjs')],
+                       work, log, dict(os.environ, NODE_PATH=''))
+    if code != 0:
+        return 'the generated ES module of the harness: exit %s\n%s' % (code, read_text(log)[-600:])
+    if read_text(log) != plain_output:
+        return 'the generated ES module of the harness printed other output than the emitted script'
+    return None
+
+
+def emit_target(dafny, work, files, target, out_dir, name, log, check=None):
     extra = TARGETS[target][1]
     cmd = [dafny, 'translate', target, '--no-verify', '--include-runtime'] + extra + \
           ['--output', os.path.join(out_dir, name)] + files
@@ -533,6 +605,9 @@ def emit_target(dafny, work, files, target, out_dir, name, log):
         with open(os.path.join(out_dir, name + '-go', 'go.mod'), 'w', encoding='utf-8') as f:
             f.write('// Written by forge: keeps this compiled proved code out of the surrounding Go module.\n'
                     'module forgeverified\n\ngo 1.21\n')
+    if target == 'js':  # one ES module with real exports next to the emitted script (cli/js_wrapper.py)
+        import js_wrapper
+        return js_wrapper.write_module(out_dir, name, check)
     return None
 
 
@@ -550,6 +625,83 @@ def tree_hashes(folder):
     return out
 
 
+def app_files(root, c):
+    """The app files a check touches: those that call the built code (usedBy), the code under test the diff
+    watches, and the diff adapters (the wrappers)."""
+    out = [u['file'] for u in (c.get('build') or {}).get('usedBy', [])]
+    for d in diff_entries(c):
+        out += list(d.get('watch') or []) + ([d['adapter']] if d.get('adapter') else [])
+    seen = []
+    for f in out:
+        if f not in seen and os.path.isfile(inside(root, f)):
+            seen.append(f)
+    return seen
+
+
+_JS_EXT = ('.ts', '.mts', '.cts', '.js', '.mjs', '.cjs')
+_IMPORT = re.compile(r'(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|^\s*import\s+)["\'](\.{1,2}/[^"\']+)["\']', re.M)
+
+
+def dependents(root, files, limit=2000):
+    """JS/TS files that import any of `files`, directly or through other files (relative imports only): a broken
+    file here can break the path to the proved code even though no check names it."""
+    tracked = [f for f in project_files(root) if f.endswith(_JS_EXT) and not f.startswith(('node_modules/',))]
+    rev = {}
+    for f in tracked[:limit]:
+        try:
+            text = read_text(os.path.join(root, f))
+        except OSError:
+            continue
+        for m in _IMPORT.finditer(text):
+            base = os.path.normpath(os.path.join(os.path.dirname(f), m.group(1)))
+            for cand in [base] + [base + e for e in _JS_EXT] + [os.path.join(base, 'index' + e) for e in _JS_EXT]:
+                if os.path.isfile(os.path.join(root, cand)):
+                    rev.setdefault(cand, set()).add(f)
+                    break
+    seen, todo = set(files), [os.path.normpath(f) for f in files]
+    while todo:
+        for g in rev.get(todo.pop(), ()):
+            if g not in seen:
+                seen.add(g)
+                todo.append(g)
+    return sorted(seen - set(files))
+
+
+def syntax_errors(root, files):
+    """A cheap sanity step, not a proof: does each file at least parse? Returns (errors, unchecked)."""
+    errors, unchecked = [], []
+    node = shutil.which('node')
+    js = [f for f in files if os.path.splitext(f)[1] in _JS_EXT]
+    if js and node:
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'eval', 'syntax_check.mjs')
+        r = subprocess.run([node, script] + [inside(root, f) for f in js], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
+        if r.returncode == 1 and r.stdout.strip() and not r.stdout.lstrip().startswith(('file:', 'node:')):
+            errors += [os.path.relpath(l.split(': ', 1)[0], root) + ': ' + l.split(': ', 1)[-1]
+                       for l in r.stdout.strip().split('\n') if l]
+        elif r.returncode != 0:  # 3: no TypeScript parser in this Node; anything else: the checker itself failed
+            unchecked += ['%s (this Node cannot parse TypeScript; Node 22.13 or later can)' % f for f in js]
+    for rel in files:
+        if os.path.splitext(rel)[1] in _JS_EXT and node:
+            continue
+        path = inside(root, rel)
+        ext = os.path.splitext(rel)[1]
+        if ext == '.py':
+            try:
+                compile(read_text(path), rel, 'exec')
+            except SyntaxError as e:
+                errors.append('%s:%s: %s' % (rel, e.lineno, e.msg))
+            continue
+        if ext == '.go' and shutil.which('gofmt'):
+            r = subprocess.run(['gofmt', '-e', '-l', path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               universal_newlines=True, timeout=120)
+            if r.returncode != 0:
+                errors.append('%s: %s' % (rel, r.stdout.strip().split('\n')[0].replace(path, rel)))
+            continue
+        unchecked.append(rel)
+    return errors, unchecked
+
+
 def build_one(root, cfg, c, dafny, check_only):
     bd = c['build']
     name = c['name'].replace('-', '_')
@@ -560,6 +712,27 @@ def build_one(root, cfg, c, dafny, check_only):
         if res['verdict'] == 'BUILT':
             res['verdict'] = verdict
         res['notes'].append(note)
+
+    # 0. sanity: the app files this check touches must at least parse (a missing brace is caught here, not in
+    # production). Optional "typecheck": a command run in the project folder, for example
+    # ["npx", "--no-install", "tsc", "--noEmit"].
+    touched = app_files(root, c)
+    errs, unchecked = syntax_errors(root, touched + dependents(root, touched))
+    if errs:
+        fail('APP_SYNTAX_ERROR', 'app file(s) do not parse: ' + '; '.join(errs[:5]))
+        return res
+    if unchecked:
+        res['notes'].append('not syntax-checked (no checker for this file type here): ' + ', '.join(unchecked))
+    if bd.get('typecheck'):
+        try:
+            r = subprocess.run(list(bd['typecheck']), cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               universal_newlines=True, timeout=600)
+            if r.returncode != 0:
+                fail('TYPECHECK_FAILED', '%s: exit %d\n%s' % (' '.join(bd['typecheck']), r.returncode, r.stdout[-800:]))
+                return res
+        except (OSError, subprocess.TimeoutExpired) as e:
+            fail('TYPECHECK_FAILED', '%s: %s' % (' '.join(bd['typecheck']), e))
+            return res
 
     with tempfile.TemporaryDirectory() as tmp:
         # 1. fuzz: one clean copy of the sources per target, so builds do not touch the project
@@ -601,7 +774,7 @@ def build_one(root, cfg, c, dafny, check_only):
         for t in bd['targets']:
             entry = res['targets'].setdefault(t, {})
             err = emit_target(dafny, work, c['files'], t, os.path.join(fresh, t), name,
-                              os.path.join(tmp, 'emit-%s.log' % t))
+                              os.path.join(tmp, 'emit-%s.log' % t), c['name'])
             if err:
                 entry['emit'] = 'FAILED'
                 entry['emit_detail'] = err
@@ -630,7 +803,39 @@ def build_one(root, cfg, c, dafny, check_only):
                  % (u['file'], u['contains']))
     if not bd.get('usedBy'):
         res['notes'].append('no "usedBy": nothing checks that the app calls the built code')
+    # 4. does a service test of the app call the built code? (a live trace, js target)
+    if bd.get('serviceTest'):
+        service_test(root, c, res, fail)
     return res
+
+
+def service_test(root, c, res, fail):
+    """Runs the check's "serviceTest" command with FORGE_TRACE set. The generated js module writes one line per
+    process on its first call. SERVICE_TEST_FAILED if the command fails, NOT_CALLED if no call was traced."""
+    st = c['build']['serviceTest']
+    cmd = st.get('command') if isinstance(st, dict) else None
+    if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
+        fail('SERVICE_TEST_FAILED', '"serviceTest" needs "command": [program, args...]')
+        return
+    fd, trace = tempfile.mkstemp(prefix='forge-trace-')
+    os.close(fd)
+    try:
+        log = trace + '.log'
+        code = run_to_file(cmd, inside(root, st.get('cwd', '.')), log, dict(os.environ, FORGE_TRACE=trace))
+        calls = sum(1 for line in read_text(trace).split('\n') if line.split('\t')[0] == c['name'])
+        res['service_test'] = {'command': cmd, 'exit': code, 'calls': calls}
+        if code != 0:
+            fail('SERVICE_TEST_FAILED', 'serviceTest %s: exit %s\n%s' % (' '.join(cmd), 'timeout' if code is None
+                                                                       else code, read_text(log)[-400:]))
+        elif calls == 0:
+            fail('NOT_CALLED', 'serviceTest %s passed, but no process called the built code (the generated js '
+                 'module traces its first call; a loader that evaluates the .js file is not traced)' % ' '.join(cmd))
+        else:
+            res['notes'].append('serviceTest: %d process(es) called the built code' % calls)
+    finally:
+        for f in (trace, trace + '.log'):
+            if os.path.exists(f):
+                os.remove(f)
 
 
 def run_build(root, check_only):
@@ -838,7 +1043,8 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None):
         else:
             cmd = list(df['run'])
         data = forge_diff.run_entry(cmd, root, env, inside(root, df['inputs']), s, n, ms,
-                                    os.path.join(root, REGRESSIONS, key.replace(':', '-')))
+                                    os.path.join(root, REGRESSIONS, key.replace(':', '-')),
+                                    messy=df.get('messy', True) is not False)
         res.update(data)
         if data.get('error') and 'Unknown file extension ".ts"' in data['error']:
             res['verdict'] = 'TOOLCHAIN_MISSING'
@@ -879,6 +1085,19 @@ def update_diff_stats(root, out):
     write_json(root, DIFF_STATS, stats)
 
 
+def messy_line(d):
+    """One line under a messy disagreement: which field was odd, and what kind of failure it is."""
+    m = d['messy']
+    what = ('THROWS_ON_MESSY_INPUT (%s): the wrapper crashed instead of failing closed' % d['got']['__throws__']
+            if d.get('kind') == 'THROWS_ON_MESSY_INPUT' else 'the wrapper answered differently from the fail-closed answer')
+    return '    messy field %s = %s: %s' % (m['field'], m['as'], what)
+
+
+def messy_summary(m):
+    return ('  messy inputs: %d sent to %s (%d field/kind pairs tried; %d not judged: no fail-closed answer and the '
+            'proved rule cannot take them)' % (m['inputs'], ', '.join(m['candidates']), m['pairs_tried'], m['not_judged']))
+
+
 def diff_report(out):
     if not out['checks']:
         return 'forge diff: no check has a "diff" entry yet (/forge fuzz sets one up; /forge add does it for code that already exists)'
@@ -900,6 +1119,8 @@ def diff_report(out):
                          'for %s, %d ms, seed %s' % (name, r['inputs'], r['out_of_domain'], r['replayed'],
                                                      ', '.join(r.get('candidates') or []), r['ms'], r['seed']))
             lines.append(dec_line)
+            if r.get('messy'):
+                lines.append(messy_summary(r['messy']))
             if st_line:
                 lines.append(st_line)
         elif v == 'DISAGREE':
@@ -913,11 +1134,16 @@ def diff_report(out):
             if len(groups) < len(r['disagreements']):
                 lines.append('  %d kind(s) of wrong answer; examples of different shape under each:' % len(groups))
             for d in sorted(r['disagreements'], key=lambda x: (x['candidate'], x.get('group', ''))):
-                lines.append('  %s%s: input %s → proved rule says %s, %s says %s  [%s]' % (
+                lines.append('  %s%s: input %s → %s %s, %s says %s  [%s]' % (
                     'NEW ' if d.get('new') else '', d['candidate'], json.dumps(d['input'], ensure_ascii=False)[:200],
+                    'expected (fail-closed or proved)' if d.get('messy') else 'proved rule says',
                     json.dumps(d['reference'], ensure_ascii=False)[:120], d['candidate'],
                     json.dumps(d['got'], ensure_ascii=False)[:120], d['file']))
+                if d.get('messy'):
+                    lines.append(messy_line(d))
             lines.append(dec_line)
+            if r.get('messy'):
+                lines.append(messy_summary(r['messy']))
             if st_line:
                 lines.append(st_line)
             lines.append('  Each one is a bug in that code, or a place where the spec says something other than '
@@ -962,7 +1188,7 @@ def invariants_text(root):
             p = inside(root, f)
             if not os.path.isfile(p):
                 state.append('%s missing' % f)
-            elif approved.get(f) != sha256(p):
+            elif not approved_matches(approved, f, p):
                 state.append('%s %s' % (f, 'changed since approval' if f in approved else 'not approved'))
         if approved.get(CONFIG) != sha256(os.path.join(root, CONFIG)):
             state.append('forge.json not approved as it is')
@@ -1001,6 +1227,9 @@ def invariants_text(root):
             code.append('- Compiled to: %s (into `%s/%s/`; compiled code is a NATIVE CHECK)' % (', '.join(targets), c['build']['out'], name))
         for u in (c.get('build') or {}).get('usedBy', []):
             code.append('- Used by: `%s`' % u['file'])
+        if c.get('watchedFields'):
+            code.append('- Code outside the rule is searched (`bypass`) for: %s; %d allowed bypass(es), each approved here (UNAPPROVED_BYPASS for any other)' % (
+                ', '.join('`%s`' % t for t in c['watchedFields']), len(c.get('allowedBypasses') or [])))
         for d in diff_entries(c):
             code.append('- Fuzzed against the shipped code (%s): %s' % (d['lang'], ', '.join('`%s`' % w for w in d.get('watch') or []) or d.get('adapter')))
         sec += ['### Code', ''] + code + ['']
@@ -1037,37 +1266,541 @@ def contract_of(path):
     return '\n'.join(keep)
 
 
-def show_specs(root):
-    """Text of what an approval covers, and the hashes of exactly that text."""
+def spec_digest(text):
+    """The spec for reading at approval: everything, except the bodies of lemmas and methods (proof steps and code,
+    which Dafny checks). Predicate and function bodies stay: they ARE the meaning of the rule. The approval hashes
+    the whole file."""
+    out, skipping, depth, pending = [], False, 0, False
+    for line in text.split('\n'):
+        st = line.strip()
+        if skipping:
+            depth += line.count('{') - line.count('}')
+            if depth <= 0:
+                skipping = False
+                out.append(line[:len(line) - len(line.lstrip())] + '{ … }  (body checked by Dafny, not shown)')
+            continue
+        if re.match(r'((ghost|static)\s+)*(lemma|method|constructor)\b', st):
+            pending = True
+        elif pending and re.match(r'(predicate|function|datatype|type|const|module|class|trait)\b', st):
+            pending = False
+        if pending and st.startswith('{'):
+            pending = False
+            depth = line.count('{') - line.count('}')
+            if depth > 0:
+                skipping = True
+                continue
+            out.append(line[:len(line) - len(line.lstrip())] + '{ … }  (body checked by Dafny, not shown)')
+            continue
+        out.append(line.rstrip())
+    return '\n'.join(out).rstrip()
+
+
+def config_digest(cfg):
+    lines = []
+    for c in cfg['checks']:
+        lines.append('- %s: proves %s against spec %s%s' % (c['name'], ', '.join(c['files']), c['spec'],
+                     '; bound by the first lines of %s' % c['binding']['file'] if c.get('binding') else ''))
+        if c.get('watchedFields'):
+            lines.append('  watched fields (code outside the rule that decides on them is listed): %s'
+                         % ', '.join(map(str, c['watchedFields'])))
+        bd = c.get('build') or {}
+        if bd:
+            lines.append('  build: %s into %s/; app callers: %s' % (', '.join(bd.get('targets', [])), bd.get('out'),
+                         ', '.join(u['file'] for u in bd.get('usedBy', [])) or 'none listed'))
+        for d in diff_entries(c):
+            lines.append('  fuzz: %s (%s) against the proved model' % (', '.join(d.get('watch') or [d.get('adapter', '?')]), d['lang']))
+    return '\n'.join(lines)
+
+
+def show_specs(root, full=False):
+    """Text of what an approval covers, and the hashes of exactly the files it covers. By default a digest for
+    reading (every spec clause complete, every answer, the whole decision record); full=True prints every file."""
     cfg = load_config(root)
     approved = read_json(os.path.join(root, APPROVED), {}) or {}
     hashes = {CONFIG: sha256(os.path.join(root, CONFIG))}
 
     def state(key):
-        if approved.get(key) == hashes[key]:
+        if approved.get(key) == hashes[key] or (key in approved and key != CONFIG
+                                                and approved_matches(approved, key, os.path.join(root, key))):
             return 'approved'
         return 'CHANGED since it was approved' if key in approved else 'not approved yet'
 
     parts = ['=== which code is checked against which spec: %s (%s) ===\n%s'
-             % (CONFIG, state(CONFIG), json.dumps(cfg, indent=2))]
+             % (CONFIG, state(CONFIG), json.dumps(cfg, indent=2) if full else config_digest(cfg))]
     for c in cfg['checks']:
         for rel in contract_files(c):
             if rel in hashes:
                 continue
-            hashes[rel] = sha256(inside(root, rel))
+            hashes[rel] = contract_hash(inside(root, rel))
             # The whole file, every word: an approval covers the complete file (by hash), so the person must be
             # able to read all of it. (Before 0.12.1 the spec was shortened to its clause lines.)
             body = read_text(inside(root, rel)).rstrip()
+            if not full and state(rel) == 'approved':
+                # Already approved and unchanged: one line, so the screen shows only what is new.
+                parts.append('=== %s %s: %s (approved, unchanged, sha256 %s…) ===' % (
+                    c['name'], 'spec' if rel == c['spec'] else 'your answers' if rel == c.get('examples')
+                    else 'decision record', rel, hashes[rel][:12]))
+                continue
+            if not full and rel == c['spec']:
+                body = spec_digest(body)
+            elif not full and rel == c.get('examples'):
+                ids = re.findall(r'//\s*(D\d+[a-z]?)\b[^\n]*', body)
+                body = ('%d answers written as Dafny asserts (%s); each must follow from the spec, or check fails with '
+                        'EXAMPLES_FAILED.' % (len(set(ids)), ', '.join(sorted(set(ids), key=lambda x: (len(x), x))))
+                        if ids else body)
             kind = 'spec' if rel == c['spec'] else 'your answers' if rel == c.get('examples') else 'decision record'
             parts.append('=== %s %s: %s (%s, sha256 %s…) ===\n%s'
                          % (c['name'], kind, rel, state(rel), hashes[rel][:12], body))
+    if not full:
+        parts.append('This is a digest. The approval covers the complete files above by their sha256 (shown). '
+                     'Read every line: /forge approve --full')
     return '\n\n'.join(parts), hashes
+
+
+DESCRIBED = DIR + '/described.json'
+_PATHLIKE = re.compile(r'(?<![\w/.-])((?:[\w.-]+/)*[\w.-]+\.[A-Za-z]{1,5})(?::\d+)?(?![\w/])')
+_IDENT = re.compile(r'`([A-Za-z_$][\w$]{2,})(?:\(\))?`')
+_SKIP_DIRS = ('.git', 'node_modules', '.forge', 'dist', 'build', 'target', '__pycache__', 'vendor')
+_TEST_FILE = re.compile(r'(^|/)(tests?|__tests__|spec)/|[._-](test|spec)\.[A-Za-z]+$|(^|/)test_[^/]+\.py$')
+
+
+def project_files(root):
+    """Tracked files (git ls-files), or a walk that skips build, vendor and hidden folders."""
+    try:
+        r = subprocess.run(['git', '-C', root, 'ls-files', '-z'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:  # no git on this machine: walk the folder
+        r = None
+    if r is not None and r.returncode == 0 and r.stdout:
+        return [f for f in r.stdout.decode('utf-8', 'replace').split('\0') if f and os.path.isfile(os.path.join(root, f))]
+    out = []
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in _SKIP_DIRS and not x.startswith('.')]
+        out += [os.path.relpath(os.path.join(d, f), root) for f in files]
+    return out
+
+
+def described_files(root, c):
+    """Code a decision record talks about: file paths it names (`gate.ts`, `src/x.py:47`) and functions it names in
+    backticks, found by a definition (function / def / func / fn / class / const …). The check's own contract and
+    proved files are left out. A heuristic: it finds what the record names, not what it means."""
+    rel = c.get('decisions')
+    if not rel or not os.path.isfile(inside(root, rel)):
+        return {}
+    return refs_in_text(root, c, read_text(inside(root, rel)))
+
+
+def refs_in_text(root, c, text):
+    own = set(contract_files(c) + [c['spec']] + c['files'] + [CONFIG])
+    out_dir = (c.get('build') or {}).get('out')
+    found = set()
+    for m in _PATHLIKE.finditer(text):
+        cand = m.group(1)
+        p = os.path.join(root, cand)
+        if os.path.isfile(p) and cand not in own:
+            found.add(os.path.normpath(cand))
+    idents = sorted({m.group(1) for m in _IDENT.finditer(text)})
+    code_ext = ('.ts', '.tsx', '.js', '.mjs', '.cjs', '.py', '.go', '.rs', '.java', '.cs', '.kt', '.rb')
+    out_norm = os.path.normpath(out_dir) + os.sep if out_dir else None
+    for ident in idents:
+        pat = re.compile(r'\b(?:function|def|func|fn|class|const|let|var)\s+%s\b|^\s*(?:export\s+)?%s\s*[:=]\s*(?:async\s*)?\('
+                         % (re.escape(ident), re.escape(ident)), re.M)
+        hits = []
+        for relf in project_files(root):
+            if not relf.endswith(code_ext) or relf in own or _TEST_FILE.search(relf):
+                continue
+            if out_norm and os.path.normpath(relf).startswith(out_norm):
+                continue
+            full = os.path.join(root, relf)
+            if os.path.getsize(full) <= 2000000 and pat.search(read_text(full)):
+                hits.append(relf)
+        # A name defined in many places says nothing about which code the record means: skip it.
+        if 1 <= len(hits) <= 2:
+            found.update(hits)
+    return {f: sha256(os.path.join(root, f)) for f in sorted(found)}
+
+
+def record_described(root):
+    """Written at approval: the code each decision record describes, as it was when the person approved it."""
+    cfg = load_config(root)
+    write_json(root, DESCRIBED, {c['name']: described_files(root, c) for c in cfg['checks'] if c.get('decisions')})
+
+
+def app_syntax_warnings(root, cfg):
+    """check: the app files the checks touch, and every file that imports them, must parse (a warning in check;
+    build fails with APP_SYNTAX_ERROR)."""
+    touched = []
+    for c in cfg['checks']:
+        touched += [f for f in app_files(root, c) if f not in touched]
+    if not touched:
+        return []
+    errs, _ = syntax_errors(root, touched + dependents(root, touched))
+    return ['APP_SYNTAX_ERROR %s' % e for e in errs[:10]]
+
+
+def stale_records(root, cfg):
+    """Warnings (never a failed verdict): code a decision record describes changed after approval."""
+    seen = read_json(os.path.join(root, DESCRIBED), {}) or {}
+    out = []
+    for c in cfg['checks']:
+        changed = [f for f, h in sorted((seen.get(c['name']) or {}).items())
+                   if not os.path.isfile(os.path.join(root, f)) or sha256(os.path.join(root, f)) != h]
+        if changed:
+            out.append('DECISION_NOTE_STALE %s: the decision record %s describes %s, which changed after approval. '
+                       'Re-read the record: it may no longer match the code (the proof approval is not affected).'
+                       % (c['name'], c['decisions'], ', '.join(changed)))
+    return out
+
+
+def next_rules(root, cfg):
+    """For each check: the first "Out of scope" item that names code in this repo (a backticked function or a file
+    path), as the suggested next rule. The record lists what the rule assumes; proving one of those assumptions
+    closes a gap the proof depends on. A heuristic over the person's own words."""
+    out = {}
+    for c in cfg['checks']:
+        rel = c.get('decisions')
+        if not rel or not os.path.isfile(inside(root, rel)):
+            continue
+        for line in _section(read_text(inside(root, rel)), 'Out of scope').split('\n'):
+            item = line.strip().lstrip('-*').strip()
+            if not item:
+                continue
+            refs = sorted(refs_in_text(root, c, item))
+            if refs:
+                out[c['name']] = {'item': item, 'code': refs}
+                break
+    return out
+
 
 
 def write_json(root, rel, value):
     os.makedirs(os.path.join(root, DIR), exist_ok=True)
-    with open(os.path.join(root, rel), 'w', encoding='utf-8') as f:
-        f.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
+    with open(os.path.join(root, rel), 'w', encoding='utf-8', errors='backslashreplace') as f:  # a lone surrogate
+        f.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')  # (messy fuzz) is written as its JSON escape
+
+
+# ---------------------------------------------------------------------------- bypass
+# A proof covers the proved function only. Code elsewhere that decides the same question itself (reads the same
+# field, repeats the same comparison) goes AROUND the rule. `bypass` searches the project for the check's
+# "watchedFields" outside the rule's own files and reports every place the person has not reviewed yet.
+# LIMIT: a text search per line, not a data-flow analysis. It misses aliases (`const f = body.for`), dynamic
+# access (`body[key]`), terms split over lines, and code that decides the same question under other names.
+
+LAST_BYPASS = DIR + '/last-bypass.json'
+BYPASS_SKIP_DIRS = {'.git', 'node_modules', 'dist', 'build', 'verified', DIR, 'vendor', 'third_party',
+                    'third-party', '.venv', 'venv', '__pycache__', 'target', '.next', 'coverage', 'bower_components'}
+# Documentation does not run, and lockfiles are generated: neither can go around a rule.
+BYPASS_SKIP_EXT = ('.md', '.markdown', '.rst', '.txt', '.adoc', '.lock', '.map', '.svg', '.min.js')
+BYPASS_SKIP_NAMES = {'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'Cargo.lock', 'go.sum', 'poetry.lock'}
+BYPASS_MAX_BYTES = 1 << 20
+_BRACE_LANGS = ('.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.java', '.cs', '.kt', '.scala',
+                '.swift', '.php', '.c', '.cc', '.cpp', '.h', '.hpp', '.dart')
+_DEF_PATTERNS = [
+    re.compile(r'^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)'),                                        # Python
+    re.compile(r'\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)\s*[(<]'),                                 # JS/TS
+    re.compile(r'^\s*(?:export\s+)?(?:(?:const|let|var)\s+|(?:(?:public|private|protected|static|readonly)\s+)*)'
+               r'([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s*)?(?:function\b|(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*'
+               r'(?::[^=]+)?=>)'),                                                              # JS/TS arrow
+    re.compile(r'^\s*([A-Za-z_$][\w$]*)\s*:\s*(?:async\s*)?(?:function\b|(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>)'),
+    re.compile(r'^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)'),                                   # Go
+    re.compile(r'^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const|extern)\s+)*fn\s+([A-Za-z_]\w*)'),  # Rust
+]
+_NOT_NAMES = {'if', 'for', 'while', 'switch', 'catch', 'return', 'new', 'else', 'do', 'try', 'using', 'lock',
+              'foreach', 'await', 'typeof', 'sizeof', 'throw', 'yield', 'function', 'public', 'private',
+              'protected', 'internal', 'static', 'final', 'abstract', 'async', 'override', 'virtual', 'sealed',
+              'synchronized', 'readonly', 'export', 'default', 'super', 'this', 'when', 'match', 'fixed'}
+
+
+def _indent(line):
+    return len(line) - len(line.lstrip(' \t'))
+
+
+def _method_name(line, next_line):
+    """A method or function header in a brace language (Java, C#, a TS/JS class or object). A cheap heuristic."""
+    s = line.strip()
+    if not s or s.endswith(';') or s.startswith(('//', '*', '/*', '#', '@', '}', '=')):
+        return None
+    if not (s.endswith('{') or (s.endswith(')') or re.search(r'\)\s*:\s*[^=;{]+$', s)) and next_line.startswith('{')):
+        return None
+    if re.match(r'(?:if|for|while|switch|catch|return|else|new|await|throw|yield|do|try|using|lock|foreach)\b', s):
+        return None
+    for m in re.finditer(r'([A-Za-z_$][\w$]*)\s*(?:<[^()]*>)?\s*\(', s):
+        if m.group(1) in _NOT_NAMES:
+            continue
+        if '=' in s[:m.start()].replace('=>', '').replace('==', ''):
+            return None  # an assignment from a call, not a definition
+        return m.group(1)
+    return None
+
+
+def enclosing_function(lines, idx, path):
+    """Name of the function that holds lines[idx], or None: the nearest less-indented definition line above it."""
+    brace = path.endswith(_BRACE_LANGS)
+
+    def name_of(j):
+        for p in _DEF_PATTERNS:
+            m = p.search(lines[j])
+            if m and m.group(1) not in _NOT_NAMES:
+                return m.group(1)
+        if brace:
+            nxt = next((lines[k].strip() for k in range(j + 1, min(j + 4, len(lines))) if lines[k].strip()), '')
+            return _method_name(lines[j], nxt)
+        return None
+
+    own = name_of(idx)
+    if own:
+        return own
+    threshold = _indent(lines[idx])
+    for j in range(idx - 1, -1, -1):
+        text = lines[j]
+        if not text.strip() or re.match(r'^\s*[{}()\[\];,]*\s*$', text) or text.strip().startswith(('//', '#', '*', '/*')):
+            continue
+        ind = _indent(text)
+        if ind >= threshold:
+            continue
+        name = name_of(j)
+        if name:
+            return name
+        threshold = ind
+        if ind == 0:
+            return None
+    return None
+
+
+def _skipped_path(rel):
+    parts = rel.replace(os.sep, '/').split('/')
+    name = parts[-1]
+    return (any(p in BYPASS_SKIP_DIRS for p in parts[:-1]) or name in BYPASS_SKIP_NAMES
+            or name.lower().endswith(BYPASS_SKIP_EXT))
+
+
+def project_files(root):
+    """Text files of the project: git's tracked and untracked-but-not-ignored files, else a walk."""
+    try:
+        r = subprocess.run(['git', '-C', root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:  # no git on this machine (minimal containers): walk the folder instead
+        r = None
+    if r is not None and r.returncode == 0:
+        rels = sorted(set(p for p in r.stdout.decode('utf-8', 'replace').split('\0') if p))
+    else:
+        rels = []
+        for folder, dirs, files in os.walk(root):
+            dirs[:] = sorted(d for d in dirs if d not in BYPASS_SKIP_DIRS)
+            for name in sorted(files):
+                rels.append(os.path.relpath(os.path.join(folder, name), root).replace(os.sep, '/'))
+    out = []
+    for rel in rels:
+        path = os.path.join(root, rel)
+        if _skipped_path(rel) or not os.path.isfile(path) or os.path.getsize(path) > BYPASS_MAX_BYTES:
+            continue
+        with open(path, 'rb') as f:
+            if b'\0' in f.read(8192):
+                continue  # binary
+        out.append(rel)
+    return out
+
+
+def scope_matchers(c):
+    terms = c.get('watchedFields') or []
+    if not isinstance(terms, list) or not all(isinstance(t, str) and t.strip() for t in terms):
+        raise ConfigError('check %s: "watchedFields" must be a list of non-empty strings (a /regex/ between '
+                          'slashes, else literal text)' % c['name'])
+    out = []
+    for t in terms:
+        try:
+            is_re = len(t) > 2 and t.startswith('/') and t.endswith('/')
+            out.append((t, re.compile(t[1:-1] if is_re else re.escape(t))))
+        except re.error as e:
+            raise ConfigError('check %s: watched field %r is not a valid regular expression: %s' % (c['name'], t, e))
+    for e in c.get('allowedBypasses') or []:
+        if not (isinstance(e, dict) and isinstance(e.get('file'), str)
+                and re.match(r'^[0-9a-f]{64}$', str(e.get('line_text_sha256', '')))):
+            raise ConfigError('check %s: each "allowedBypasses" entry needs "file" and "line_text_sha256" (64 hex '
+                              'digits)' % c['name'])
+    return out
+
+
+def rule_own_files(root, cfg, c):
+    """Project-relative files (and folders, ending in /) that belong to the rule itself: never reported."""
+    files = set(contract_files(c)) | set(c['files'])
+    bd = c.get('build') or {}
+    if bd.get('fuzz'):
+        files.add(bd['fuzz'])
+    dfy = [f for f in files if f.endswith('.dfy') and os.path.isfile(inside(root, f))]
+    try:
+        files |= set(include_closure(root, dfy))
+    except ConfigError:
+        pass
+    for d in diff_entries(c):
+        files |= {d[k] for k in ('inputs', 'adapter') if d.get(k)}
+    files.add(os.path.relpath(invariants_path(root, cfg), os.path.realpath(root)))
+    norm = {os.path.normpath(f).replace(os.sep, '/') for f in files}
+    if bd.get('out'):
+        norm.add(os.path.normpath(bd['out']).replace(os.sep, '/') + '/')
+    return norm
+
+
+def line_sha(text):
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def run_bypass(root, override=None):
+    """override: {check name: terms} to search with instead of its watchedFields (a preview; nothing is written)."""
+    cfg = load_config(root)
+    for c in cfg['checks']:
+        if override and c['name'] in override:
+            c['watchedFields'] = list(override[c['name']])
+    approved = read_json(os.path.join(root, APPROVED), {}) or {}
+    out = {'at': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'), 'checks': {},
+           'no_terms': [], 'config_approved': approved.get(CONFIG) == sha256(os.path.join(root, CONFIG))}
+    with_terms = [c for c in cfg['checks'] if c.get('watchedFields')]
+    out['no_terms'] = [c['name'] for c in cfg['checks'] if not c.get('watchedFields')]
+    files = project_files(root) if with_terms else []
+    cache = {}
+    for c in with_terms:
+        matchers = scope_matchers(c)
+        own = rule_own_files(root, cfg, c)
+        watched = {w for d in diff_entries(c) for w in d.get('watch') or []}
+        reviewed = c.get('allowedBypasses') or []
+        res = out['checks'][c['name']] = {'terms': [t for t, _ in matchers], 'hits': [], 'reviewed': 0,
+                                          'outdated_reviews': [], 'files_searched': 0}
+        used = set()
+        for rel in files:
+            if rel in own or any(o.endswith('/') and rel.startswith(o) for o in own):
+                continue
+            res['files_searched'] += 1
+            if rel not in cache:
+                cache[rel] = read_text(os.path.join(root, rel)).replace('\r\n', '\n').split('\n')
+            lines = cache[rel]
+            for i, text in enumerate(lines):
+                terms = [t for t, rx in matchers if rx.search(text)]
+                if not terms:
+                    continue
+                h = line_sha(text)
+                match = [k for k, e in enumerate(reviewed) if e['file'] == rel and e['line_text_sha256'] == h]
+                if match:
+                    used.update(match)
+                    res['reviewed'] += 1
+                    continue
+                res['hits'].append({'file': rel, 'line': i + 1, 'terms': terms, 'text': text.strip()[:200],
+                                    'function': enclosing_function(lines, i, rel), 'line_text_sha256': h,
+                                    'fuzzed_file': rel in watched})
+        res['outdated_reviews'] = [e for k, e in enumerate(reviewed) if k not in used]
+    k = sum(len(r['hits']) for r in out['checks'].values())
+    out['unreviewed'] = k
+    out['verdict'] = 'NO_SCOPE_TERMS' if not with_terms else 'BYPASS_FOUND' if k else 'BYPASS_CLEAR'
+    return out
+
+
+def outside_of(root):
+    """For `check`: the unreviewed bypass hits per check (never changes a verdict). {} when nothing is watched."""
+    try:
+        out = run_bypass(root)
+    except Exception as e:  # the search must never crash `check`; checks with watchedFields fail closed (main)
+        return {}, '%s: %s' % (type(e).__name__, e)
+    return ({name: [{'file': h['file'], 'line': h['line'], 'function': h['function'], 'term': h['terms'][0],
+                     'text': h['text']} for h in r['hits']] for name, r in out['checks'].items()}, None)
+
+
+def outside_lines(outside):
+    lines = []
+    for name, hits in outside.items():
+        if hits:
+            terms = sorted({h['term'] for h in hits})
+            lines.append('%d place%s decide%s with %s outside %s: %s' % (
+                len(hits), '' if len(hits) == 1 else 's', 's' if len(hits) == 1 else '', ', '.join(terms), name,
+                ', '.join('%s:%d%s' % (h['file'], h['line'], ' ' + h['function'] if h['function'] else '') for h in hits[:12])
+                + (', … and %d more (forge_check.py bypass lists all)' % (len(hits) - 12) if len(hits) > 12 else '')))
+    if lines:
+        lines.append('(not reviewed yet; /forge:bypass explains each one. A proof covers only the proved rule.)')
+    return lines
+
+
+def bypass_counts(out):
+    """--count: unreviewed lines per term, to judge a term set before saving it."""
+    lines = []
+    for name, r in out['checks'].items():
+        lines.append('%s: %d unreviewed line(s) in %d file(s) (%d file(s) searched; %d allowed)' % (
+            name, len(r['hits']), len({h['file'] for h in r['hits']}), r['files_searched'], r['reviewed']))
+        for t in r['terms']:
+            hs = [h for h in r['hits'] if t in h['terms']]
+            lines.append('  %5d  %s  (%d file(s))' % (len(hs), t, len({h['file'] for h in hs})))
+    return '\n'.join(lines) or 'no check has "watchedFields" (pass --rule NAME --set-terms … --count to preview)'
+
+
+def gate_bypass(result, outside, error):
+    """The hard gate: a check whose proof passed, but with code outside the rule that uses its watchedFields and is
+    not in its approved allowedBypasses, is UNAPPROVED_BYPASS. A proof failure (or any other verdict) still wins."""
+    for name, verdict in list(result['verdicts'].items()):
+        if verdict != 'VERIFIED':
+            continue
+        hits = outside.get(name) or []
+        if hits:
+            result['verdicts'][name] = 'UNAPPROVED_BYPASS'
+            result['detail'][name] = ('the proof passed, but %d place(s) outside the rule use its watchedFields and are '
+                                      'not in its approved allowedBypasses:\n%s\nRoute each through the proved rule, '
+                                      'or allow it (/forge:bypass) and approve forge.json again.' % (
+                                          len(hits), '\n'.join('  %s:%d%s  [%s]  %s' % (
+                                              h['file'], h['line'], '  in ' + h['function'] if h['function'] else '',
+                                              h['term'], h['text']) for h in hits[:40])
+                                          + ('\n  … and %d more (forge_check.py bypass)' % (len(hits) - 40) if len(hits) > 40 else '')))
+
+
+def bypass_report(out):
+    if out['verdict'] == 'NO_SCOPE_TERMS':
+        return ('forge bypass: NO_SCOPE_TERMS: no check has "watchedFields", so nothing was searched. /forge:bypass '
+                'proposes them from the approved rule.')
+    k = out['unreviewed']
+    lines = ['forge bypass %s %s: %d place%s outside the rule not reviewed yet' % (
+        '✗' if k else '✓', out['verdict'], k, '' if k == 1 else 's')]
+    for name, r in out['checks'].items():
+        lines.append('  %s: %d file(s) searched for %s; %d hit(s), %d allowed (allowedBypasses)' % (
+            name, r['files_searched'], ', '.join(r['terms']), len(r['hits']) + r['reviewed'], r['reviewed']))
+        for h in r['hits']:
+            lines.append('    %s:%d  %s[%s]%s  %s' % (h['file'], h['line'], 'in %s  ' % h['function'] if h['function'] else '',
+                                                    ', '.join(h['terms']), '  (a fuzzed file)' if h['fuzzed_file'] else '',
+                                                    h['text']))
+        for e in r['outdated_reviews']:
+            lines.append('    outdated allowed bypass (the line changed or is gone): %s: %s' % (e['file'], e.get('note', '')))
+    if out['no_terms']:
+        lines.append('  no "watchedFields" yet (not searched): ' + ', '.join(out['no_terms']))
+    if not out['config_approved']:
+        lines.append('  NOTE: %s is not approved as it is now, so these terms and reviews are not approved either '
+                     '(/forge approve).' % CONFIG)
+    if k:
+        lines.append('Each place may decide the same question as the proved rule without going through it. '
+                     '/forge:bypass explains each one and records your answer.')
+    lines.append('A text search (FINITE TEST of the listed terms): it misses aliases, dynamic field access and '
+                 'other names for the same question.')
+    return '\n'.join(lines)
+
+
+def _bypass_edit(root, rule, set_terms, record, note):
+    """Writes watchedFields or a allowedBypasses entry into forge.json (the person approves it again after)."""
+    cfg = load_config(root)
+    c = next((x for x in cfg['checks'] if x['name'] == rule), None)
+    if c is None:
+        raise ConfigError('no check named %s' % rule)
+    if set_terms is not None:
+        c['watchedFields'] = list(set_terms)
+        scope_matchers(c)
+        what = 'watchedFields of %s: %s' % (rule, ', '.join(set_terms))
+    else:
+        m = re.match(r'^(.+):(\d+)$', record or '')
+        if not m or not (note or '').strip():
+            raise ConfigError('--record needs FILE:LINE and --note "why this place is fine"')
+        rel, n = os.path.normpath(m.group(1)).replace(os.sep, '/'), int(m.group(2))
+        hit = next((h for h in run_bypass(root)['checks'].get(rule, {}).get('hits', [])
+                    if h['file'] == rel and h['line'] == n), None)
+        if hit is None:
+            raise ConfigError('%s:%d is not an unreviewed bypass hit of %s (run bypass first)' % (rel, n, rule))
+        c.setdefault('allowedBypasses', []).append({'file': rel, 'line_text_sha256': hit['line_text_sha256'],
+                                                   'note': note.strip()})
+        what = 'reviewed %s:%d for %s' % (rel, n, rule)
+    with open(os.path.join(root, CONFIG), 'w', encoding='utf-8') as f:
+        f.write(json.dumps(cfg, indent=2, ensure_ascii=False) + '\n')
+    return 'wrote %s (%s). %s changed: the person approves it again (/forge approve, then /forge approve yes).' % (
+        CONFIG, what, CONFIG)
 
 
 def main(argv=None):
@@ -1076,7 +1809,8 @@ def main(argv=None):
     # python:3.12-slim container).
     os.environ.setdefault('DOTNET_SYSTEM_GLOBALIZATION_INVARIANT', '1')
     p = argparse.ArgumentParser(prog='forge_check.py', description='Forge proof check')
-    p.add_argument('command', choices=['check', 'approve', 'spec', 'build', 'setup', 'mutate', 'diff', 'invariants'])
+    p.add_argument('command', choices=['check', 'approve', 'spec', 'build', 'setup', 'mutate', 'diff', 'invariants',
+                                       'bypass'])
     p.add_argument('--root', default='.', help='project folder (default: current folder)')
     p.add_argument('--json', action='store_true', help='print the result as JSON')
     p.add_argument('--base', help='git ref; any change to forge.json, approved.json or a spec '
@@ -1088,11 +1822,36 @@ def main(argv=None):
     p.add_argument('--inputs', type=int, help='diff: at most this many random inputs (default from forge.json, 1500)')
     p.add_argument('--budget-ms', type=int, help='diff: time budget per check in ms (default 1500)')
     p.add_argument('--seed', type=int, help='diff: random seed (default: a fresh one each run)')
+    p.add_argument('--full', action='store_true', help='spec/approve: print every approved file in full')
     p.add_argument('--check', action='store_true', help='build: write nothing; the emitted code on '
                                                         'disk must equal a fresh build')
+    p.add_argument('--rule', help='bypass: the check whose watchedFields or allowedBypasses to write')
+    p.add_argument('--set-terms', nargs='+', metavar='TERM', help='bypass --rule NAME: write its watchedFields')
+    p.add_argument('--record', metavar='FILE:LINE', help='bypass --rule NAME: record a hit as reviewed (with --note)')
+    p.add_argument('--count', action='store_true', help='bypass: only count unreviewed lines per term (with --rule '
+                                                        'NAME --set-terms …: a preview; nothing is written)')
+    p.add_argument('--note', help='bypass --record: why that place is fine, in the person\'s words')
     a = p.parse_args(argv)
     root = os.path.abspath(a.root)
     try:
+        if a.command == 'bypass':
+            if a.count:
+                if a.set_terms is not None and not a.rule:
+                    raise ConfigError('--set-terms needs --rule NAME')
+                out = run_bypass(root, {a.rule: a.set_terms} if a.set_terms is not None else None)
+                print(json.dumps({n: {'unreviewed': len(r['hits']), 'per_term': {t: sum(t in h['terms'] for h in r['hits'])
+                                  for t in r['terms']}} for n, r in out['checks'].items()}) if a.json else bypass_counts(out))
+                return 0
+            if a.set_terms is not None or a.record:
+                if not a.rule:
+                    raise ConfigError('--set-terms and --record need --rule NAME')
+                print(_bypass_edit(root, a.rule, a.set_terms, a.record, a.note))
+                return 0
+            out = run_bypass(root)
+            if not a.no_write:
+                write_json(root, LAST_BYPASS, out)
+            print(json.dumps(out, indent=2, ensure_ascii=False) if a.json else bypass_report(out))
+            return 1 if out['verdict'] == 'BYPASS_FOUND' else 0
         if a.command == 'invariants':
             text = invariants_text(root)
             path = invariants_path(root, load_config(root))
@@ -1109,6 +1868,8 @@ def main(argv=None):
             print('wrote %s (%d rules)' % (os.path.relpath(path, root), len(load_config(root)['checks'])))
             return 0
         if a.command == 'diff':
+            if hasattr(sys.stdout, 'reconfigure'):
+                sys.stdout.reconfigure(errors='backslashreplace')  # messy inputs may hold a lone surrogate
             out = run_diff(root, a.inputs, a.budget_ms, a.seed)
             if not a.no_write:
                 update_diff_stats(root, out)
@@ -1131,7 +1892,7 @@ def main(argv=None):
                 print('dafny: %s\nversion: %s (pinned download: %s)' % (path, version, DAFNY_VERSION))
             return 0 if version else 1
         if a.command == 'spec':
-            text, hashes = show_specs(root)
+            text, hashes = show_specs(root, a.full)
             print(json.dumps({'text': text, 'hashes': hashes}, ensure_ascii=False) if a.json else text)
             return 0
         if a.command == 'approve' and a.hashes:
@@ -1146,22 +1907,24 @@ def main(argv=None):
                 print('changed since it was shown: %s. Read it again.' % ', '.join(differ))
                 return 1
             write_json(root, APPROVED, current)
+            record_described(root)
             print('\n'.join('approved %s  sha256 %s…' % (k, h[:12]) for k, h in current.items()))
             return 0
         if a.command == 'approve':
             if not (sys.stdin.isatty() and sys.stdout.isatty()):
                 print('approve needs a person at a terminal.', file=sys.stderr)
                 return 2
-            text, hashes = show_specs(root)
+            text, hashes = show_specs(root, a.full)
             print(text)
             if input('\nApprove exactly this? Type yes: ').strip() != 'yes':
                 print('Not approved.')
                 return 1
             for key, h in hashes.items():
-                if sha256(os.path.join(root, key)) != h:
+                if (sha256 if key == CONFIG else contract_hash)(os.path.join(root, key)) != h:
                     print('%s changed while you read it. Run approve again.' % key)
                     return 1
             write_json(root, APPROVED, hashes)
+            record_described(root)
             print('approved: ' + ', '.join(hashes))
             return 0
         if a.command == 'build':
@@ -1171,9 +1934,18 @@ def main(argv=None):
                 all(b['verdict'] == 'BUILT' for b in result['build'].values())
             return 0 if ok else 1
         result = run_checks(root, a.base)
+        result['outside'], outside_error = outside_of(root)
+        if outside_error:
+            result['outside_error'] = outside_error
+            for c in load_config(root)['checks']:
+                if c.get('watchedFields') and result['verdicts'].get(c['name']) == 'VERIFIED':
+                    result['verdicts'][c['name']] = 'ERROR'
+                    result['detail'][c['name']] = 'the bypass search did not run: ' + outside_error
+        gate_bypass(result, result['outside'], outside_error)
         if not a.no_write:
             write_json(root, LAST, result)
-        print(json.dumps(result, indent=2, ensure_ascii=False) if a.json else report(result))
+        text = report(result) + ''.join('\n' + l for l in outside_lines(result['outside']))
+        print(json.dumps(result, indent=2, ensure_ascii=False) if a.json else text)
         return 0 if all(v == 'VERIFIED' for v in result['verdicts'].values()) else 1
     except ConfigError as e:
         if a.json:

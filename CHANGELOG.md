@@ -2,6 +2,102 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## 0.13.0 — 2026-11-23
+
+One release with the owner's chronicle feedback and the airlock:
+- **Bypass gate** (`watchedFields`, `UNAPPROVED_BYPASS`, `/forge:bypass`): code outside a proved rule that decides on its fields fails `check` until it is routed through the rule or allowed by a person.
+- **Messy-input fuzz** of the unproved wrapper (`THROWS_ON_MESSY_INPUT`).
+- **Scope-honest status**, `DECISION_NOTE_STALE`, notes edits without re-approval, next-rule suggestion, build syntax step over app files and their importers (`APP_SYNTAX_ERROR`), short approval digest (`--full` for every file).
+- **Fast generated JS module** (no `new Function`) and `serviceTest` (`NOT_CALLED`).
+- **forge-airlock** in the plugin: an agent box with hidden paths absent from disk, default-deny MCP, gates on the compiled #91 verifier, canary, egress allowlist, reviewed sync-back; red-team fixes (sync-back case/Unicode aliases; protocol F1–F8); model proxy so the box holds no API key, with spending capped by the proved verifier (strict 1 byte/token reservation, settled to reported usage). `prove_release.sh`: 8 gates, all exit 0 on three consecutive runs.
+- **Upgrade note:** a committed `js` build is `STALE_BUILD` until you run `/forge build` once (the new module is part of the build). Approvals from before 0.13 stay valid; approve once more to edit notes without re-approval.
+
+- New (`js` target): `build` also writes `<name>.mjs` and `<name>.d.mts` next to the emitted `<name>.js`: one ES
+  module with real exports, a private pinned copy of bignumber.js 9.3.1 (SHA-256 checked) and helpers
+  (`toDafnyString`/`fromDafnyString` with a bounded cache of frozen seqs, `toDafnyInt`/`fromDafnyInt`, seq and set
+  helpers). No `new Function`, no `eval`, no file reading, no npm install in the app (owner feedback #6: chronicle
+  needed a `new Function` loader, bignumber.js and string conversions on every call). The runtime's string literals
+  use the same cache. Code: `cli/js_wrapper.py`, two small hooks in `cli/forge_check.py`.
+- New (build): the js fuzz harness also runs through its own generated module under
+  `node --disallow-code-generation-from-strings` and must print the same output as the plain emitted script.
+- Upgrade: run `build` once; a committed js build without the module is `STALE_BUILD`.
+- `/forge:build-setup` tells Claude to import the module instead of writing a loader, with a template wrapper.
+- New (build): optional `"serviceTest": {"command": [...], "cwd": "."}` per check. `build` and `build --check` run
+  it with `FORGE_TRACE` set; the generated js module writes one line per process on its first call. Verdicts
+  `NOT_CALLED` (the command passed, no call traced) and `SERVICE_TEST_FAILED`; the number of calling processes is
+  recorded. Only the js module is traced (not the py target, not an app's own loader of the `.js` file).
+- Measured (one machine, Node 24.3.0, warm, medians of 5 passes, 3 runs): wallet `Spend` 2,000 x 10 calls: old
+  loader 6.34–6.42 ms, module 6.48–6.73 ms (no gain: ints use bignumber.js in both); a chronicle rule, 2,000 calls
+  with 10 limits each, on a copy of chronicle: old wrapper 62.6–81.9 ms, module 26.7–41.3 ms, 0 of 8,000 decisions
+  differ. Chronicle's test suite on the copy with gate.ts on the module: 228 pass, 1 skipped, 1 fail (a folder left
+  out of the copy), the same as with the old wrapper. Its `test/service.test.ts` as serviceTest: `NOT_CALLED` with
+  the old `new Function` wrapper (not traced), `BUILT` with 1 calling process on the module wrapper.
+- Tested: 62 cases (12 new): the module imports under `--disallow-code-generation-from-strings` and a copy that
+  calls `new Function` does not; the generator is deterministic and refuses `new Function`, `eval` and other
+  `require`s; same results as the old loader on 5,000 wallet fuzz inputs and the 4 decisions, and an edited module
+  disagrees; string/seq/set/int helpers equal the old loader with the cache on, off and at 16 entries, and a cache
+  that returns a wrong seq is caught; a hand edit of the module is `STALE_BUILD`; the build's harness-module check
+  fails on a different output; serviceTest `BUILT` / `NOT_CALLED` / `SERVICE_TEST_FAILED`.
+- Not tested: browsers and Cloudflare Workers themselves (only Node with code generation from strings forbidden);
+  Windows; `--unicode-char false` builds (the helpers then pass JS strings through, untested).
+- Later option, not built: Rust output compiled to WebAssembly.
+
+- Status line and `check` say what VERIFIED covers: `model PROVED`, the fuzz count with `wrapper NOT proved`, bypasses, `records current`.
+- `DECISION_NOTE_STALE`: code named in a decision record changed after approval (warning only). `.forge/described.json` is written at approval.
+- Approval hashes only the binding sections of a decision record (`n:` hashes); notes sections can be edited without re-approval. Old full-file approvals are still accepted.
+- Next-rule suggestion from the Out-of-scope items that name code.
+- `build`: `APP_SYNTAX_ERROR` when an app file a check touches, or any JS/TS file that imports one, does not parse; optional `typecheck` command (`TYPECHECK_FAILED`). `check` warns on the same.
+- `/forge approve` shows a digest; `--full` prints every file; approved, unchanged files collapse to one line.
+- Measured on a copy of a real app (2 rules): stale note flagged on the changed `turbopufferFilter`; the note fixed without re-approval; a missing brace in a file three imports away flagged; `visibleTo()` suggested as the next rule; approval screen 26,214 → 1,404 characters with both rules already approved.
+- Added (fuzzer): messy inputs for the unproved wrapper that turns app/JSON values into proved-code values (owner
+  feedback: chronicle's gate-mayread wrapper threw on `householdId: undefined`, and the fuzz never sent one). An
+  adapter may export `wrapper` / `wrappers` (the app's real wrapper, called with raw values) and `failClosed` /
+  `fail_closed`. Each field is in turn made undefined (JavaScript), null, a number, a boolean, "", a lone surrogate,
+  a long text, [], {}, the number as text, or removed. A throw is always `THROWS_ON_MESSY_INPUT`; any other answer
+  must equal the fail-closed answer (or the proved rule's answer where the input is one it takes). Grouped, shrunk
+  and saved like other disagreements. On by default when the adapter names a wrapper; `"messy": false` turns it off.
+- Changed (protocol, backward compatible): the hello line may name `"messy"` candidates; messy lines carry
+  `"messy": true` and are sent with ASCII escapes. Results, case files and printed reports keep a lone surrogate as
+  its JSON escape instead of failing.
+- Changed: `/forge fuzz` and `/forge:build-setup` tell Claude to write wrappers that fail closed on a non-text id and
+  to add the wrapper as a messy candidate; templates for TypeScript and Python.
+- Tested: 58 cases (8 new: messy off finds nothing (negative control); the JS wrapper that throws on amount
+  undefined/null is found as THROWS_ON_MESSY_INPUT and shrunk to {cap 0, spent 0, amount undefined}; the Python one
+  that raises on None, only on that field; the wrappers that turn "5" into 5, in both languages; the fail-closed
+  wrapper has no messy disagreement (negative control); every kind is tried and judged; saved messy cases replay).
+  On a copy of chronicle (gate-mayread, the app's real gate-mayread.ts, an adapter written for the test): the
+  `householdId: undefined` throw is found, with 23 other throwing fields/kinds (ids that are not text, `limits` that
+  is not a list, `entry` or `viewer` that is not an object); with a fail-closed patch of the wrapper, 2,776 messy
+  inputs give 0 disagreements. Not tested: messy inputs for Go, Rust, Java, C# and "cmd" evaluators (the protocol
+  allows them; no evaluator announces messy candidates yet).
+- Added: `forge_check.py bypass` finds code that goes around a proved rule: lines outside the rule's own files that
+  use the check's `"watchedFields"` (literal text or `/regex/`), with file:line, term, text and enclosing function.
+  Verdicts `BYPASS_CLEAR` (exit 0), `BYPASS_FOUND` (exit 1), `NO_SCOPE_TERMS` (exit 0, nothing searched). Places the
+  person allows are kept in `"allowedBypasses"` (in forge.json, so a person approves each) by the SHA-256 of the line,
+  so an edited line is reported again. `bypass --rule NAME --set-terms …` and `--record FILE:LINE --note …` write
+  them; `bypass --count [--rule NAME --set-terms …]` previews lines per term and writes nothing.
+- Added: a hard gate in `check`: a check with `"watchedFields"` whose proof passes is `UNAPPROVED_BYPASS` (exit 1)
+  while an unallowed line outside the rule matches; the detail lists the lines. A failed proof still wins; a check
+  without `"watchedFields"` behaves as before. The lines also go under `"outside"` in the JSON and on one report line.
+  If the search itself fails, a check with `"watchedFields"` is `ERROR` (fail closed).
+- Added: `/forge:bypass` (a conversation): proposes SPECIFIC watched fields (property access, comparisons) from the
+  approved spec and decision record, shows the measured count per term before saving, explains each place, and
+  asks per place: route it through the proved rule, it is fine (record why), or a new rule. `/forge approve yes`
+  prints the count; bare `/forge` offers `/forge:bypass` for a check without watched fields.
+- Changed: the example has watched fields; its six shipped legacy functions are allowed bypasses (they are the code
+  the fuzz compares). forge.json re-approved, INVARIANTS.md regenerated. The planted second spender
+  (`gift_card.py`, `can_send_gift`) lives in the tests, so the example stays VERIFIED under the gate.
+- Fixed (found in CI): `check` crashed where git is not installed; the search now walks the folder.
+- Measured: on a copy of the real app that motivated it (205 files searched, about 0.3 s): bare `body.for` and
+  `householdId` match 290 lines in 25 files; the specific set `.body.for`, `/\bhouseholdId\s*(===|!==|==|!=)/`,
+  `/(===|!==|==|!=)\s*[\w.]*\bhouseholdId\b/` matches 19 lines in 10 files and still names the three places found
+  by hand (`gate.ts:83 mayRetract`, `companion.ts:186 retract`, `companion.ts:224 forget`).
+- Tested: 18 new cases (found; own files never reported; UNAPPROVED_BYPASS for a new reader; allowed and re-approved
+  → VERIFIED; edited allowed line → UNAPPROVED_BYPASS again; a failed proof still FAILED; negative control without
+  watchedFields → VERIFIED; no other use → clear; no terms; bad regex; review of a non-hit refused; no git on PATH;
+  git untracked/ignored/node_modules; `--count` preview; a chronicle-shaped TS/Java/Go/Rust project). Not tested:
+  the `/forge:bypass` conversation and the register.ts wiring inside Claude Code.
+
 ## 0.12.2 — 2026-11-22
 - Fixed (fuzzer): different bugs that give the same wrong answer were reported as one. The fuzzer kept one example
   per kind of wrong answer and stopped at 5 per candidate, so on chronicle's original code three real fail-open bugs
@@ -13,6 +109,25 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
 - Fixed: the JavaScript evaluator split input lines at U+2028 and U+2029 (Node's readline); it now splits at "\n" only.
 - Tested: 50 cases (1 new: two bugs with the same wrong answer, zero and empty text, are both reported).
 
+- Added: the MCP airlock in the same plugin (`airlock/`, `/forge:airlock`, `python3 airlock/forge_airlock.py up --
+  <command>`): `forge.yaml` drafted by Claude (secrets by NAME only), a box whose workspace has the hidden paths
+  absent (also from git history), default-deny MCP tools, caps decided by the compiled #91 escrow verifier (PROVED
+  model), a breach canary (fail closed), an egress allowlist, `--pass-env NAME` with a warning, and a diff
+  sync-back applied only after y. Ported from Forge's private proposal #97. No existing command changed; only
+  `up`, `tools` and `check` need Docker.
+- Changed (airlock): gated calls go to ONE persistent verifier process with a memo of its pure SHA-256 and key
+  validation; every call still verifies the whole log. Measured: see `prove_release.sh` gate G6.
+- Fixed (airlock, the two known gaps of #97): symlink swap between the check and the open (the workspace is
+  mounted `nosymfollow` for the airlock and every upstream); mid-call crash, timeout and airlock kill (steps end
+  ABORTED and stay spent; the exact total survives restarts; a crashed stdio upstream is started again).
+- Added: `prove_release.sh`, 8 release gates, exit 0 only if all pass.
+- Added (airlock): `llm` in `forge.yaml`, the airlock's model endpoint. The box gets `ANTHROPIC_BASE_URL` and no
+  key; the airlock adds the key (named by `key_env`), forwards through the egress proxy (an airlock-only target),
+  streams SSE back, reserves `max_tokens` + estimated input before forwarding and settles to the reported usage
+  after (the full reservation stays spent when usage is unknown). Caps per session, per UTC day and per request,
+  decided by the same compiled #91 verifier (PROVED model); estimate, settlement and proxy are NATIVE CHECK.
+  `up` needs no `--pass-env` for the model key and refuses it. Tested: gate G8 (fake provider, fake key).
+- Not tested: a real model session in the box; Linux and Windows hosts; real paid upstreams.
 ## 0.12.1 — 2026-11-22
 - Fixed: `/forge approve` (and bare `/forge`, `/forge spec`) showed each spec shortened to its clause lines, so some
   multi-line clauses were cut off, while the approval covers the complete file by hash. It now shows every file in

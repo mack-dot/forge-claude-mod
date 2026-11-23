@@ -26,11 +26,19 @@ type Check = {
   examples?: string
   decisions?: string
   diff?: DiffEntry | DiffEntry[]
+  watchedFields?: string[]
 }
 type LastDiff = { checks: Record<string, { verdict: string; inputs?: number; disagreements?: unknown[] }> }
 type Config = { version: 1; checks: Check[]; dafny?: string }
 type Verdict = string
-type LastCheck = { at: string; verdicts: Record<string, Verdict>; detail: Record<string, string> }
+type LastCheck = {
+  at: string
+  verdicts: Record<string, Verdict>
+  detail: Record<string, string>
+  warnings?: string[]
+  // places outside a rule that decide on its watched fields (written by `check` when a check has watchedFields)
+  outside?: Record<string, unknown[]>
+}
 
 const DIR = '.forge'
 const CONFIG = `${DIR}/forge.json`
@@ -82,8 +90,28 @@ function summary(last: LastCheck | undefined, total: number): string {
   if (!vs.length) return 'forge: no checks · /forge'
   const ok = vs.filter(([, v]) => v === 'VERIFIED').length
   const bad = vs.find(([, v]) => v !== 'VERIFIED')
-  if (!bad) return `forge ✓ VERIFIED ${ok}/${vs.length}`
+  if (!bad) return vs.length === 1 ? `forge ✓ ${vs[0][0]}: model PROVED` : `forge ✓ ${ok}/${vs.length} models PROVED`
   return `forge ✗ ${bad[1]} ${bad[0]} · ${ok}/${vs.length} verified`
+}
+
+// What a green check does NOT cover, said in the same line: the fuzz (a finite test of the code people run),
+// code outside the rule that decides the same question, and decision notes that may be stale.
+function scopeText(last: LastCheck | undefined, diff: LastDiff | undefined, cfg: Config | undefined): string {
+  if (!last || !Object.values(last.verdicts).every(v => v === 'VERIFIED')) return ''
+  let t = ''
+  const fuzzed = cfg?.checks.some(c => c.diff) ?? false
+  if (!fuzzed && !(diff && Object.keys(diff.checks).length)) t += ' · app code NOT fuzzed'
+  // Bypasses: shown (also as 0) once a check names the fields it governs; unknown otherwise, so say nothing.
+  const watched = cfg?.checks.some(c => (c as { watchedFields?: unknown[] }).watchedFields?.length) ?? false
+  const outside = Object.values(last.outside ?? {}).reduce((n, xs) => n + (xs?.length ?? 0), 0)
+  if (watched || outside) t += outside ? ` · ${outside} bypass${outside === 1 ? '' : 'es'}, /forge:bypass` : ' · 0 bypasses'
+  const warnings = last.warnings ?? []
+  const stale = warnings.filter(w => w.startsWith('DECISION_NOTE_STALE')).length
+  const broken = warnings.filter(w => w.startsWith('APP_SYNTAX_ERROR')).length
+  if (broken) t += ` · ✗ ${broken} app file${broken === 1 ? '' : 's'} do not parse`
+  if (stale) t += ` · ${stale} decision record${stale === 1 ? '' : 's'} may be stale`
+  else if (cfg?.checks.some(c => (c as { decisions?: string }).decisions)) t += ' · records current'
+  return t
 }
 
 async function refreshStatus($: Api) {
@@ -104,8 +132,9 @@ async function refreshStatus($: Api) {
       ? ` · fuzz ${broken.verdict}`
       : bad
         ? ` · fuzz ✗ ${bad} disagreement(s), /forge diff`
-        : ` · fuzz ✓ ${inputs.toLocaleString('en-US')} inputs`
+        : ` · fuzzed ${inputs.toLocaleString('en-US')} cases, wrapper NOT proved`
   }
+  if (!isChecking && !isDiffing) text += scopeText(last, diff, cfg)
   $.ui.status(cfg || last ? text : undefined)
 }
 
@@ -158,9 +187,10 @@ async function runBuild($: Api, isCheckOnly: boolean): Promise<string> {
 const PENDING = `${DIR}/pending-approval.json`
 const PENDING_MAX_AGE_MS = 24 * 3600 * 1000
 
-async function showSpecs($: Api): Promise<{ text: string; isOk: boolean; hashes?: Record<string, string> }> {
+async function showSpecs($: Api, isFull = false): Promise<{ text: string; isOk: boolean; hashes?: Record<string, string> }> {
   const root: string = await $.session.root()
-  const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'spec', '--root', root, '--json'], {
+  const args = ['python3', `${$.plugin.root}/cli/forge_check.py`, 'spec', '--root', root, '--json', ...(isFull ? ['--full'] : [])]
+  const r = await $.process.run(args, {
     cwd: root,
     timeoutMs: 60_000,
   })
@@ -172,17 +202,17 @@ async function showSpecs($: Api): Promise<{ text: string; isOk: boolean; hashes?
   }
 }
 
-async function showForApproval($: Api, lead: string): Promise<string> {
+async function showForApproval($: Api, lead: string, isFull = false): Promise<string> {
   const root: string = await $.session.root()
-  const { text, isOk, hashes } = await showSpecs($)
+  const { text, isOk, hashes } = await showSpecs($, isFull)
   if (!isOk || !hashes) return text
   await writeJson($, root, PENDING, { shownAt: new Date().toISOString(), hashes })
   return `${lead}\n\n${text}\n\nFor a plain-words explanation: /forge:explain\nTo approve exactly this: /forge approve yes`
 }
 
-async function approve($: Api, isConfirmed: boolean): Promise<string> {
+async function approve($: Api, isConfirmed: boolean, isFull = false): Promise<string> {
   const root: string = await $.session.root()
-  if (!isConfirmed) return showForApproval($, 'You are about to approve this:')
+  if (!isConfirmed) return showForApproval($, 'You are about to approve this:', isFull)
   const pending = await readJson<{ shownAt: string; hashes: Record<string, string> }>($, join(root, PENDING))
   const isFresh = !!pending && Date.now() - Date.parse(pending.shownAt) < PENDING_MAX_AGE_MS
   if (!pending || !isFresh)
@@ -200,10 +230,24 @@ async function approve($: Api, isConfirmed: boolean): Promise<string> {
       cwd: root,
       timeoutMs: 60_000,
     })
-    return `${r.stdout.trim()}\n${inv.exitCode === 0 ? inv.stdout.trim() + ' (commit it with the approval)' : 'INVARIANTS.md was not updated: ' + (inv.stderr || inv.stdout).trim()}\nNext: /forge check`
+    const outside = await bypassCount($, root)
+    return `${r.stdout.trim()}\n${inv.exitCode === 0 ? inv.stdout.trim() + ' (commit it with the approval)' : 'INVARIANTS.md was not updated: ' + (inv.stderr || inv.stdout).trim()}${outside}\nNext: /forge check`
   }
   // Something changed since it was shown: show the new version, so the next "yes" approves that.
   return showForApproval($, `${(r.stdout || r.stderr).trim()}\nHere is the current version:`)
+}
+
+// After an approval: if a check names its watchedFields, count the places outside the rule that use them.
+async function bypassCount($: Api, root: string): Promise<string> {
+  const cfg = await readJson<Config>($, join(root, CONFIG))
+  if (!cfg?.checks?.some(c => c.watchedFields?.length)) return ''
+  const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'bypass', '--root', root, '--json'], { cwd: root, timeoutMs: 60_000 })
+  try {
+    const k = (JSON.parse(r.stdout) as { unreviewed: number }).unreviewed
+    return k ? `\nBypass search: ${k} place${k === 1 ? '' : 's'} outside the rule use its watched fields (/forge:bypass)` : '\nBypass search: no unreviewed place outside the rule uses its watched fields'
+  } catch {
+    return `\nBypass search did not run: ${(r.stderr || r.stdout).trim().slice(0, 300)}`
+  }
 }
 
 // The steps where Claude talks with the person are Markdown commands in commands/ (/forge:scan,
@@ -238,7 +282,13 @@ async function wizard($: Api): Promise<{ text: string; fill?: string }> {
   const next = hasDiff
     ? 'Every disagreement above is a bug in your shipped code or a gap in the rule. Your app files are unchanged.\nOptional next steps: switch your app to the proved code (ask Claude: "switch my app to the proved rule"); /forge add for another rule; /forge mutate; /forge invariants.'
     : 'Next: fuzz your shipped code against the proved rule. Claude sets it up without changing your app files:'
-  return { text: `${proof}${fuzz ? '\n\n' + fuzz : ''}\n\n${next}`, fill: hasDiff ? undefined : '/forge:fuzz ' }
+  // A proof covers the proved function only: offer the search for code that decides the same question elsewhere.
+  const unwatched = cfg.checks.filter(c => !c.watchedFields?.length).map(c => c.name)
+  const bypass = unwatched.length
+    ? `\nNot searched yet for code that goes around the rule (${unwatched.join(', ')}): /forge:bypass`
+    : ''
+  const fill = hasDiff ? (unwatched.length ? '/forge:bypass ' : undefined) : '/forge:fuzz '
+  return { text: `${proof}${fuzz ? '\n\n' + fuzz : ''}\n\n${next}${bypass}`, fill }
 }
 
 // Files whose change should trigger the differential fuzz: the proved code, the files that import it, the
@@ -312,7 +362,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'forge',
-      description: 'Forge proof gate: next step, or check / approve / build / spec / status (conversations: /forge:scan, /forge:add)',
+      description: 'Forge proof gate: next step, or check / approve / build / spec / status (conversations: /forge:scan, /forge:add, /forge:bypass)',
       argumentHint: '[check|approve|approve yes|build|diff|invariants|mutate|spec|status]',
     })
     const r = await next(e)
@@ -350,19 +400,24 @@ export const register: Register = on => {
       })
       return { text: (r.stdout || r.stderr).trim().slice(0, 6000) || `The checker did not run (exit ${r.exitCode}).` }
     }
-    if (arg === 'approve') return { text: await approve($, /^approve\s+yes\b/.test(e.args.trim())) }
+    if (arg === 'approve')
+      return { text: await approve($, /^approve\s+yes\b/.test(e.args.trim()), /--full\b/.test(e.args)) }
     if (arg === 'spec') {
-      const { text } = await showSpecs($)
+      const { text } = await showSpecs($, /--full\b/.test(e.args))
       return { text: `${text}\n\nFor a plain-words explanation: /forge:explain` }
     }
     if (arg === 'status') {
       const root: string = await $.session.root()
       const last = await readJson<LastCheck>($, join(root, LAST))
-      return { text: last ? `${summary(last, 0)}\nlast run ${last.at}\n${JSON.stringify(last.verdicts, null, 2)}` : 'No check has run yet. Try /forge.' }
+      const cfg = await readJson<Config>($, join(root, CONFIG))
+      const diff = await readJson<LastDiff>($, join(root, '.forge/last-diff.json'))
+      if (!last) return { text: 'No check has run yet. Try /forge.' }
+      const extra = [...(last.warnings ?? []).map(w => `! ${w}`)]
+      return { text: `${summary(last, 0)}${scopeText(last, diff, cfg)}\nlast run ${last.at}\n${JSON.stringify(last.verdicts, null, 2)}${extra.length ? '\n' + extra.join('\n') : ''}` }
     }
     // Steps where Claude talks with the person are Markdown commands (/forge:scan …). A command.run hook
     // cannot start a Claude turn, so put the right command in the prompt box: the person presses Enter.
-    const moved = ['scan', 'add', 'explain', 'fix', 'doctor', 'build-setup', 'fuzz']
+    const moved = ['scan', 'add', 'explain', 'fix', 'doctor', 'build-setup', 'fuzz', 'bypass']
     if (moved.includes(arg)) {
       const rest = e.args.trim().slice(arg.length).trim()
       const line = `/forge:${arg}${rest ? ' ' + rest : ' '}`
