@@ -273,7 +273,8 @@ against other code) and `agent/protocol_regress.py` in `validate.sh` (domain con
 | "memo on gives the same verdict as memo off" | FINITE TEST (24 logs x 2) plus the purity argument above |
 | Everything else in `engine/`, `forge_airlock.py`, the canary, the egress proxy, the sync filter, the draft heuristics | NATIVE CHECK |
 | Every run and number in this README | FINITE TEST (one machine) |
-| Isolation | container tier: the box shares the host kernel (on macOS, Docker Desktop's Linux VM) |
+| Isolation (default `docker`) | container tier: the box shares the host kernel (on macOS, Docker Desktop's Linux VM) |
+| Isolation `gvisor` / `microvm` | NATIVE CHECK: the runtime choice and the in-box probe; the runtimes themselves are third-party code, not proved |
 | Hosts in `agent.egress_allow` | reachable: the box can send data there |
 | `--pass-env NAME` | the agent can read that value |
 | `llm`: spending caps | the verifier's verdict on the log is PROVED; estimate, settlement and proxy are NATIVE CHECK |

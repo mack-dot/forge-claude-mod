@@ -28,9 +28,21 @@ RT=$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import backends
   || { echo "VALIDATE: isolation $ISO not available on this Docker host (fail closed)" | tee -a "$OUT/summary.txt"; exit 2; }
 RT_OVR=""
 if [ -n "$RT" ]; then  # the agent side only; airlock, mock-http, bench-direct stay on runc
+  # gVisor's netstack and a Kata guest do not reach Docker's embedded DNS (a NAT rule in the netns):
+  # fixed addresses for airlock and mock-http, written into the agent side's /etc/hosts.
   RT_OVR="$OUT/compose.runtime.yml"
-  { echo "services:"; for s in agent control-env-secret control-hidden-mount control-egress control-root-writes agent-bench; do
-      printf '  %s: {runtime: %s}\n' "$s" "$RT"; done; } >"$RT_OVR"
+  # mock-http only for control-egress (the agent on the upstream network): the canary of a normal agent
+  # counts a resolvable upstream name as a breach.
+  H='["airlock:172.30.250.10"]'; HE='["airlock:172.30.250.10", "mock-http:172.30.251.20"]'
+  { echo "networks:"
+    echo "  agentnet: {ipam: {config: [{subnet: 172.30.250.0/24}]}}"
+    echo "  upstream: {ipam: {config: [{subnet: 172.30.251.0/24}]}}"
+    echo "services:"
+    echo "  airlock: {networks: {agentnet: {ipv4_address: 172.30.250.10}, upstream: {ipv4_address: 172.30.251.10}}}"
+    echo "  mock-http: {networks: {upstream: {ipv4_address: 172.30.251.20}}}"
+    for s in agent control-env-secret control-hidden-mount control-egress control-root-writes agent-bench; do
+      printf '  %s: {runtime: %s, extra_hosts: %s}\n' "$s" "$RT" "$([ "$s" = control-egress ] && echo "$HE" || echo "$H")"
+    done; } >"$RT_OVR"
 fi
 echo "== isolation $ISO (agent runtime: ${RT:-runc})" | tee -a "$OUT/summary.txt"
 
@@ -52,7 +64,7 @@ PROBE=$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import backe
 dc --profile controls down -v --remove-orphans >/dev/null 2>&1
 t=$SECONDS; dc up -d --wait airlock >/dev/null 2>&1
 export FORGE_HOST_KERNEL=$(dc exec -T airlock cat /proc/version 2>/dev/null)
-dc run --rm --no-deps -T -e FORGE_HOST_KERNEL agent sh -c "$PROBE cat /proc/version; (dmesg 2>/dev/null | head -2) || true" >"$OUT/iso-probe.log" 2>&1; rc=$?
+dc run --rm --no-deps -T -e FORGE_HOST_KERNEL agent sh -c "$PROBE cat /proc/version" </dev/null >"$OUT/iso-probe.log" 2>&1; rc=$?
 echo "     host (airlock) kernel: $FORGE_HOST_KERNEL" | cut -c1-160 | tee -a "$OUT/summary.txt"
 sed 's/^/     agent: /' "$OUT/iso-probe.log" | head -4 | cut -c1-160 | tee -a "$OUT/summary.txt"
 if [ "$ISO" = docker ]; then

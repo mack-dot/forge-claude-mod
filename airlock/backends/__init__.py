@@ -37,7 +37,8 @@ RUNTIMES = {
 }
 
 HINT = {
-    "gvisor": "install gVisor on a Linux Docker host and register it: `runsc install && systemctl restart docker` "
+    "gvisor": "install gVisor on a Linux Docker host and register it: `runsc install -- --reproduce-nat && systemctl restart docker` "
+              "(--reproduce-nat lets Docker's embedded DNS answer in the sandbox) "
               "(https://gvisor.dev/docs/user_guide/install/). Docker Desktop on macOS or Windows has no runsc.",
     "microvm": "needs a Linux Docker host with /dev/kvm and Kata Containers registered as a Docker runtime named "
                "`kata` (https://github.com/kata-containers/kata-containers). Docker Desktop on macOS has no Kata "
@@ -96,6 +97,30 @@ def apply(doc, runtime, services=("agent",)):
             if s in doc["services"]:
                 doc["services"][s]["runtime"] = runtime
     return doc
+
+
+def agent_hosts(project, services, network="agentnet"):
+    """["airlock:<ip>", ...] for the started services on the agent network of a compose project,
+    or None if one cannot be read. Used for gvisor and microvm: their agent cannot use Docker's
+    embedded DNS (127.0.0.11 is a NAT rule in the container's network namespace, which gVisor's
+    netstack and a Kata guest kernel do not see), so the names go into the agent's /etc/hosts."""
+    hosts = []
+    for svc in services:
+        r = subprocess.run(["docker", "compose", "-p", project, "ps", "-q", svc], capture_output=True, text=True)
+        cid = r.stdout.strip().splitlines()[:1]
+        if r.returncode or not cid:
+            return None
+        r = subprocess.run(["docker", "inspect", "-f", "{{json .NetworkSettings.Networks}}", cid[0]],
+                           capture_output=True, text=True)
+        try:
+            nets = json.loads(r.stdout)
+        except ValueError:
+            return None
+        ip = next((v.get("IPAddress") for k, v in nets.items() if k == f"{project}_{network}"), None)
+        if not ip:
+            return None
+        hosts.append(f"{svc}:{ip}")
+    return hosts
 
 
 def probe_sh(name):

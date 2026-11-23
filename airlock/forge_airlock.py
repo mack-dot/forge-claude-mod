@@ -348,6 +348,14 @@ def cmd_up(a):
             run(dc + ["logs", "--no-log-prefix", "--tail", "30", "airlock"])
             say("the airlock did not start (fail closed); see the log above")
             return EXIT_POLICY
+        if agent_runtime:  # gVisor's netstack and a Kata VM do not reach Docker's embedded DNS: pin the names
+            hosts = B.agent_hosts(project, services)
+            if hosts is None:
+                say("could not read the airlock's address on the agent network (fail closed)")
+                return EXIT_POLICY
+            doc["services"]["agent"]["extra_hosts"] = hosts
+            with open(os.path.join(run_dir, "compose.json"), "w") as f:
+                json.dump(doc, f, indent=1)
         cmd = claude_args(a.command)
         probe, probe_env = B.probe_sh(isolation), []
         if probe:  # the kernel the trusted side sees (runc = the Docker host kernel), compared in the box

@@ -8,7 +8,8 @@ drives the y/N prompt through a pseudo-terminal. Cases:
   2. answer y -> exactly the allowed changes are applied; hidden, read-only, ignored and
      forge.yaml changes are not; the uncommitted change was visible in the box;
   3. a breach (the FAKE upstream key passed to the agent) -> canary BREACH, exit 10, nothing synced;
-  4. --isolation with a backend this Docker host does not have -> refused (exit 2), nothing ran.
+  4. --isolation with a backend this Docker host does not have -> refused (exit 2), nothing ran;
+  5. --isolation gvisor with runc posing as runsc -> the in-box probe refuses (exit 10), nothing ran.
 FORGE_E2E_ISOLATION=gvisor|microvm runs cases 1-3 with that backend (the box must also pass its probe).
 Leaves no container, volume or network of its own. Exit 0 only if all hold. Label: FINITE TEST."""
 import hashlib
@@ -149,6 +150,12 @@ def main():
             case(f"up: --isolation {n} on a Docker host without it -> refused (exit 2), command not run, repo unchanged",
                  code == 2 and "not available" in log and "BOX-" not in log and tree_hash(repo) == before0,
                  f"exit {code}: {log[-800:]}")
+        # negative control of the in-box probe: "gvisor" mapped to plain runc must be caught at start
+        before0 = tree_hash(repo)
+        code, log = up(repo, "n", extra=["--isolation", "gvisor"], env_extra={"FORGE_AIRLOCK_GVISOR_RUNTIME": "runc"})
+        case("up: --isolation gvisor on a runtime that is not gVisor (runc) -> probe refuses, exit 10, command not run",
+             code == 10 and "NOT in effect" in log and "BOX-2-DONE" not in log
+             and tree_hash(repo) == before0, f"exit {code}: {log[-800:]}")
         before = tree_hash(repo)
         t0 = time.monotonic()
         code, log = up(repo, "n")

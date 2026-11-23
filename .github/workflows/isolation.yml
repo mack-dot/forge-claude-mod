@@ -45,7 +45,9 @@ jobs:
           sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/gvisor.list -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0
           sudo apt-get install -y "runsc=${GVISOR_RELEASE}.0"
           runsc --version
-          sudo runsc install
+          # --reproduce-nat: copy the container netns NAT rules into gVisor's netstack, so Docker's embedded
+          # DNS (127.0.0.11, a DNAT rule) answers in the sandbox; without it the agent cannot resolve `airlock`.
+          sudo runsc install -- --reproduce-nat
           sudo systemctl restart docker
           cat /etc/docker/daemon.json
       - name: install Kata Containers (pinned static release) and register it with Docker
@@ -82,12 +84,19 @@ jobs:
           rts=runc
           [ "${{ matrix.backend }}" = gvisor ] && rts=runc,runsc
           [ "${{ matrix.backend }}" = microvm ] && rts=runc,kata
-          python3 airlock/proof/startup_bench.py forge-airlock-proof:local "$rts" 10 > "$RUNNER_TEMP/startup.json"
-          cat "$RUNNER_TEMP/startup.json"
+          # cold = the first start after a Docker restart and a page-cache drop, for EACH runtime separately
+          for rt in ${rts//,/ }; do
+            sudo systemctl restart docker && sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+            until docker info >/dev/null 2>&1; do sleep 1; done
+            python3 airlock/proof/startup_bench.py forge-airlock-proof:local "$rt" 10 > "$RUNNER_TEMP/startup-$rt.json"
+          done
+          cat "$RUNNER_TEMP"/startup-*.json
       - name: Docker battery (validate.sh = G2-G4) with the agent under ${{ matrix.backend }}
         run: |
           s=$SECONDS
-          FORGE_ISOLATION=${{ matrix.backend }} airlock/proof/validate.sh "$RUNNER_TEMP/validate" > "$RUNNER_TEMP/validate-console.txt" 2>&1; v=$?
+          FORGE_ISOLATION=${{ matrix.backend }} timeout 1800 airlock/proof/validate.sh "$RUNNER_TEMP/validate" \
+            </dev/null > "$RUNNER_TEMP/validate-console.txt" 2>&1 && v=0 || v=$?
+          [ "$v" = 124 ] && { echo "validate.sh TIMED OUT after 1800 s"; docker ps -a; }
           cat "$RUNNER_TEMP/validate/summary.txt"
           echo "battery ${{ matrix.backend }}: exit=$v checks_ok=$(grep -c '^ok  ' "$RUNNER_TEMP/validate/summary.txt") checks_fail=$(grep -c '^FAIL' "$RUNNER_TEMP/validate/summary.txt") wall=$((SECONDS-s))s"
           [ "$v" = 0 ] || { tail -60 "$RUNNER_TEMP/validate-console.txt"; exit 1; }
@@ -95,7 +104,7 @@ jobs:
         if: always()
         run: |
           [ "${{ matrix.backend }}" = docker ] || export FORGE_E2E_ISOLATION=${{ matrix.backend }}
-          python3 airlock/tests/run_up_e2e.py
+          timeout 900 python3 airlock/tests/run_up_e2e.py
       - name: minimal Firecracker boot (pinned release; Kata's guest kernel; busybox initramfs)
         if: always() && matrix.backend == 'microvm'
         run: |
@@ -136,5 +145,5 @@ jobs:
           path: |
             ${{ runner.temp }}/validate
             ${{ runner.temp }}/validate-console.txt
-            ${{ runner.temp }}/startup.json
+            ${{ runner.temp }}/startup-*.json
           if-no-files-found: warn
