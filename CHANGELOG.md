@@ -2,7 +2,16 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
-## Unreleased
+## 0.13.0 — 2026-11-23
+
+One release with the owner's chronicle feedback and the airlock:
+- **Bypass gate** (`watchedFields`, `UNAPPROVED_BYPASS`, `/forge:bypass`): code outside a proved rule that decides on its fields fails `check` until it is routed through the rule or allowed by a person.
+- **Messy-input fuzz** of the unproved wrapper (`THROWS_ON_MESSY_INPUT`).
+- **Scope-honest status**, `DECISION_NOTE_STALE`, notes edits without re-approval, next-rule suggestion, build syntax step over app files and their importers (`APP_SYNTAX_ERROR`), short approval digest (`--full` for every file).
+- **Fast generated JS module** (no `new Function`) and `serviceTest` (`NOT_CALLED`).
+- **forge-airlock** in the plugin: an agent box with hidden paths absent from disk, default-deny MCP, gates on the compiled #91 verifier, canary, egress allowlist, reviewed sync-back; red-team fixes (sync-back case/Unicode aliases; protocol F1–F8); model proxy so the box holds no API key, with spending capped by the proved verifier (strict 1 byte/token reservation, settled to reported usage). `prove_release.sh`: 8 gates, all exit 0 on three consecutive runs.
+- **Upgrade note:** a committed `js` build is `STALE_BUILD` until you run `/forge build` once (the new module is part of the build). Approvals from before 0.13 stay valid; approve once more to edit notes without re-approval.
+
 - New (`js` target): `build` also writes `<name>.mjs` and `<name>.d.mts` next to the emitted `<name>.js`: one ES
   module with real exports, a private pinned copy of bignumber.js 9.3.1 (SHA-256 checked) and helpers
   (`toDafnyString`/`fromDafnyString` with a bounded cache of frozen seqs, `toDafnyInt`/`fromDafnyInt`, seq and set
@@ -100,6 +109,25 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
 - Fixed: the JavaScript evaluator split input lines at U+2028 and U+2029 (Node's readline); it now splits at "\n" only.
 - Tested: 50 cases (1 new: two bugs with the same wrong answer, zero and empty text, are both reported).
 
+- Added: the MCP airlock in the same plugin (`airlock/`, `/forge:airlock`, `python3 airlock/forge_airlock.py up --
+  <command>`): `forge.yaml` drafted by Claude (secrets by NAME only), a box whose workspace has the hidden paths
+  absent (also from git history), default-deny MCP tools, caps decided by the compiled #91 escrow verifier (PROVED
+  model), a breach canary (fail closed), an egress allowlist, `--pass-env NAME` with a warning, and a diff
+  sync-back applied only after y. Ported from Forge's private proposal #97. No existing command changed; only
+  `up`, `tools` and `check` need Docker.
+- Changed (airlock): gated calls go to ONE persistent verifier process with a memo of its pure SHA-256 and key
+  validation; every call still verifies the whole log. Measured: see `prove_release.sh` gate G6.
+- Fixed (airlock, the two known gaps of #97): symlink swap between the check and the open (the workspace is
+  mounted `nosymfollow` for the airlock and every upstream); mid-call crash, timeout and airlock kill (steps end
+  ABORTED and stay spent; the exact total survives restarts; a crashed stdio upstream is started again).
+- Added: `prove_release.sh`, 8 release gates, exit 0 only if all pass.
+- Added (airlock): `llm` in `forge.yaml`, the airlock's model endpoint. The box gets `ANTHROPIC_BASE_URL` and no
+  key; the airlock adds the key (named by `key_env`), forwards through the egress proxy (an airlock-only target),
+  streams SSE back, reserves `max_tokens` + estimated input before forwarding and settles to the reported usage
+  after (the full reservation stays spent when usage is unknown). Caps per session, per UTC day and per request,
+  decided by the same compiled #91 verifier (PROVED model); estimate, settlement and proxy are NATIVE CHECK.
+  `up` needs no `--pass-env` for the model key and refuses it. Tested: gate G8 (fake provider, fake key).
+- Not tested: a real model session in the box; Linux and Windows hosts; real paid upstreams.
 ## 0.12.1 — 2026-11-22
 - Fixed: `/forge approve` (and bare `/forge`, `/forge spec`) showed each spec shortened to its clause lines, so some
   multi-line clauses were cut off, while the approval covers the complete file by hash. It now shows every file in
