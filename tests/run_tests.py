@@ -960,6 +960,18 @@ def main():
         failed += not ok
         extra += 1
         print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
+    # signed approvals (S1): the rogue-agent exit gate, software ed25519 keys made at test time
+    sig = subprocess.run([sys.executable, os.path.join(HERE, 'run_signed_approval.py')], stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, universal_newlines=True)
+    for line in sig.stdout.splitlines():
+        if line.startswith(('ok  ', 'FAIL')):
+            failed += line.startswith('FAIL')
+            extra += 1
+            print(line)
+    if sig.returncode and 'FAIL' not in sig.stdout:
+        failed += 1
+        extra += 1
+        print('FAIL  signed approvals: run_signed_approval.py exit %d: %s' % (sig.returncode, sig.stdout[-400:]))
     print('%d cases, %d failed' % (len(CASES) + len(BUILD_CASES) + extra, failed))
     return 1 if failed else 0
 

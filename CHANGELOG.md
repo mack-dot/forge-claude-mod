@@ -2,6 +2,30 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## Unreleased — signed approvals (S1: an approval only a person with a hardware key can make)
+
+- New (optional): `"require_signed_approval": true` in forge.json. `approve --hardware [--key KEY]` (and
+  `/forge approve yes --hardware`) signs the canonical approved.json with `ssh-keygen -Y sign -n forge-approval`
+  into `.forge/approved.json.sig`. approved.json then also covers `.forge/allowed_signers` and `"signed_files"`
+  (for example `forge.yaml`, `INVARIANTS.md`). `check` verifies against a trust anchor outside the working tree
+  (`--allowed-signers`, `FORGE_ALLOWED_SIGNERS`, or `.forge/allowed_signers` at `--base`); else verdict
+  `APPROVAL_UNSIGNED`, exit 2. Optional `"signer_key_types"` (for example only `sk-` FIDO2 types). New
+  `cli/forge_sign.py`.
+- New (airlock): `require_human_approval: hardware` per tool and `human_approval.allowed_signers` in forge.yaml. The
+  call is held until a signature over the exact call (run, call id, step id, tool, argument hash) verifies;
+  `forge_sign.py call` signs on the host. The airlock image now has `openssh-client`.
+- The mod's guard also blocks Claude's Edit and Write tools on `.forge/approved.json.sig` and
+  `.forge/allowed_signers`.
+- Tested (FINITE TEST, software ed25519 keys made at test time, no hardware): `tests/run_signed_approval.py`, 27
+  cases: a rogue agent (`tests/rogue_agent.py`) that rewrites spec, forge.yaml, INVARIANTS.md, approved.json and the
+  .sig, switches the requirement off, or adds its own key and re-signs gets `APPROVAL_UNSIGNED`/exit 2 in every case,
+  with the anchor outside the project and at `--base`; owner-signed gives `VERIFIED`/0. Airlock: 16 unit cases and a
+  Docker `forge up` end-to-end test (6 cases). Mutation controls: an accept-all verifier fails 8 signed-approval
+  cases; removing the hash coverage check fails 7; an accept-all call verifier fails 6 airlock cases; skipping the
+  hold fails 8.
+- Not tested: a real FIDO2 key or a Secure Enclave key (needs the owner's hardware; commands in the pull request);
+  the Action on a signed project (no workflow change here); PIN (`verify-required`) through the mod.
+
 ## 0.13.0 — 2026-11-23
 
 One release with the owner's chronicle feedback and the airlock:

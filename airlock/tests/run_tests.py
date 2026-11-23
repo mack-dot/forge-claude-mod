@@ -536,8 +536,16 @@ def test_llm():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_human_approval():
+    """require_human_approval: hardware (tests/human_approval_test.py; software keys made at test time)."""
+    sys.path.insert(0, HERE)
+    import human_approval_test
+    human_approval_test.run(lambda name, ok, detail="": case(name, bool(ok), detail))
+
+
 def main():
-    for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static, test_redteam):
+    for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static,
+              test_redteam, test_human_approval):
         try:
             t()
         except Exception as e:  # noqa: BLE001
