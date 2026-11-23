@@ -375,11 +375,14 @@ def _resolve(v, environ, where):
     return ENV_REF.sub(sub, v)
 
 
+ISOLATION_BACKENDS = ("docker", "gvisor", "microvm")  # the same names as airlock/backends
+
+
 class Policy:
     def __init__(self, doc, environ=None, resolve=True):
         """resolve=True replaces ${NAME} in upstreams with the value from environ (the
         airlock side). resolve=False keeps the names (host side: no secret is read)."""
-        _keys(doc, "forge.yaml", required=("version", "upstreams", "tools"), optional=("paths", "canary", "agent", "llm"))
+        _keys(doc, "forge.yaml", required=("version", "upstreams", "tools"), optional=("paths", "canary", "agent", "llm", "isolation"))
         if doc["version"] != 1:
             raise PolicyError("version must be 1")
         # upstreams
@@ -465,6 +468,10 @@ class Policy:
         for hp in self.egress_allow:
             if not isinstance(hp, str) or not re.fullmatch(r"[A-Za-z0-9.-]{1,253}:[0-9]{1,5}", hp):
                 raise PolicyError(f"agent.egress_allow entry {hp!r} must be host:port")
+        # isolation backend of the agent container (forge_airlock.py checks that it is available)
+        self.isolation = doc.get("isolation")
+        if self.isolation is not None and self.isolation not in ISOLATION_BACKENDS:
+            raise PolicyError(f"isolation must be one of {', '.join(ISOLATION_BACKENDS)}, not {self.isolation!r}")
         self.llm = parse_llm(doc.get("llm"))
         self.env_names = sorted(set(env_refs(doc)) | ({self.llm["key_env"]} if self.llm else set()))
         self.llm_key = None

@@ -4,7 +4,7 @@
   forge init  [--repo R] [--tools tools.json] [--force] [--json]   draft forge.yaml (secrets by NAME only)
   forge tools [--repo R] [--policy P]                              list the real tools of each upstream
   forge check [--repo R] [--policy P]                              validate forge.yaml (exit 2 if invalid)
-  forge up    [--repo R] [--policy P] [--pass-env NAME]... -- <command> [args...]
+  forge up    [--repo R] [--policy P] [--pass-env NAME]... [--isolation docker|gvisor|microvm] -- <command> [args...]
   forge reset-logs [--repo R]                                      delete this repository's gate logs
   forge wrapper [--repo R] [--force]                               write ./forge-airlock (init does it too)
 
@@ -31,6 +31,8 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "engine"))
 import draft as D  # noqa: E402
+sys.path.insert(0, HERE)
+import backends as B  # noqa: E402
 import sync  # noqa: E402
 from policy import Policy, PolicyError, env_refs  # noqa: E402
 
@@ -141,7 +143,7 @@ def stage_repo(repo, dest):
 
 # ---------------------------------------------------------------- compose generation
 def compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, pass_env, readonly_dirs,
-                own_agent_image=False, llm_session="default", egress_token=None):
+                own_agent_image=False, llm_session="default", egress_token=None, agent_runtime=None):
     agent_env = {"FORGE_AIRLOCK": f"http://airlock:{PORT}", "HOME": "/tmp"}
     if pol.egress_allow:
         agent_env.update(HTTPS_PROXY="http://egress:3128", HTTP_PROXY="http://egress:3128",
@@ -203,6 +205,8 @@ def compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, pass
     # F2: bounded container logs (json-file rotation): an agent cannot fill the host disk
     for v in svc.values():
         v["logging"] = {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}}
+    # isolation backend: only the agent changes runtime (gvisor: runsc; microvm: kata); the trusted side stays on runc
+    B.apply({"services": svc}, agent_runtime)
     return {"services": svc,
             "networks": {"agentnet": {"internal": True}, "outnet": {}},
             "volumes": {"ws": {}, "state": {}, "logs": {"external": True, "name": logs_volume}}}
@@ -287,6 +291,14 @@ def cmd_up(a):
     wants_claude = os.path.basename(a.command[0]) == "claude" and not a.agent_image
     build_images(wants_claude)
     pol, _doc = load_policy(policy_path)
+    try:  # fail closed: the chosen backend must be registered with Docker; never fall back to docker
+        isolation = B.resolve(a.isolation, getattr(pol, "isolation", None))
+        agent_runtime = B.runtime_for(isolation, B.docker_runtimes())
+    except B.BackendError as e:
+        say(str(e))
+        raise SystemExit(EXIT_POLICY)
+    say(f"isolation: {isolation}" + (f" (agent container runtime {agent_runtime})" if agent_runtime else
+                                     " (runc: the agent shares the Docker host kernel)"))
     missing = [n for n in pol.env_names if n not in os.environ]
     if missing:
         say(f"forge.yaml names these secrets, but your shell does not set them: {', '.join(missing)}")
@@ -319,7 +331,8 @@ def cmd_up(a):
         with open(os.path.join(run_dir, "agent", "mcp.json"), "w") as f:
             json.dump({"mcpServers": {"forge-airlock": {"type": "http", "url": f"http://airlock:{PORT}/mcp"}}}, f)
         doc = compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, a.pass_env,
-                          readonly_dirs(pol, stage), own_agent_image=bool(a.agent_image), llm_session=project)
+                          readonly_dirs(pol, stage), own_agent_image=bool(a.agent_image), llm_session=project,
+                          agent_runtime=agent_runtime)
         if pol.llm:
             c = pol.llm
             say(f"model access through the airlock: {c['scheme']}://{c['host']}:{c['port']} with the key from "
@@ -336,16 +349,24 @@ def cmd_up(a):
             say("the airlock did not start (fail closed); see the log above")
             return EXIT_POLICY
         cmd = claude_args(a.command)
+        probe, probe_env = B.probe_sh(isolation), []
+        if probe:  # the kernel the trusted side sees (runc = the Docker host kernel), compared in the box
+            os.environ["FORGE_HOST_KERNEL"] = out(dc + ["exec", "-T", "airlock", "cat", "/proc/version"]).stdout.strip()
+            probe_env = ["-e", "FORGE_HOST_KERNEL"]
         say("running the breach canary in the agent container, then: " + " ".join(cmd))
         tty = [] if sys.stdin.isatty() and sys.stdout.isatty() else ["-T"]
         signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl-C belongs to the program in the box
-        rc = run(dc + ["run", "--rm", "-e", "FORGE_CANARY_TOKEN"] + tty + ["agent", "sh", "-c",
-                 'python3 -I /forge/agent/canary.py >/tmp/forge-canary.log 2>&1; c=$?; tail -n 3 /tmp/forge-canary.log; '
+        rc = run(dc + ["run", "--rm", "-e", "FORGE_CANARY_TOKEN"] + probe_env + tty + ["agent", "sh", "-c",
+                 probe + 'unset FORGE_HOST_KERNEL; python3 -I /forge/agent/canary.py >/tmp/forge-canary.log 2>&1; c=$?; tail -n 3 /tmp/forge-canary.log; '
                  'unset FORGE_CANARY_TOKEN; [ "$c" = 0 ] || exit 86; exec "$@"', "forge-box"] + cmd).returncode
         signal.signal(signal.SIGINT, old_int)
         state = out(dc + ["exec", "-T", "airlock", "python3", "-c",
                           "import json,urllib.request; print(json.load(urllib.request.urlopen("
                           f"'http://127.0.0.1:{PORT}/healthz', timeout=5))['canary'])"]).stdout.strip()
+        if state != "PASSED" and probe and rc == B.PROBE_EXIT:
+            say(f"isolation {isolation} is not in effect in the agent container (probe exit {rc}): fail closed; "
+                "the command did not run; nothing is synced back")
+            return EXIT_BREACH
         if state != "PASSED":
             say(f"breach canary state {state or 'unknown'}: fail closed; the command did not run or was refused; "
                 "nothing is synced back")
@@ -496,6 +517,9 @@ def main(argv=None):
                            help="pass this variable from your shell to the agent (it CAN read it)")
             s.add_argument("--agent-image", help="your own agent image (needs python3 for the canary)")
             s.add_argument("--keep", action="store_true", help="keep the generated folder (debugging)")
+            s.add_argument("--isolation", choices=B.NAMES, default=None,
+                           help="agent isolation backend: docker (default, shared kernel), gvisor (runsc), "
+                                "microvm (Kata VM); refuses to start if the backend is not available")
     a = p.parse_args(argv)
     a.command = command
     return {"init": cmd_init, "tools": cmd_tools, "check": cmd_check, "up": cmd_up,

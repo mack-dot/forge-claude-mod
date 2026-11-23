@@ -7,7 +7,9 @@ drives the y/N prompt through a pseudo-terminal. Cases:
   1. answer n -> the real repository is byte-for-byte unchanged;
   2. answer y -> exactly the allowed changes are applied; hidden, read-only, ignored and
      forge.yaml changes are not; the uncommitted change was visible in the box;
-  3. a breach (the FAKE upstream key passed to the agent) -> canary BREACH, exit 10, nothing synced.
+  3. a breach (the FAKE upstream key passed to the agent) -> canary BREACH, exit 10, nothing synced;
+  4. --isolation with a backend this Docker host does not have -> refused (exit 2), nothing ran.
+FORGE_E2E_ISOLATION=gvisor|microvm runs cases 1-3 with that backend (the box must also pass its probe).
 Leaves no container, volume or network of its own. Exit 0 only if all hold. Label: FINITE TEST."""
 import hashlib
 import json
@@ -17,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.abspath(os.path.join(HERE, ".."))
@@ -97,6 +100,9 @@ def make_repo(tmp):
 def up(repo, answer, extra=(), env_extra=None):
     """Run forge up under a pseudo-terminal; type `answer` at the y/N prompt."""
     env = dict(os.environ, FORGE_E2E_TOKEN=FAKE, **(env_extra or {}))
+    iso = os.environ.get("FORGE_E2E_ISOLATION")
+    if iso and "--isolation" not in extra:
+        extra = ["--isolation", iso] + list(extra)
     argv = [sys.executable, os.path.join(PKG, "forge_airlock.py"), "up", "--repo", repo] + list(extra) + \
         ["--", "sh", "-c", SCRIPT]
     pid, fd = pty.fork()
@@ -133,11 +139,27 @@ def main():
     repo = make_repo(tmp)
     key = hashlib.sha256(os.path.realpath(repo).encode()).hexdigest()[:12]
     try:
+        sys.path.insert(0, PKG)
+        import backends as B
+        have = B.docker_runtimes() or set()
+        missing = [n for n in ("gvisor", "microvm") if not any(rt in have for rt in B.RUNTIMES[n])]
+        for n in missing:  # negative control: never a silent fall back to docker
+            before0 = tree_hash(repo)
+            code, log = up(repo, "n", extra=["--isolation", n])
+            case(f"up: --isolation {n} on a Docker host without it -> refused (exit 2), command not run, repo unchanged",
+                 code == 2 and "not available" in log and "BOX-" not in log and tree_hash(repo) == before0,
+                 f"exit {code}: {log[-800:]}")
         before = tree_hash(repo)
+        t0 = time.monotonic()
         code, log = up(repo, "n")
+        print(f"timing: up (answer n) {time.monotonic() - t0:.1f}s isolation={os.environ.get('FORGE_E2E_ISOLATION') or 'docker'}")
         open(os.path.join(tmp, "run-n.log"), "w").write(log)
         case("up: the canary passed and the hostile script ran to the end (exit 0)",
              code == 0 and "BOX-2-DONE" in log and "[canary] PASS" in log, f"exit {code}: {log[-1500:]}")
+        iso = os.environ.get("FORGE_E2E_ISOLATION")
+        if iso:
+            case(f"up: isolation {iso}: the box passed its probe (agent kernel differs from the host kernel)",
+                 f"isolation {iso}: agent kernel differs" in log, log[-1500:])
         case("up: the review lists hidden and ignored changes as not applied",
              all(s in log for s in ("not applied: .env", "not applied: src/proprietary/core.ts",
                                     "not applied: node_modules/x.js")), log[-2500:])
