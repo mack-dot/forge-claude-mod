@@ -1,0 +1,82 @@
+prove_release: commit 2881584 dirty=0 docker 28.5.1 2026-11-23T01:09:10Z
+G1  checker tests + airlock unit tests + plugin validate + secret/home-path scans exit=0     181s
+G2  hidden/visible paths: cat, ../, symlinks, concurrent swap, git show (4 checks) exit=0     220s
+G3  real fs server + gates: deny, args, 20 parallel, dup ids, crash, timeout, restart (15) exit=0     220s
+G4  planted breaches caught; fail-closed boot (12 checks)                      exit=0     220s
+G5  diff sync-back: y applies allowed only, n applies nothing, hidden/read-only rejected exit=0      33s
+G6  gated-call latency before (subprocess) vs after (persistent), median and p95 exit=0     105s
+G7  README: unified workflow and honest labels                                 exit=0       0s
+cleanup: containers=0 volumes=0 networks=0
+prove_release: PASS total=540s out=.forge/cache/release/run2
+
+ok   image build                                                    exit=0   expect=0      2s
+ok   codebase: docker compose up (canary + scenario phase 1)        exit=0   expect=0     29s
+ok   codebase: concurrent symlink-swap attack on MCP reads -> no leak exit=0   expect=0     20s
+info codebase: CONTROL swap attack WITHOUT nosymfollow (not gated): exit=0 (20 = the attack won)
+ok   codebase: planted breach control-env-secret -> canary BREACH   exit=10  expect=10    10s
+ok   codebase: planted breach control-hidden-mount -> canary BREACH exit=10  expect=10    10s
+ok   codebase: planted breach control-root-writes -> canary BREACH  exit=10  expect=10     9s
+ok   codebase: after BREACH an allowed read is refused (lockdown)   exit=0   expect=0      1s
+ok   codebase: workspace re-verified on each of 3 restarts (count=4) exit=0   expect=0      0s
+ok   visible: docker compose up (canary + scenario phase 1)         exit=0   expect=0     11s
+ok   quota: docker compose up (canary + scenario phase 1)           exit=0   expect=0     14s
+ok   quota: docker compose restart airlock (same log volume)        exit=0   expect=0      6s
+ok   quota: phase 2 after restart (caps kept)                       exit=0   expect=0      8s
+ok   quota: audit (every log re-verifies ACCEPT, gross <= cap)      exit=0   expect=0      0s
+ok   quota: audit numbers (3 deploys, 1000 rows, 2 aborted, 0 denied calls upstream) exit=0   expect=0      0s
+ok   quota: planted breach control-egress (agent on upstream net) -> BREACH exit=10  expect=10     9s
+ok   quota: second airlock on the same log volume refuses to start  exit=2   expect=2      0s
+ok   quota: invalid policy unknown-key -> refuses to start          exit=2   expect=2      0s
+ok   quota: invalid policy allow-and-deny -> refuses to start       exit=2   expect=2      1s
+ok   quota: invalid policy tool-not-offered -> refuses to start     exit=2   expect=2      1s
+ok   quota: invalid policy cap-changed -> refuses to start          exit=2   expect=2      0s
+ok   quota: one flipped log byte -> airlock refuses to start        exit=2   expect=2      1s
+ok   concurrency: docker compose up (canary + scenario phase 1)     exit=0   expect=0     11s
+ok   concurrency: audit (every log re-verifies ACCEPT, gross <= cap) exit=0   expect=0      4s
+ok   concurrency: audit numbers (sum 1000, 14 charges, 0 duplicate ids, 5 deploys) exit=0   expect=0      0s
+ok   crash: docker compose up (canary + scenario phase 1)           exit=0   expect=0     18s
+ok   crash: airlock killed (SIGKILL) while gated call 5 is PENDING (waited 17 polls) exit=0   expect=0     11s
+ok   crash: after restart every log re-verifies ACCEPT              exit=0   expect=0      3s
+ok   crash: exact spent total 5 of 5 (2 COMMITTED; crash, timeout, killed-in-flight ABORTED) exit=0   expect=0      0s
+ok   crash: next call after the restart refused REJECT_OVER_CAP     exit=0   expect=0      7s
+ok   crash: spent total still exactly 5 after two more restarts     exit=0   expect=0      3s
+== total 220s
+ok   cleanup: 0 containers and 0 volumes left (c=0 v=0)             exit=0   expect=0      0s
+VALIDATE: PASS
+
+{
+ "host_before": {
+  "mode": "subprocess",
+  "memo": "1",
+  "n": 120,
+  "median_ms": 287.01,
+  "p95_ms": 478.12
+ },
+ "host_after": {
+  "mode": "persistent",
+  "memo": "1",
+  "n": 120,
+  "median_ms": 15.67,
+  "p95_ms": 23.66
+ },
+ "docker_before": {
+  "call": "charge amount=1 (mock HTTP), gated by the compiled verifier",
+  "n": 120,
+  "direct_median_ms": 1.39,
+  "direct_p95_ms": 2.53,
+  "proxy_median_ms": 300.02,
+  "proxy_p95_ms": 513.21,
+  "overhead_median_ms": 298.63,
+  "overhead_p95_ms": 510.68
+ },
+ "docker_after": {
+  "call": "charge amount=1 (mock HTTP), gated by the compiled verifier",
+  "n": 120,
+  "direct_median_ms": 1.33,
+  "direct_p95_ms": 1.8,
+  "proxy_median_ms": 18.56,
+  "proxy_p95_ms": 26.08,
+  "overhead_median_ms": 17.23,
+  "overhead_p95_ms": 24.28
+ }
+}
