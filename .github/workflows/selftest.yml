@@ -34,16 +34,10 @@ jobs:
       - name: --base with the project in a subfolder (notes edit passes, binding edit is APPROVAL_CHANGED)
         run: bash .github/ci-fixture/subfolder_base.sh . "$RUNNER_TEMP/subfolder-base"
   action-on-example:
+    # No toolchain set up here: the Action must install Node and Go itself for the example's js and go targets.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
-      - run: go install golang.org/x/tools/cmd/goimports@v0.24.0 && echo "$HOME/go/bin" >> "$GITHUB_PATH"
       - uses: ./
         with:
           root: examples/wallet-cap
