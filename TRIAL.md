@@ -58,6 +58,7 @@ built code.
 | Survivors: harmless, or a spec gap (one line each) | |
 | Real bugs found: places where the code disagreed with the tester's own answers | |
 | False alarms: failures that were not real problems | |
+| Optional: `/forge mutate app` (fuzz quality): caught / scored, and survivors on reached lines | |
 
 ## After
 

@@ -9,7 +9,8 @@ Usage:
   forge_check.py build   [--root DIR] [--json] [--check]
   forge_check.py setup   [--root DIR] [--json]     (find Dafny, or download the pinned release)
   forge_check.py mutate  [--root DIR] [--json] [--max N]
-  forge_check.py diff    [--root DIR] [--json] [--inputs N] [--budget-ms MS] [--seed S]
+  forge_check.py mutate  --app [--root DIR] [--json] [--max N] [--inputs N] [--seed S] [--langs py,js,...]
+  forge_check.py diff    [--root DIR] [--json] [--inputs N] [--budget-ms MS] [--seed S] [--coverage]
   forge_check.py invariants [--root DIR] [--check]   (INVARIANTS.md: every approved rule in plain words)
   forge_check.py bypass  [--root DIR] [--json]       (code outside the rule that reads its "watchedFields")
   forge_check.py bypass  --rule NAME --set-terms TERM...  |  --rule NAME --record FILE:LINE --note TEXT
@@ -26,6 +27,9 @@ language. It reads only hashes to see whether the compiled code matches the Dafn
 proof on each. A mutant is "caught" when the check is no longer VERIFIED. A mutant that survives means the
 spec does not forbid that change: either the change is harmless (an equivalent mutant) or the spec is too
 weak there. Read each survivor. Nothing in the project is changed.
+`mutate --app` plants the same kind of bugs in the SHIPPED code (the diff entries' "watch" files, in a temporary
+copy) and runs the diff on each: it measures the fuzz, not the proof (see forge_mutate_app.py).
+`diff --coverage` also reports which lines and branches of the watched files the run reached (forge_coverage.py).
 
 `build` first runs `check`. For each check with a "build" entry it then:
   1. verifies the fuzz harness with Dafny, compiles it to every listed target, runs it,
@@ -976,8 +980,9 @@ def build_is_fresh(root, c):
     return sorted(sources) == sorted(want) and all(sources[f] == sha256(inside(root, f)) for f in want)
 
 
-def run_diff(root, inputs=None, budget_ms=None, seed=None):
-    """Runs every diff entry through the language-neutral core (forge_diff.py)."""
+def run_diff(root, inputs=None, budget_ms=None, seed=None, coverage=False, only=None):
+    """Runs every diff entry through the language-neutral core (forge_diff.py). coverage: also measure which lines
+    and branches of the watched files the run reached (forge_coverage.py). only: run just these diff keys."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import forge_diff
     cfg = load_config(root)
@@ -989,6 +994,8 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None):
         for df in entries:
             jobs.append((c, df, c['name'] if len(entries) == 1 else '%s:%s' % (c['name'], df.get('name') or df['lang'])))
     for c, df, key in jobs:
+        if only is not None and key not in only:
+            continue
         res = out['checks'][key] = {}
         if not c.get('build'):
             res['verdict'] = 'NO_BUILD'
@@ -1042,10 +1049,17 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None):
                 continue
         else:
             cmd = list(df['run'])
+        cov = None
+        if coverage:
+            import forge_coverage
+            cov = forge_coverage.Session(df['lang'], root, df.get('watch'))
+            cmd, env = cov.wrap(cmd, env)
         data = forge_diff.run_entry(cmd, root, env, inside(root, df['inputs']), s, n, ms,
                                     os.path.join(root, REGRESSIONS, key.replace(':', '-')),
                                     messy=df.get('messy', True) is not False)
         res.update(data)
+        if cov:
+            res['coverage'] = cov.collect()
         if data.get('error') and 'Unknown file extension ".ts"' in data['error']:
             res['verdict'] = 'TOOLCHAIN_MISSING'
             res['detail'] = ('this Node cannot import TypeScript directly (%s); it needs Node 22.18 or newer'
@@ -1150,6 +1164,9 @@ def diff_report(out):
                          'what you meant. Saved cases under %s/%s/ run first next time.' % (REGRESSIONS, name.replace(':', '-')))
         else:
             lines.append('✗ %s: %s: %s' % (name, v, (r.get('detail') or r.get('error') or '')[:600]))
+        if r.get('coverage'):
+            import forge_coverage
+            lines.extend(forge_coverage.report_lines(r['coverage']))
     return '\n'.join(lines)
 
 
@@ -1822,6 +1839,12 @@ def main(argv=None):
     p.add_argument('--inputs', type=int, help='diff: at most this many random inputs (default from forge.json, 1500)')
     p.add_argument('--budget-ms', type=int, help='diff: time budget per check in ms (default 1500)')
     p.add_argument('--seed', type=int, help='diff: random seed (default: a fresh one each run)')
+    p.add_argument('--coverage', action='store_true', help='diff: also report the lines and branches of the watched '
+                                                           'files that the run reached (slower)')
+    p.add_argument('--app', action='store_true', help='mutate: plant bugs in the shipped code (diff "watch" files) '
+                                                      'and run the diff on each, instead of in the Dafny files')
+    p.add_argument('--langs', help='mutate --app: diff entry languages to mutate (default py,js; "all" adds the '
+                                   'compiled ones, which rebuild per mutant)')
     p.add_argument('--full', action='store_true', help='spec/approve: print every approved file in full')
     p.add_argument('--check', action='store_true', help='build: write nothing; the emitted code on '
                                                         'disk must equal a fresh build')
@@ -1870,12 +1893,18 @@ def main(argv=None):
         if a.command == 'diff':
             if hasattr(sys.stdout, 'reconfigure'):
                 sys.stdout.reconfigure(errors='backslashreplace')  # messy inputs may hold a lone surrogate
-            out = run_diff(root, a.inputs, a.budget_ms, a.seed)
+            out = run_diff(root, a.inputs, a.budget_ms, a.seed, coverage=a.coverage)
             if not a.no_write:
                 update_diff_stats(root, out)
                 write_json(root, LAST_DIFF, out)
             print(json.dumps(out, indent=2, ensure_ascii=False) if a.json else diff_report(out))
             return 0 if all(r['verdict'] == 'DIFF_OK' for r in out['checks'].values()) else 1
+        if a.command == 'mutate' and a.app:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import forge_mutate_app
+            out = forge_mutate_app.run(root, a.max, a.inputs, a.seed, a.langs)
+            print(json.dumps(out, indent=2, ensure_ascii=False) if a.json else forge_mutate_app.report(out))
+            return 0
         if a.command == 'mutate':
             out = run_mutate(root, a.max)
             print(json.dumps(out, indent=2) if a.json else mutate_report(out))

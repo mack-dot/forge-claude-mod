@@ -960,6 +960,12 @@ def main():
         failed += not ok
         extra += 1
         print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
+    sys.path.insert(0, HERE)
+    import coverage_mutate_cases  # diff --coverage and mutate --app (M1.2)
+    for name, ok in coverage_mutate_cases.cases():
+        failed += not ok
+        extra += 1
+        print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
     print('%d cases, %d failed' % (len(CASES) + len(BUILD_CASES) + extra, failed))
     return 1 if failed else 0
 

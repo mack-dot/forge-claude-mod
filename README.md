@@ -273,6 +273,45 @@ Rust evaluators takes about 7 s.
 Labels: the inputs, the evaluators and the core are test code (not proved); a run is a FINITE TEST. It compares
 returned values only; side effects of the code under test are not checked.
 
+### How good is the fuzz? Coverage and `mutate --app`
+
+A green diff says only that the inputs found no disagreement. Two measures say how much the inputs tried:
+
+- **`forge_check.py diff --coverage`** (off by default): which lines and branches of each watched file the run
+  reached, and the name of every branch it never took (`file:line`, what was never taken, the source line).
+  Python uses coverage.py if the Python that runs Forge can import it, else a standard-library tracer with the
+  same counts on the example; JavaScript/TypeScript uses Node's built-in V8 coverage (`NODE_V8_COVERAGE`, no
+  dependency). V8 lists a block only when it ran a different number of times than the code around it, so for JS
+  the report names blocks never run but gives no branch total. Go, Rust, Java and C# are not measured.
+- **`forge_check.py mutate --app`**: plants one small bug at a time (the `mutate` list: `<=` to `<`, `&&` to `||`,
+  `+ 1` removed, …; for Python also `and`/`or`, `True`/`False`) in the watched files, in a temporary copy (never in
+  your project), and runs that diff entry on each mutant with a fixed seed and input count. **Caught**: the diff
+  report changes (for code that agrees with the proved rule: it now disagrees). **Survived**: the report is the
+  same. A survivor on a line the fuzz never reached is an input gap; on a reached line it is either an input gap or
+  a mutant **equivalent to the original under the spec** (harmless: no input can tell them apart). Forge cannot
+  tell which; read each one. Python and JS/TS by default; `--langs all` adds Go, Rust, Java and C#, which rebuild
+  the evaluator per mutant. `--max N` caps the mutants (default 40; `/forge mutate app` in Claude Code runs it with 30).
+
+```
+forge mutate --app: 8 of 21 planted bugs in the shipped code caught by the diff (13 survived, 1 not run); seed 1, 4,163 ms
+  SURVIVED legacy_wallet.py:2  <= to <  in: if 0 < amount and spent + amount <= cap:  [line reached by the fuzz: equivalent, or the inputs miss the case]
+  SURVIVED legacy_wallet.py:4  False to True  in: return False, spent  [line NEVER reached by the fuzz]
+```
+
+Measured on the example (one machine, macOS arm64, Python 3.10, Node 24.3; the shipped Python and TypeScript code
+fixed so that it has no planted bug):
+
+| Inputs module | `legacy_wallet.py` lines / branches | `legacy_wallet.ts` lines / blocks never run | `mutate --app` caught |
+| --- | --- | --- | --- |
+| the example's own (`diff/wallet_inputs.py`) | 4/4, 2/2 | 3/3, 0 | 19 of 21; both survivors in `app.py` (`sys.path.insert(0, …)` to 1, and a demo line under `__main__`): equivalent |
+| a deliberately weak one (amount 1–100, spent 0–100, cap 10000, no decisions) | 3/4, 1/2: `legacy_wallet.py:2 condition never False` | 2/3, 1: `legacy_wallet.ts:3 block never run` | 8 of 21; every `<=`/`<`/`&&` mutant of the cap comparison survives |
+
+Time cost (medians of 7 runs, 1,500 inputs): `--coverage` takes a Python diff from 156 to 241 ms with the stdlib
+tracer (148 to 342 ms with coverage.py 7.16) and a TypeScript diff from 196 to 281 ms. `mutate --app` costs one
+diff run per mutant: on the example 150–220 ms (Python), 210–430 ms (TypeScript), about 0.4 s (Go), 0.6 s (Rust,
+warm cargo cache) and 1.4 s (Java) per mutant. Labels: both measures are test tooling (not proved); a mutation
+score is a FINITE TEST of the fuzz, not of the code.
+
 ## Bypass: code that goes around a proved rule
 
 A proof is only as strong as the guarantee that nothing goes around it. On a real app, a proved read rule decided that
