@@ -1095,7 +1095,9 @@ def messy_line(d):
 
 def messy_summary(m):
     return ('  messy inputs: %d sent to %s (%d field/kind pairs tried; %d not judged: no fail-closed answer and the '
-            'proved rule cannot take them)' % (m['inputs'], ', '.join(m['candidates']), m['pairs_tried'], m['not_judged']))
+            'proved rule cannot take them)%s' % (m['inputs'], ', '.join(m['candidates']), m['pairs_tried'], m['not_judged'],
+                                                 '; not sent (this language cannot carry them): ' + ', '.join(m['skipped_kinds'])
+                                                 if m.get('skipped_kinds') else ''))
 
 
 def diff_report(out):

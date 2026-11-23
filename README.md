@@ -379,7 +379,7 @@ does not follow your types: a field can be `undefined`, `null`, a number where t
 real app, `householdId: undefined` reached such a wrapper and it threw instead of answering "forbid". The plain
 fuzz never sent that value, so it did not see it.
 
-If the JavaScript/TypeScript or Python adapter exports a raw-value wrapper, the fuzz also sends **messy variants**
+If the adapter (any of the six languages) exports a raw-value wrapper, the fuzz also sends **messy variants**
 of its inputs to it: each field (nested objects and lists too, bounded) is in turn made `undefined` (JavaScript
 only), `null`, a number, a boolean, `""`, a lone surrogate, a 20,000-character text, `[]`, `{}`, the number as
 text (`"5"` for `5`), or removed. Big integers in the other fields stay exact.
@@ -394,6 +394,14 @@ export function failClosed(i) {                        // the spec's fail-closed
 }
 ```
 
+The compiled languages take the raw JSON in their own types: Go `json.RawMessage` (`var wrappers =
+map[string]func(json.RawMessage) any{…}`, `func failClosed(raw json.RawMessage) any`, nil: the rule takes it),
+Rust `serde_json::Value` (`pub fn wrappers()`, `pub fn fail_closed(raw: &Value) -> Option<Value>`), Java the
+evaluator's parsed value (Map / List / String / Boolean / BigInteger / BigDecimal / null; `wrappers()`,
+`failClosed(Object)`), C# `JsonElement` (`Wrappers()`, `FailClosed(JsonElement)`). `undefined` is sent only to
+JavaScript. Rust does not get the lone surrogate: serde_json rejects it while it parses, before any wrapper could run
+(listed under `skipped_kinds`). A panic (Go, Rust) or an exception (Java, C#) is `THROWS_ON_MESSY_INPUT`.
+
 Rules: a throw from the wrapper on any messy input is always a disagreement of kind `THROWS_ON_MESSY_INPUT`.
 Otherwise its answer must equal `failClosed(input)`, or the proved rule's answer where `failClosed` returns
 `undefined`. Messy disagreements are grouped, shrunk (the messy field and its kind stay; the rest of the input
@@ -406,13 +414,16 @@ answer and that the proved rule cannot take is counted as "not judged" (only a t
     messy field amount = undefined: THROWS_ON_MESSY_INPUT (TypeError): the wrapper crashed instead of failing closed
 ```
 
-The example has three planted wrappers (`examples/wallet-cap/messy_wrappers.ts` and `.py`, adapters
-`diff/wallet_messy.*`): one that throws on `amount` undefined/null, one that turns `"5"` into `5`, and a correct one
-that fails closed (the negative control). They are not in the example's `forge.json`; the tests add them.
+The example has three planted wrappers per language (`examples/wallet-cap/messy_wrappers.ts`, `.py`, `.rs`,
+`messygo/`, `messyjava/`, `messycs/`; adapters `diff/wallet_messy.*`): one that throws or panics on a null, missing or
+wrong-typed `amount`, one that turns `"5"` into `5`, and a correct one that fails closed (the negative control). They
+are not in the example's `forge.json`; the tests add them (C# in `tests/run_cs_diff.py`, in CI).
 
 Time, measured on the example (one machine, warm, 1,500 inputs, median of 3 runs): the three wrappers with messy
 off 324 ms (JS) and 216 ms (Python); with messy on (about 1,530 messy inputs, including shrinking the planted bugs)
-1,192 ms and 1,236 ms. An entry without a wrapper does not change. With the default time budget (1.5 s per entry)
+1,192 ms and 1,236 ms before M1.1b. After M1.1b (the messy step no longer writes the 20,000-character text once per
+field and kind; same inputs for a seed), messy on, entry time: JS 473 ms, Python 393 ms, Go 429 ms, Rust 467 ms,
+Java 519 ms; the whole `diff` command 0.49–0.62 s. An entry without a wrapper does not change. With the default time budget (1.5 s per entry)
 messy inputs share the budget, so fewer plain inputs run (584 instead of 1,500 for JS in one measured run).
 
 Labels: the messy values are a fixed list, not every possible value; the fail-closed answer is the adapter's (the
