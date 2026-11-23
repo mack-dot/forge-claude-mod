@@ -164,6 +164,38 @@ def run_built_python(root):  # importing the built module creates __pycache__ in
     subprocess.run([sys.executable, os.path.join(root, 'app.py')], stdout=subprocess.DEVNULL, check=True)
 
 
+def edit_generated_module(root):  # hand edit of the generated ES module (cli/js_wrapper.py)
+    path = os.path.join(root, 'verified/wallet-cap/js/wallet_cap.mjs')
+    text = open(path, encoding='utf-8').read()
+    assert 'isLessThanOrEqualTo((s).dtor_cap)' in text
+    open(path, 'w', encoding='utf-8').write(text.replace('isLessThanOrEqualTo((s).dtor_cap)', 'isLessThan((s).dtor_cap)', 1))
+
+
+def add_service_test(root, body, command=None):
+    """Adds a "serviceTest" to the wallet check (service/svc.mjs with this body) and re-approves."""
+    os.makedirs(os.path.join(root, 'service'), exist_ok=True)
+    open(os.path.join(root, 'service', 'svc.mjs'), 'w').write(
+        "import * as W from '../verified/wallet-cap/js/wallet_cap.mjs'\n" + body)
+    cfg = json.load(open(os.path.join(root, CONFIG)))
+    cfg['checks'][0]['build']['serviceTest'] = {'command': command or ['node', 'service/svc.mjs'], 'cwd': '.'}
+    json.dump(cfg, open(os.path.join(root, CONFIG), 'w'), indent=2)
+    reapprove(root)
+
+
+def service_calls(root):  # the service test calls the built code
+    add_service_test(root, "const [n, o] = W.Spend(W.State.create_Wallet(W.toDafnyInt(10), W.toDafnyInt(0)), W.toDafnyInt(3))\n"
+                           "if (!o.is_Ok || W.fromDafnyInt(n.dtor_spent) !== 3) process.exit(1)\n")
+
+
+def service_imports_only(root):  # imported, never called
+    add_service_test(root, "console.log(typeof W.Spend)\n")
+
+
+def service_fails(root):  # the service test itself fails
+    add_service_test(root, "W.Spend(W.State.create_Wallet(W.toDafnyInt(1), W.toDafnyInt(0)), W.toDafnyInt(1))\n"
+                           "process.exit(2)\n")
+
+
 def wrong_expect(root):  # the harness expects something the code does not do
     edit(root, 'fuzz/WalletFuzz.dfy', 'expect next.cap == cap, "W2";', 'expect next.cap == cap + 1, "W2";')
 
@@ -204,10 +236,104 @@ BUILD_CASES = [
     ('emitted code equals a fresh build', no_change, 'BUILT', 0),
     ('app ran the built code (__pycache__ appears)', run_built_python, 'BUILT', 0),
     ('emitted code edited by hand', edit_emitted, 'STALE_BUILD', 1),
+    ('generated ES module edited by hand', edit_generated_module, 'STALE_BUILD', 1),
+    ('serviceTest calls the built code', service_calls, 'BUILT', 0),
+    ('serviceTest imports the built code, never calls it', service_imports_only, 'NOT_CALLED', 1),
+    ('serviceTest fails', service_fails, 'SERVICE_TEST_FAILED', 1),
     ('fuzz harness expects a wrong result', wrong_expect, 'FUZZ_FAILED', 1),
     ('app no longer imports the built code', unwire, 'NOT_WIRED', 1),
     ('a touched app file does not parse (missing brace)', broken_ts_app, 'APP_SYNTAX_ERROR', 1),
 ]
+
+
+def js_module_cases():
+    """The generated ES module of the js target (cli/js_wrapper.py), each with a negative control."""
+    sys.path.insert(0, os.path.join(HERE, '..', 'cli'))
+    import forge_check
+    import forge_diff
+    import js_wrapper
+    js_dir = os.path.join(EXAMPLE, 'verified', 'wallet-cap', 'js')
+    built = os.path.join(js_dir, 'wallet_cap.mjs')
+    node = lambda *a, **kw: subprocess.run(['node'] + list(a), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           universal_newlines=True, **kw)
+    out = []
+    with tempfile.TemporaryDirectory() as tmp:
+        # 1. it imports with code generation from strings forbidden; a copy that calls new Function does not
+        imp = lambda f: node('--disallow-code-generation-from-strings', '--input-type=module', '-e',
+                             'await import(%s)' % json.dumps('file://' + os.path.abspath(f)))
+        bad = os.path.join(tmp, 'bad.mjs')
+        open(bad, 'w', encoding='utf-8').write(open(built, encoding='utf-8').read()
+                                               + '\nexport const sneaky = new Function("return 1")();\n')
+        r_ok, r_bad = imp(built), imp(bad)
+        out.append(('js module: imports under --disallow-code-generation-from-strings', r_ok.returncode == 0))
+        out.append(('js module: a copy that calls new Function fails that import (negative control)',
+                    r_bad.returncode != 0 and 'EvalError' in r_bad.stdout))
+        # 2. the generator refuses emitted code that would need code generation or an unknown require
+        js = open(os.path.join(js_dir, 'wallet_cap.js'), encoding='utf-8').read()
+        bn = js_wrapper.bignumber_source()
+        refused = []
+        for change in ('\nlet f = new Function("x", "return x");\n', "\nconst fs = require('fs');\n",
+                       '\neval("1");\n'):
+            try:
+                js_wrapper.wrap(js + change, bn, 'x.js')
+                refused.append(False)
+            except js_wrapper.WrapError:
+                refused.append(True)
+        out.append(('js module: generation is deterministic, and refuses new Function / eval / require(\'fs\')',
+                    all(refused) and js_wrapper.wrap(js, bn, 'x.js') == js_wrapper.wrap(js, bn, 'x.js')
+                    and js_wrapper.wrap(js, bn, 'wallet_cap.js', True, 'wallet-cap')[0] == open(built, encoding='utf-8').read()))
+        # 3. same results as the old loader on the wallet fuzz inputs; an edited module disagrees (negative control)
+        mutant = os.path.join(tmp, 'mutant.mjs')
+        open(mutant, 'w', encoding='utf-8').write(open(built, encoding='utf-8').read().replace(
+            'isLessThanOrEqualTo((s).dtor_cap)', 'isLessThan((s).dtor_cap)', 1))
+        results = {}
+        for label, mod in (('built', built), ('mutant', mutant)):
+            env = dict(os.environ, NODE_PATH=forge_check.js_node_path(), FORGE_TEST_MODULE=mod,
+                       FORGE_TEST_EMITTED=os.path.join(js_dir, 'wallet_cap.js'))
+            results[label] = forge_diff.run_entry(
+                ['node', os.path.join(HERE, '..', 'cli', 'eval', 'node_eval.mjs'),
+                 os.path.join(HERE, 'js_module', 'wallet_module_diff.mjs')], tmp, env,
+                os.path.join(EXAMPLE, 'diff', 'wallet_inputs.py'), 11, 5000, 60000, os.path.join(tmp, 'reg-' + label))
+        b, m = results['built'], results['mutant']
+        out.append(('js module: same results as the old loader on %d wallet fuzz inputs and 4 decisions'
+                    % b.get('inputs', 0), not b.get('error') and b['inputs'] == 5000 and not b['disagreements']
+                    and b['decisions']['agree'] == 4))
+        out.append(('js module: an edited module disagrees with the old loader (negative control)',
+                    not m.get('error') and len(m['disagreements']) > 0))
+        # 4. string, seq, set and int helpers; the cache does not change results; a broken cache is caught
+        dafny = os.environ.get('FORGE_DAFNY') or 'dafny'
+        shutil.copy(os.path.join(HERE, 'js_module', 'Strings.dfy'), tmp)
+        r = subprocess.run([dafny, 'translate', 'js', '--no-verify', '--include-runtime', 'Strings.dfy'], cwd=tmp,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        err = js_wrapper.write_module(tmp, 'Strings') if r.returncode == 0 else r.stdout[-300:]
+        test = os.path.join(HERE, 'js_module', 'strings_test.mjs')
+        env = dict(os.environ, NODE_PATH=forge_check.js_node_path())
+        s_ok = node('--disallow-code-generation-from-strings', test, os.path.join(tmp, 'Strings.mjs'),
+                    os.path.join(tmp, 'Strings.js'), env=env) if not err else None
+        broken = os.path.join(tmp, 'BrokenCache.mjs')
+        if not err:
+            text = open(os.path.join(tmp, 'Strings.mjs'), encoding='utf-8').read()
+            open(broken, 'w', encoding='utf-8').write(text.replace('let seq = young.get(s);',
+                                                                   'let seq = young.get(s.slice(0, 1));'))
+        s_bad = node(test, broken, os.path.join(tmp, 'Strings.js'), env=env) if not err else None
+        out.append(('js module: string/seq/set/int helpers equal the old loader, cache on, off and small (%s)'
+                    % (err or s_ok.stdout.strip()[:60]), not err and s_ok.returncode == 0))
+        out.append(('js module: a cache that returns a wrong seq is caught (negative control)',
+                    not err and s_bad.returncode == 1 and s_bad.stdout.startswith('FAIL')))
+        # 5. the build's check of the harness module reports a different output
+        work = os.path.join(tmp, 'h')
+        shutil.copytree(os.path.join(EXAMPLE, 'fuzz'), os.path.join(work, 'fuzz'))
+        shutil.copytree(os.path.join(EXAMPLE, 'impl'), os.path.join(work, 'impl'))
+        shutil.copytree(os.path.join(EXAMPLE, 'spec'), os.path.join(work, 'spec'))
+        subprocess.run([dafny, 'translate', 'js', '--no-verify', '--include-runtime', 'fuzz/WalletFuzz.dfy'],
+                       cwd=work, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log = os.path.join(tmp, 'h.log')
+        plain = node(os.path.join(work, 'fuzz', 'WalletFuzz.js'), env=env).stdout
+        same = forge_check.js_module_check(work, 'fuzz/WalletFuzz.dfy', plain, log)
+        differ = forge_check.js_module_check(work, 'fuzz/WalletFuzz.dfy', plain + 'x\n', log)
+        out.append(('js module: build runs the fuzz harness as the generated module; a different output fails',
+                    same is None and differ is not None and 'other output' in differ))
+    return out
 
 
 def static_checks():
@@ -740,6 +866,10 @@ def main():
         extra += 1
         print('%s  diff: two bugs with the same wrong answer (zero and empty text) are both reported  %s' % ('ok  ' if ok else 'FAIL', found))
 
+    for name, ok in js_module_cases():
+        failed += not ok
+        extra += 1
+        print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
     # Messy inputs: the unproved wrapper that turns raw app/JSON values into Dafny values must fail closed, never throw
     # (owner feedback: a real app's wrapper threw on `householdId: undefined`, and the plain fuzz never sent one).
     with tempfile.TemporaryDirectory() as tmp:
