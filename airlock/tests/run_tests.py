@@ -209,6 +209,107 @@ def test_sync():
     shutil.rmtree(tmp)
 
 
+def _tree_hash(root):
+    """sha256 over every path, type and content under root (including .git), not following links."""
+    import hashlib
+    h = hashlib.sha256()
+    for d, dirs, files in sorted(os.walk(root, followlinks=False)):
+        dirs.sort()
+        for n in sorted(files + [x for x in dirs if os.path.islink(os.path.join(d, x))]):
+            full = os.path.join(d, n)
+            h.update(os.path.relpath(full, root).encode("utf-8", "surrogateescape") + b"\0")
+            if os.path.islink(full):
+                h.update(b"L" + os.readlink(full).encode("utf-8", "surrogateescape"))
+            else:
+                h.update(oct(os.stat(full).st_mode & 0o777).encode() + open(full, "rb").read())
+        h.update(b"\1")
+    return h.hexdigest()
+
+
+def test_sync_aliases():
+    """Regression (red team 2026-11-22): case, Unicode-normalization, trailing dot/space and
+    case-only-rename aliases of hidden, read-only, .git and forge.yaml paths. On a case-insensitive
+    host (macOS APFS) each of these reached the real repository before the fix."""
+    import hashlib
+    import unicodedata
+    nfc = lambda x: unicodedata.normalize("NFC", x)  # noqa: E731
+    nfd = lambda x: unicodedata.normalize("NFD", x)  # noqa: E731
+    tmp = tempfile.mkdtemp()
+    real, stage, exp = (os.path.join(tmp, x) for x in ("real", "stage", "export"))
+    files = {"forge.yaml": "version: 1\norig: true\n", "src/app.ts": "a\n",
+             "src/proprietary/core.ts": "SECRET MARGIN TABLE v2\n", "tests/ui.test.ts": "t\n",
+             nfc("src/café/price.ts"): "hidden nfc\n", nfd("docs/naïve.md"): "read-only nfd\n"}
+    for root in (real, stage):
+        subprocess.run(["git", "init", "-q", root], check=True)
+        for rel, txt in files.items():
+            os.makedirs(os.path.dirname(os.path.join(root, rel)) or root, exist_ok=True)
+            open(os.path.join(root, rel), "w").write(txt)
+    os.makedirs(os.path.join(exp, "files"))
+    doc = base_doc()
+    doc["paths"] = {"hidden_paths": ["src/proprietary/**", nfc("src/café/**"), ".env*"],
+                    "readonly_paths": ["tests/**", nfc("docs/naïve.md")]}
+    pol = Policy(doc, resolve=False)
+    counter = [0]
+
+    def ch(rel, status="added", txt="ATTACK\n", mode="100644"):
+        c = {"path": rel, "status": status, "symlink": False}
+        if status != "deleted":
+            counter[0] += 1
+            data = txt.encode()
+            open(os.path.join(exp, "files", str(counter[0])), "wb").write(data)
+            c.update(file=f"files/{counter[0]}", sha256=hashlib.sha256(data).hexdigest(), mode=mode, size=len(data))
+        return c
+
+    def attempt(name, changes):
+        before = _tree_hash(real)
+        apply, rejected = sync.plan(pol, changes, exp, stage, real)
+        sync.apply_changes(apply, real)
+        rej = {r for r, _ in rejected}
+        ok = not apply and rej == {c["path"] for c in changes} and _tree_hash(real) == before
+        case("sync alias: " + name + " is REJECTED and the real repository is byte-identical", ok,
+             f"applied={[c['path'] for c in apply]} rejected={rejected}")
+
+    attempt("TESTS/evil.ts (case variant of read-only tests/**)", [ch("TESTS/evil.ts")])
+    attempt(".GIT/hooks/post-checkout (case variant of .git)",
+            [ch(".GIT/hooks/post-checkout", txt="#!/bin/sh\necho PWNED\n", mode="100755")])
+    attempt("Forge.yaml (case variant of the policy file)", [ch("Forge.yaml", txt="version: 1\npwned: true\n")])
+    attempt("SRC/proprietary/core.ts (case variant of a hidden path)", [ch("SRC/proprietary/core.ts")])
+    attempt("NFD form of the hidden NFC path src/café/price.ts", [ch(nfd("src/café/price.ts"))])
+    attempt("NFC form of the read-only NFD file docs/naïve.md", [ch(nfc("docs/naïve.md"))])
+    attempt("NFD form of the read-only pattern docs/naïve.md (pattern NFC)", [ch(nfd("docs/naïve.md"))])
+    attempt("trailing dot and space variants (tests./x, forge.yaml., forge.yaml , .git./hooks/x)",
+            [ch("tests./x.ts"), ch("forge.yaml."), ch("forge.yaml "), ch(".git./hooks/post-commit")])
+    attempt("ignorable code point in .git (.g\\u200cit/hooks/x)", [ch(".g\u200cit/hooks/post-merge")])
+    attempt("case-only rename of an allowed file (src/app.ts -> src/App.ts)",
+            [ch("src/app.ts", "deleted"), ch("src/App.ts", txt="a\n")])
+    attempt("case variant of an allowed existing file (SRC/App.TS)", [ch("SRC/App.TS")])
+    attempt("two new names that fold to one (new.md and NEW.md)", [ch("new.md"), ch("NEW.md")])
+    box = ["TESTS/evil.ts", ".GIT/hooks/post-checkout", "Forge.yaml", "SRC/proprietary/core.ts",
+           nfd("src/café/price.ts"), nfd("docs/naïve.md"), "tests./x.ts", "forge.yaml ", ".g\u200cit/config"]
+    case("sync alias: refusal() alone (the export in the box, no host file system) refuses every alias",
+         all(sync.refusal(pol, x) for x in box) and sync.refusal(pol, "src/app.ts") is None,
+         [x for x in box if not sync.refusal(pol, x)])
+    case("sync alias: case variants of .git and forge.yaml are flagged SENSITIVE",
+         all(sync.sensitive(x) for x in (".GIT/hooks/x", ".git/config", "Forge.yaml", "sub/FORGE.YAML", "forge.yaml")))
+    # negative control: a normal allowed edit still applies
+    apply, rejected = sync.plan(pol, [ch("src/app.ts", "modified", "a\nb\n")], exp, stage, real)
+    sync.apply_changes(apply, real)
+    case("sync alias: negative control, a normal allowed edit (src/app.ts) still applies",
+         not rejected and open(os.path.join(real, "src/app.ts")).read() == "a\nb\n", rejected)
+    # apply-time re-check (TOCTOU): a parent swapped to a symlink after plan() is not written through
+    outside = os.path.join(tmp, "outside")
+    os.makedirs(outside)
+    os.makedirs(os.path.join(real, "lib"))
+    os.makedirs(os.path.join(stage, "lib"))
+    apply, rejected = sync.plan(pol, [ch("lib/x.ts", txt="x\n")], exp, stage, real)
+    os.rmdir(os.path.join(real, "lib"))
+    os.symlink(outside, os.path.join(real, "lib"))
+    done = sync.apply_changes(apply, real)
+    case("sync alias: apply re-checks the target; a parent swapped to a symlink after the plan is not written",
+         len(apply) == 1 and not done and not os.listdir(outside), (apply, done, os.listdir(outside)))
+    shutil.rmtree(tmp)
+
+
 def make_log(n, cap=10 ** 6):
     exp = int(time.time()) + 86400
     man = R.manifest_bytes(R.sha(b"t"), cap, exp)
@@ -369,7 +470,7 @@ def test_static():
 
 
 def main():
-    for t in (test_policy, test_paths, test_sync, test_verifier, test_draft, test_static):
+    for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_static):
         try:
             t()
         except Exception as e:  # noqa: BLE001

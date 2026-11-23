@@ -9,7 +9,8 @@
 #   G3 real server-filesystem + gated MCP: default deny, arg rules, 20 parallel calls stop at the
 #      cap, duplicate ids, mid-call crash, timeout, kill of the airlock mid-call, restarts
 #   G4 every planted breach caught by the canary; fail-closed boot (invalid policy, tampered log)
-#   G5 diff sync-back: allowed edits applied on y, none on n, hidden and read-only edits rejected
+#   G5 diff sync-back: allowed edits applied on y, none on n, hidden and read-only edits rejected,
+#      also their case / Unicode-normalization / trailing dot-space aliases and case-only renames
 #   G6 gated-call latency before (subprocess per call) and after (persistent verifier), >= 100 calls
 #   G7 README: the unified workflow and its honest labels
 # Label: FINITE TEST (one machine, the listed inputs). Container tier: shares the host kernel.
@@ -103,6 +104,15 @@ tail -1 "$OUT/g5-up-e2e.txt" | sed 's/^/     up e2e: /'
 s_ok=$(grep -c '^ok    sync:' "$OUT/g1-airlock-unit.txt"); s_bad=$(grep -c '^FAIL  sync:' "$OUT/g1-airlock-unit.txt")
 echo "     sync filter unit cases: $s_ok ok, $s_bad failed"
 [ "$s_bad" = 0 ] && [ "$s_ok" -ge 10 ] || g=1
+# aliases on a case-insensitive / normalizing host (red team 2026-11-22): TESTS/evil.ts, .GIT/hooks/*,
+# Forge.yaml, SRC/proprietary/*, NFC/NFD, trailing dot/space, case-only rename -> all REJECTED, repo byte-identical
+a_ok=$(grep -c '^ok    sync alias:' "$OUT/g1-airlock-unit.txt"); a_bad=$(grep -c '^FAIL  sync alias:' "$OUT/g1-airlock-unit.txt")
+echo "     sync alias cases (case, NFC/NFD, trailing dot/space, case-only rename, TOCTOU): $a_ok ok, $a_bad failed"
+[ "$a_bad" = 0 ] && [ "$a_ok" -ge 15 ] || g=1
+for a in 'TESTS/evil.ts' '.GIT/hooks/post-checkout' 'Forge.yaml' 'SRC/proprietary/core.ts' 'NFD form of the hidden' \
+         'trailing dot and space' 'case-only rename' 'negative control'; do
+  grep -qF "ok    sync alias: $a" "$OUT/g1-airlock-unit.txt" || { echo "     missing alias case: $a"; g=1; }
+done
 gate G5 "diff sync-back: y applies allowed only, n applies nothing, hidden/read-only rejected" $g $((SECONDS-t))
 
 # ---------------------------------------------------------------- G6

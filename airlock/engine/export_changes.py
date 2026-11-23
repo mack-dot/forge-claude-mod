@@ -6,7 +6,8 @@
 # Base = the tree of filtered.git main (built by the airlock; the agent cannot write it),
 # so the agent's own .git (refs, commits, hooks) is never trusted for the diff.
 # Writes <out>/changes.json and <out>/files/<n> (new content). Paths that the policy hides,
-# makes read-only or that are inside .git are listed as REFUSED and never exported.
+# makes read-only or that are inside .git are listed as REFUSED and never exported; so are their
+# case and Unicode-normalization aliases (sync.refusal) and two names that fold to one (sync.fold).
 # Label: NATIVE CHECK (hand-written, not proved).
 import hashlib
 import json
@@ -57,6 +58,10 @@ def main():
             rel = os.path.normpath(os.path.join(rel_d, n)).replace(os.sep, "/")
             cur[rel] = full
     os.makedirs(os.path.join(out, "files"), exist_ok=True)
+    # Aliases: two names that a case-insensitive or normalizing host file system sees as one.
+    folds = {}
+    for rel in set(base) | set(cur):
+        folds.setdefault(sync.fold(rel), set()).add(rel)
     changes, n = [], 0
     for rel in sorted(set(base) | set(cur)):
         full = cur.get(rel)
@@ -82,6 +87,9 @@ def main():
             entry = {"path": rel, "status": "modified" if rel in base else "added", "mode": mode,
                      "sha256": hashlib.sha256(data).hexdigest(), "size": len(data), "symlink": is_link}
         why = sync.refusal(pol, rel, symlink=entry.get("symlink", False))
+        if not why and len(folds[sync.fold(rel)]) > 1:
+            why = ("case or normalization alias of " + ", ".join(repr(x) for x in sorted(folds[sync.fold(rel)])
+                                                                   if x != rel) + " (none of them applied)")
         if why:
             entry["refused"] = why
         elif entry["status"] != "deleted":

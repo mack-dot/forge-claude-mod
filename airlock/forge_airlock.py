@@ -230,7 +230,8 @@ def sync_back(pol, run_dir, stage, repo):
     changes = json.load(open(path))["changes"]
     apply, rejected = sync.plan(pol, changes, os.path.join(run_dir, "export"), stage, repo, ignored_fn(repo))
     for rel, why in rejected:
-        print(f"  not applied: {rel}: {why}")
+        flag = "   <-- SENSITIVE (refused)" if sync.sensitive(rel) else ""
+        print(f"  not applied: {rel}: {why}{flag}")
     if not apply:
         say("no change that may be applied; your repository is unchanged")
         return 0

@@ -69,7 +69,11 @@ its value reaches the agent anyway, the canary reports BREACH and nothing runs.
    root file system). For `claude`, it adds `--mcp-config <airlock> --strict-mcp-config`, so
    `claude` in the box sees the airlock as its only MCP server.
 8. On exit, lists the changed files. Never applied: hidden paths, read-only paths, `forge.yaml`,
-   `.git`, symlinks, ignored files, and files that you changed in the real repository meanwhile.
+   `.git`, symlinks, ignored files, and files that you changed in the real repository meanwhile;
+   also every case, Unicode-normalization (NFC/NFD), ignorable-code-point and trailing dot/space
+   alias of them, and any name that is an alias of an existing file (for example a case-only rename):
+   on a case-insensitive host (macOS) `Forge.yaml` or `.GIT/hooks/x` would else land on `forge.yaml`
+   or `.git/hooks/x`. Each target is checked again right before its write.
    Flagged for review: `.mcp.json`, `.claude/`, `.github/`, `package.json` and similar files
    that change what runs on your machine. It applies the rest only after `y`.
 9. Removes the containers, networks and run volumes. The gate logs stay in the volume
