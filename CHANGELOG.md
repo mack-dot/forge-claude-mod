@@ -16,6 +16,10 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
   ABORTED and stay spent; the exact total survives restarts; a crashed stdio upstream is started again).
 - Added: `prove_release.sh`, 7 release gates, exit 0 only if all pass.
 - Not tested: a real model session in the box; Linux and Windows hosts; real paid upstreams.
+## 0.12.1 — 2026-11-22
+- Fixed: `/forge approve` (and bare `/forge`, `/forge spec`) showed each spec shortened to its clause lines, so some
+  multi-line clauses were cut off, while the approval covers the complete file by hash. It now shows every file in
+  full. Found when the owner approved two real chronicle rules.
 
 ## 0.12.0 — 2026-11-22
 - Changed: bare `/forge` runs whatever comes next, so a beginner needs one command: nothing set up → the read-only

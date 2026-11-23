@@ -1050,7 +1050,9 @@ def show_specs(root):
             if rel in hashes:
                 continue
             hashes[rel] = sha256(inside(root, rel))
-            body = contract_of(inside(root, rel)) if rel == c['spec'] else read_text(inside(root, rel))
+            # The whole file, every word: an approval covers the complete file (by hash), so the person must be
+            # able to read all of it. (Before 0.12.1 the spec was shortened to its clause lines.)
+            body = read_text(inside(root, rel)).rstrip()
             kind = 'spec' if rel == c['spec'] else 'your answers' if rel == c.get('examples') else 'decision record'
             parts.append('=== %s %s: %s (%s, sha256 %s…) ===\n%s'
                          % (c['name'], kind, rel, state(rel), hashes[rel][:12], body))
