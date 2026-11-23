@@ -469,8 +469,15 @@ def test_static():
     case("static: no absolute host home path in the package", not bad, bad)
 
 
+def test_redteam():
+    """Regression tests of the protocol red-team findings F1 to F8 (tests/redteam_regress.py)."""
+    sys.path.insert(0, HERE)
+    import redteam_regress
+    redteam_regress.run(lambda name, ok, detail="": case("redteam: " + name, bool(ok), detail))
+
+
 def main():
-    for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_static):
+    for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_static, test_redteam):
         try:
             t()
         except Exception as e:  # noqa: BLE001

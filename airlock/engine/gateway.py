@@ -9,20 +9,24 @@
 # Dafny model). Everything in this file is NATIVE CHECK (hand-written, not proved).
 import fcntl
 import hashlib
+import hmac
 import json
 import os
+import re
+import secrets
 import signal
 import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mcp_client  # noqa: E402
 import workspace  # noqa: E402
 from gatelog import GateLog, GateError  # noqa: E402
-from policy import Policy, PolicyError, Refusal, canonical_json, MONEY_MAX  # noqa: E402
+from policy import Policy, PolicyError, Refusal, canonical_json, clip, strict_loads, MONEY_MAX  # noqa: E402
 
 POLICY_FILE = os.environ.get("FORGE_POLICY", "/forge/forge.yaml")
 DATA = os.environ.get("FORGE_DATA", "/data")
@@ -30,6 +34,10 @@ STATE = os.environ.get("FORGE_STATE", "/state")
 SOURCE = os.environ.get("FORGE_SOURCE", "/state/source")
 PORT = int(os.environ.get("FORGE_PORT", "8700"))
 ERR = -32001  # JSON-RPC server error code used for every FORGE_* refusal
+MAX_BODY = 1 << 20
+READ_TIMEOUT_S = float(os.environ.get("FORGE_READ_TIMEOUT_S", "30"))  # F1: per socket read
+MAX_CONN = int(os.environ.get("FORGE_MAX_CONN", "256"))  # F1: concurrent connections (threads)
+TOKEN_HEADER = "x-forge-canary-token"  # F7
 
 
 def die(msg):
@@ -120,6 +128,9 @@ class Airlock:
         self.canary = "PENDING"  # PENDING -> PASSED | BREACH ; one report per airlock lifetime
         self.canary_lock = threading.Lock()
         self.canary_report = None
+        self.canary_token = canary_token()
+        # F7: fingerprints are salted per workspace build (workspace.json, airlock side only)
+        self.fp_salt = bytes.fromhex(self.ws.get("fp_salt", ""))
         print(f"[airlock] up on :{PORT}; {len(self.route)} tools exposed; {len(self.logs)} gate logs; "
               f"{sum(len(t) for t in self.upstream_tools.values())} upstream tools seen; canary PENDING", flush=True)
 
@@ -139,10 +150,12 @@ class Airlock:
         name, args = params.get("name"), params.get("arguments") or {}
         if self.canary == "BREACH":
             raise Refusal("FORGE_BREACH_LOCKDOWN", "startup canary found a breach; airlock refuses every call")
-        tp, fwd = self.policy.check_call(name, args)  # deny / unlisted / arg rules / paths
+        tp, fwd = self.policy.check_call(name, args, self._declared(name))  # deny / unlisted / args / paths
         if tp.gated:
             amount = self._amount(tp, args)
-            step_id = self._step_id(tp, args)
+            step_id, idv = self._step_id(tp, args)
+            if idv is not None:
+                fwd[tp.id_field] = args[tp.id_field] = idv  # forward the normalized id (the replay key)
             self._run_checker(tp, name, args)
         if self.canary != "PASSED":
             raise Refusal("FORGE_CANARY_PENDING", "startup canary has not passed; nothing is forwarded yet")
@@ -158,16 +171,33 @@ class Airlock:
         if verdict != "ACCEPT":
             raise Refusal("FORGE_GATE_REFUSED", f"gate {tp.log}: verifier verdict {verdict}",
                           verdict=verdict, log=tp.log, gross=gross, cap=tp.cap)
+        # F8: every exit from here finishes the step: COMMITTED only for a dict result without
+        # isError, ABORTED (still spent) for an error, a timeout or ANY exception.
+        ok, note = False, "internal error before the upstream answered"
         try:
             res = up.request("tools/call", {"name": name, "arguments": fwd})
+            if not isinstance(res, dict):
+                raise mcp_client.UpstreamError(f"{name}: upstream result is not an object")
+            ok, note = not res.get("isError"), ""
         except mcp_client.UpstreamError as e:
-            log.finish(seq, False, str(e))
-            raise Refusal("FORGE_UPSTREAM_FAILED", f"{e}; the gate step stays spent (seq {seq})",
+            note = str(e)
+            raise Refusal("FORGE_UPSTREAM_FAILED", f"{clip(note, 300)}; the gate step stays spent (seq {seq})",
                           log=tp.log, seq=seq) from None
-        log.finish(seq, not (isinstance(res, dict) and res.get("isError")))
-        res = dict(res or {})
+        except BaseException as e:
+            note = f"{type(e).__name__}: {clip(str(e), 150)}"
+            raise
+        finally:
+            log.finish(seq, ok, note)
+        res = dict(res)
         res["_meta"] = {"forge": {"log": tp.log, "seq": seq, "gross": gross, "cap": tp.cap, "verdict": verdict}}
         return res
+
+    def _declared(self, name):
+        """Argument names the upstream's inputSchema lists for this tool (for strict_args)."""
+        route = self.route.get(name) if isinstance(name, str) else None
+        schema = (self.upstream_tools.get(route, {}).get(name) or {}).get("inputSchema") if route else None
+        props = schema.get("properties") if isinstance(schema, dict) else None
+        return set(props) if isinstance(props, dict) else set()
 
     def _live_upstream(self, name):
         """Gap 2 (crash). A stdio upstream that died (for example mid-call) is started again
@@ -200,17 +230,25 @@ class Airlock:
         return amount
 
     def _step_id(self, tp, args):
+        """Returns (step_id, normalized id or None). F4: the id must be a string; it is
+        NFC-normalized and stripped, then must fully match id_regex; the replay key is the
+        normalized form, so '1', ' 1' and 1 cannot be three different steps."""
         if tp.id_field:
-            if tp.id_field not in args or args[tp.id_field] in ("", None):
-                raise Refusal("FORGE_ARG_REFUSED", f"id field {tp.id_field!r} is required by the gate")
+            v = args.get(tp.id_field)
+            if not isinstance(v, str):
+                raise Refusal("FORGE_ARG_REFUSED", f"id field {tp.id_field!r} must be a non-empty string")
+            v = unicodedata.normalize("NFC", v).strip()
+            if not v or not tp.id_regex.fullmatch(v):
+                raise Refusal("FORGE_ARG_REFUSED", f"id field {tp.id_field!r} must fully match "
+                              f"/{tp.id_regex.pattern}/ (after NFC and strip)")
             return hashlib.sha256(b"forge-step:" + tp.log.encode() + b":" +
-                                  canonical_json(args[tp.id_field]).encode()).digest()[:16]
-        return hashlib.sha256(b"forge-step-rand:" + os.urandom(32)).digest()[:16]
+                                  canonical_json(v).encode()).digest()[:16], v
+        return hashlib.sha256(b"forge-step-rand:" + os.urandom(32)).digest()[:16], None
 
     def _run_checker(self, tp, name, args):
         if not tp.checker:
             return
-        payload = canonical_json({"tool": name, "arguments": args}).encode()
+        payload = canonical_json({"tool": name, "arguments": args}).encode()  # allow_nan=False
         try:
             r = subprocess.run(tp.checker["command"], input=payload, capture_output=True,
                                timeout=tp.checker.get("timeout_s", 10), env={"PATH": "/usr/bin:/bin:/usr/local/bin"})
@@ -230,8 +268,9 @@ class Airlock:
         revs = [n for n, tp in self.policy.tools.items() if "git_revpath" in tp.path_args.values()]
         return {
             "agent_root": self.policy.agent_root,
+            "fp_salt": self.fp_salt.hex(),
             "fingerprints": self.ws["fingerprints"],
-            "secret_fps": [workspace.fp(s.encode()) for s in self.policy.secrets()],
+            "secret_fps": [workspace.fp(s.encode(), self.fp_salt) for s in self.policy.secrets()],
             "hidden_names": self.ws["hidden_names"],
             "readonly_files": self.ws.get("readonly_files", [])[:8],
             "closed_dirs": self.ws.get("closed_dirs", [])[:8],
@@ -257,11 +296,37 @@ class Airlock:
         return out
 
 
+def canary_token():
+    """F7: the canary endpoints need this token. forge_airlock.py (or the test harness) sets
+    FORGE_CANARY_TOKEN for the airlock and passes it ONLY to the canary process (the agent's
+    command runs after `unset`). Without it, a random token is written to STATE/canary.token
+    (root, 0600; never mounted in the agent), so nobody in the box can report or read the plan."""
+    tok = os.environ.get("FORGE_CANARY_TOKEN", "")
+    if len(tok) >= 16:
+        return tok
+    tok = secrets.token_hex(16)
+    try:
+        path = os.path.join(STATE, "canary.token")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(tok)
+    except OSError:
+        pass
+    return tok
+
+
+class BodyError(Exception):
+    def __init__(self, status, why):
+        super().__init__(why)
+        self.status, self.why = status, why
+
+
 class Handler(BaseHTTPRequestHandler):
     A = None
+    timeout = READ_TIMEOUT_S  # F1: every socket read times out (slow-loris)
 
     def _send(self, code, obj):
-        body = json.dumps(obj).encode()
+        body = json.dumps(obj, allow_nan=False).encode()
         self.send_response(code)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(body)))
@@ -269,16 +334,51 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _body(self):
-        n = int(self.headers.get("content-length") or 0)
-        if n > (1 << 20):
-            raise ValueError("body too large")
-        return json.loads(self.rfile.read(n) or b"null")
+        """F1: Content-Length is required, decimal and at most 1 MiB; Transfer-Encoding is
+        refused. F5: NaN / Infinity / overflowing numbers do not parse."""
+        if self.headers.get("transfer-encoding") is not None:
+            raise BodyError(400, "transfer-encoding is not supported; send content-length")
+        cl = self.headers.get_all("content-length") or []
+        if not cl:
+            raise BodyError(411, "content-length is required")
+        if len(cl) != 1 or not re.fullmatch(r"[0-9]{1,9}", cl[0].strip()):
+            raise BodyError(400, "content-length must be one decimal number")
+        n = int(cl[0])
+        if n > MAX_BODY:
+            raise BodyError(413, f"body larger than {MAX_BODY} bytes")
+        raw = self.rfile.read(n)
+        if len(raw) != n:
+            raise BodyError(400, "body shorter than content-length")
+        try:
+            return strict_loads(raw or b"null")
+        except (ValueError, RecursionError):
+            raise BodyError(400, "parse error") from None
+
+    def _token_ok(self):
+        got = self.headers.get(TOKEN_HEADER) or ""
+        return hmac.compare_digest(got.encode("utf-8", "replace"), self.A.canary_token.encode())
+
+    def _read_or_reply(self, rpc):
+        try:
+            return True, self._body()
+        except BodyError as e:
+            self.close_connection = True
+            if rpc:
+                code = -32700 if e.why == "parse error" else -32600
+                self._send(e.status, {"jsonrpc": "2.0", "id": None, "error": {"code": code, "message": e.why}})
+            else:
+                self._send(e.status, {"error": e.why})
+        except OSError:  # read timeout or reset: drop the connection
+            self.close_connection = True
+        return False, None
 
     def do_GET(self):
         A = self.A
         if self.path == "/healthz":
             return self._send(200, {"ok": True, "canary": A.canary, "ws_mount": A.ws_mount})
         if self.path == "/forge/canary/plan":
+            if not self._token_ok():
+                return self._send(403, {"error": "canary token required"})
             with A.canary_lock:
                 if A.canary != "PENDING":
                     return self._send(404, {"error": "canary window closed"})
@@ -299,10 +399,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         A = self.A
         if self.path == "/forge/canary/report":
-            try:
-                rep = self._body()
-            except ValueError:
-                return self._send(400, {"error": "bad body"})
+            if not self._token_ok():
+                return self._send(403, {"error": "canary token required"})
+            ok_body, rep = self._read_or_reply(False)
+            if not ok_body:
+                return
             with A.canary_lock:
                 if A.canary != "PENDING":
                     return self._send(409, {"error": "canary already reported", "state": A.canary})
@@ -314,14 +415,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"state": A.canary})
         if self.path.split("?")[0] != "/mcp":
             return self._send(404, {"error": "not found"})
-        try:
-            msg = self._body()
-        except ValueError:
-            return self._send(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+        ok_body, msg = self._read_or_reply(True)
+        if not ok_body:
+            return
         if isinstance(msg, list) or not isinstance(msg, dict):
             return self._send(400, {"jsonrpc": "2.0", "id": None,
                                     "error": {"code": -32600, "message": "batches are not supported"}})
         mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+        pname = clip(params.get("name")) if isinstance(params, dict) else clip(type(params).__name__)
         if mid is None:  # notification
             self.send_response(202)
             self.send_header("content-length", "0")
@@ -339,13 +440,13 @@ class Handler(BaseHTTPRequestHandler):
                 res = A.tools_call(params)
             else:
                 return self._send(200, {"jsonrpc": "2.0", "id": mid,
-                                        "error": {"code": -32601, "message": f"method {method!r} not supported"}})
+                                        "error": {"code": -32601, "message": f"method {clip(method)} not supported"}})
         except Refusal as r:
-            print(f"[airlock] refuse {params.get('name')!r}: {r.code} {r.message}", flush=True)
+            print(f"[airlock] refuse {pname}: {r.code} {clip(r.message, 300)}", flush=True)
             return self._send(200, {"jsonrpc": "2.0", "id": mid, "error": {
                 "code": ERR, "message": f"{r.code}: {r.message}", "data": dict(r.data, forge_code=r.code)}})
         except Exception as e:  # noqa: BLE001 - fail closed on any internal error
-            print(f"[airlock] internal error: {type(e).__name__}: {e}", flush=True)
+            print(f"[airlock] internal error: {type(e).__name__}: {clip(str(e), 300)}", flush=True)
             return self._send(200, {"jsonrpc": "2.0", "id": mid, "error": {
                 "code": ERR, "message": "FORGE_INTERNAL: refused", "data": {"forge_code": "FORGE_INTERNAL"}}})
         return self._send(200, {"jsonrpc": "2.0", "id": mid, "result": res})
@@ -355,8 +456,34 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class Server(ThreadingHTTPServer):
+    """F1: at most MAX_CONN connections are served at once (one thread each); one more gets
+    503 at once and is closed, so held connections cannot grow threads without bound."""
     request_queue_size = 256
     daemon_threads = True
+
+    def __init__(self, *a, max_conn=None, **kw):
+        self._slots = threading.BoundedSemaphore(max_conn or MAX_CONN)
+        super().__init__(*a, **kw)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 def main():

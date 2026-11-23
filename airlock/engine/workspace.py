@@ -44,8 +44,10 @@ def git(args, cwd=None, inp=None, env=None, user=None, check=True):
     return r.stdout
 
 
-def fp(line):
-    return hashlib.sha256(b"forge-fp:" + line).hexdigest()[:32]
+def fp(line, salt=b""):
+    """Fingerprint of one line. F7: salted with a random per-build salt (workspace.json), so a
+    leaked plan is not a reusable lookup table of hidden lines or credentials."""
+    return hashlib.sha256(b"forge-fp:" + salt + line).hexdigest()[:32]
 
 
 def lines_of(data):
@@ -57,8 +59,8 @@ def lines_of(data):
     return out
 
 
-def scan_bytes(data, fps):
-    return {fp(ln) for ln in lines_of(data)} & fps
+def scan_bytes(data, fps, salt=b""):
+    return {fp(ln, salt) for ln in lines_of(data)} & fps
 
 
 def _walk(root):
@@ -99,7 +101,7 @@ class BlobReader:
         self.p.wait(30)
 
 
-def filter_history(policy, source, filtered):
+def filter_history(policy, source, filtered, salt=b""):
     hidden = policy.is_hidden
     if os.path.exists(filtered):
         shutil.rmtree(filtered)
@@ -167,7 +169,7 @@ def filter_history(policy, source, filtered):
     blobs.close()
     os.remove(idx)
     git(["--git-dir", filtered, "update-ref", "refs/heads/main", parent])
-    fps = {fp(x) for x in hidden_lines - public_lines}
+    fps = {fp(x, salt) for x in hidden_lines - public_lines}
     return {"commits": len(commits), "hidden_names": sorted(hidden_names),
             "hidden_only_blobs": sorted(hidden_blobs - public_blobs), "fingerprints": sorted(fps),
             "dropped": dropped}
@@ -180,6 +182,7 @@ def verify_workspace(policy, ws, info, as_uid=None, build=True):
     build=False (restart): content checks only. The agent may have created files or
     symlinks since; their names are harmless, hidden CONTENT must still be absent."""
     hidden, fps, bad_blobs = policy.is_hidden, set(info["fingerprints"]), set(info["hidden_only_blobs"])
+    salt = bytes.fromhex(info.get("fp_salt", ""))
     problems = []
     for full, rel in _walk(ws):
         if rel == ".git" or rel.startswith(".git/"):
@@ -192,7 +195,7 @@ def verify_workspace(policy, ws, info, as_uid=None, build=True):
                 problems.append(f"symlink to hidden/outside: {rel}")
         elif os.path.isfile(full):
             with open(full, "rb") as f:
-                if scan_bytes(f.read(4 << 20), fps):
+                if scan_bytes(f.read(4 << 20), fps, salt):
                     problems.append(f"hidden fingerprint in file: {rel}")
     gd = ["--git-dir", os.path.join(ws, ".git")]
     objs = git(gd + ["cat-file", "--batch-all-objects", "--batch-check"], user=as_uid).decode().split("\n")
@@ -200,7 +203,7 @@ def verify_workspace(policy, ws, info, as_uid=None, build=True):
         if o and o.split()[0] in bad_blobs:
             problems.append(f"hidden blob in object store: {o.split()[0]}")
     allobj = git(gd + ["cat-file", "--batch-all-objects", "--batch"], user=as_uid)
-    if scan_bytes(allobj, fps):
+    if scan_bytes(allobj, fps, salt):
         problems.append("hidden fingerprint in a git object")
     names = git(gd + ["log", "--all", "--name-only", "--format="], user=as_uid).decode().split("\n")
     for nme in names:
@@ -270,7 +273,9 @@ def prepare(policy, source, state, ws):
     if os.listdir(ws):
         raise WorkspaceError(f"{ws} is not empty and has no build marker; refusing to reuse it")
     filtered = os.path.join(state, "filtered.git")
-    info = filter_history(policy, source, filtered)
+    salt = os.urandom(16)
+    info = filter_history(policy, source, filtered, salt)
+    info["fp_salt"] = salt.hex()
     git(["init", "-q", "-b", "scratch", ws])
     git(["-C", ws, "fetch", "-q", "--no-tags", filtered, "refs/heads/main"])
     git(["-C", ws, "checkout", "-q", "-B", "main", "FETCH_HEAD"])
