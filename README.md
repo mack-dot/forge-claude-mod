@@ -215,6 +215,52 @@ python3 cli/forge_check.py mutate    # plant small bugs, count how many the proo
 ```
 
 `examples/wallet-cap` is a small complete project. `tests/run_tests.py` drives every verdict.
+### Messy inputs: the wrapper must fail closed, never throw
+
+The wrapper that turns your app's values (often JSON) into the proved code's values is not proved. Runtime JSON
+does not follow your types: a field can be `undefined`, `null`, a number where text was expected, or missing. On a
+real app, `householdId: undefined` reached such a wrapper and it threw instead of answering "forbid". The plain
+fuzz never sent that value, so it did not see it.
+
+If the JavaScript/TypeScript or Python adapter exports a raw-value wrapper, the fuzz also sends **messy variants**
+of its inputs to it: each field (nested objects and lists too, bounded) is in turn made `undefined` (JavaScript
+only), `null`, a number, a boolean, `""`, a lone surrogate, a 20,000-character text, `[]`, `{}`, the number as
+text (`"5"` for `5`), or removed. Big integers in the other fields stay exact.
+
+```js
+// diff/<check>_diff.mjs (Python: wrapper / wrappers, fail_closed, returning None for "the rule takes it")
+export const wrapper = (i) => myRealWrapper(i)        // the app's REAL wrapper, raw values, no conversion here
+// or: export const wrappers = { name: fn, ... }
+export function failClosed(i) {                        // the spec's fail-closed answer for a value the
+  return typeof i.householdId === 'string' ? undefined // proved rule does not take; undefined: the rule
+    : { effect: 'forbid', rule: 'other_household' }    // takes it, so the proved rule's answer is expected
+}
+```
+
+Rules: a throw from the wrapper on any messy input is always a disagreement of kind `THROWS_ON_MESSY_INPUT`.
+Otherwise its answer must equal `failClosed(input)`, or the proved rule's answer where `failClosed` returns
+`undefined`. Messy disagreements are grouped, shrunk (the messy field and its kind stay; the rest of the input
+shrinks) and saved like the others. `"messy": false` on a diff entry turns them off; an inputs module can list
+fields to leave alone in `messy_skip = ['retracted', 'limits[].setBy']`. A messy input that has no fail-closed
+answer and that the proved rule cannot take is counted as "not judged" (only a throw is reported for it).
+
+```
+  NEW wrapper-throws: input {"cap": 0, "spent": 0, "amount": {"__undefined__": true}} → expected (fail-closed or proved) {"ok": false, "spent": null}, wrapper-throws says {"__throws__": "TypeError"}
+    messy field amount = undefined: THROWS_ON_MESSY_INPUT (TypeError): the wrapper crashed instead of failing closed
+```
+
+The example has three planted wrappers (`examples/wallet-cap/messy_wrappers.ts` and `.py`, adapters
+`diff/wallet_messy.*`): one that throws on `amount` undefined/null, one that turns `"5"` into `5`, and a correct one
+that fails closed (the negative control). They are not in the example's `forge.json`; the tests add them.
+
+Time, measured on the example (one machine, warm, 1,500 inputs, median of 3 runs): the three wrappers with messy
+off 324 ms (JS) and 216 ms (Python); with messy on (about 1,530 messy inputs, including shrinking the planted bugs)
+1,192 ms and 1,236 ms. An entry without a wrapper does not change. With the default time budget (1.5 s per entry)
+messy inputs share the budget, so fewer plain inputs run (584 instead of 1,500 for JS in one measured run).
+
+Labels: the messy values are a fixed list, not every possible value; the fail-closed answer is the adapter's (the
+person's) choice, not proved; a run is a FINITE TEST.
+
 See `PLAN.md` for what is built and what is not.
 
 ## Limits

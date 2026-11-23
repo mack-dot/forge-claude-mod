@@ -838,7 +838,8 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None):
         else:
             cmd = list(df['run'])
         data = forge_diff.run_entry(cmd, root, env, inside(root, df['inputs']), s, n, ms,
-                                    os.path.join(root, REGRESSIONS, key.replace(':', '-')))
+                                    os.path.join(root, REGRESSIONS, key.replace(':', '-')),
+                                    messy=df.get('messy', True) is not False)
         res.update(data)
         if data.get('error') and 'Unknown file extension ".ts"' in data['error']:
             res['verdict'] = 'TOOLCHAIN_MISSING'
@@ -879,6 +880,19 @@ def update_diff_stats(root, out):
     write_json(root, DIFF_STATS, stats)
 
 
+def messy_line(d):
+    """One line under a messy disagreement: which field was odd, and what kind of failure it is."""
+    m = d['messy']
+    what = ('THROWS_ON_MESSY_INPUT (%s): the wrapper crashed instead of failing closed' % d['got']['__throws__']
+            if d.get('kind') == 'THROWS_ON_MESSY_INPUT' else 'the wrapper answered differently from the fail-closed answer')
+    return '    messy field %s = %s: %s' % (m['field'], m['as'], what)
+
+
+def messy_summary(m):
+    return ('  messy inputs: %d sent to %s (%d field/kind pairs tried; %d not judged: no fail-closed answer and the '
+            'proved rule cannot take them)' % (m['inputs'], ', '.join(m['candidates']), m['pairs_tried'], m['not_judged']))
+
+
 def diff_report(out):
     if not out['checks']:
         return 'forge diff: no check has a "diff" entry yet (/forge fuzz sets one up; /forge add does it for code that already exists)'
@@ -900,6 +914,8 @@ def diff_report(out):
                          'for %s, %d ms, seed %s' % (name, r['inputs'], r['out_of_domain'], r['replayed'],
                                                      ', '.join(r.get('candidates') or []), r['ms'], r['seed']))
             lines.append(dec_line)
+            if r.get('messy'):
+                lines.append(messy_summary(r['messy']))
             if st_line:
                 lines.append(st_line)
         elif v == 'DISAGREE':
@@ -913,11 +929,16 @@ def diff_report(out):
             if len(groups) < len(r['disagreements']):
                 lines.append('  %d kind(s) of wrong answer; examples of different shape under each:' % len(groups))
             for d in sorted(r['disagreements'], key=lambda x: (x['candidate'], x.get('group', ''))):
-                lines.append('  %s%s: input %s → proved rule says %s, %s says %s  [%s]' % (
+                lines.append('  %s%s: input %s → %s %s, %s says %s  [%s]' % (
                     'NEW ' if d.get('new') else '', d['candidate'], json.dumps(d['input'], ensure_ascii=False)[:200],
+                    'expected (fail-closed or proved)' if d.get('messy') else 'proved rule says',
                     json.dumps(d['reference'], ensure_ascii=False)[:120], d['candidate'],
                     json.dumps(d['got'], ensure_ascii=False)[:120], d['file']))
+                if d.get('messy'):
+                    lines.append(messy_line(d))
             lines.append(dec_line)
+            if r.get('messy'):
+                lines.append(messy_summary(r['messy']))
             if st_line:
                 lines.append(st_line)
             lines.append('  Each one is a bug in that code, or a place where the spec says something other than '
@@ -1066,8 +1087,8 @@ def show_specs(root):
 
 def write_json(root, rel, value):
     os.makedirs(os.path.join(root, DIR), exist_ok=True)
-    with open(os.path.join(root, rel), 'w', encoding='utf-8') as f:
-        f.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
+    with open(os.path.join(root, rel), 'w', encoding='utf-8', errors='backslashreplace') as f:  # a lone surrogate
+        f.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')  # (messy fuzz) is written as its JSON escape
 
 
 def main(argv=None):
@@ -1109,6 +1130,8 @@ def main(argv=None):
             print('wrote %s (%d rules)' % (os.path.relpath(path, root), len(load_config(root)['checks'])))
             return 0
         if a.command == 'diff':
+            if hasattr(sys.stdout, 'reconfigure'):
+                sys.stdout.reconfigure(errors='backslashreplace')  # messy inputs may hold a lone surrogate
             out = run_diff(root, a.inputs, a.budget_ms, a.seed)
             if not a.no_write:
                 update_diff_stats(root, out)

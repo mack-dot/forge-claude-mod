@@ -446,6 +446,66 @@ def main():
         extra += 1
         print('%s  diff: two bugs with the same wrong answer (zero and empty text) are both reported  %s' % ('ok  ' if ok else 'FAIL', found))
 
+    # Messy inputs: the unproved wrapper that turns raw app/JSON values into Dafny values must fail closed, never throw
+    # (owner feedback: a real app's wrapper threw on `householdId: undefined`, and the plain fuzz never sent one).
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, 'p')
+        shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
+        cfg = json.load(open(os.path.join(root, CONFIG)))
+
+        def messy_cfg(flag):
+            cfg['checks'][0]['diff'] = [
+                dict({'name': 'messy-js', 'lang': 'js', 'inputs': 'diff/wallet_inputs.py', 'adapter': 'diff/wallet_messy.mjs'}, **flag),
+                dict({'name': 'messy-py', 'lang': 'py', 'inputs': 'diff/wallet_inputs.py', 'adapter': 'diff/wallet_messy.py'}, **flag)]
+            json.dump(cfg, open(os.path.join(root, CONFIG), 'w'))
+
+        messy_cfg({'messy': False})  # negative control first: without the messy step, nothing is found
+        code_off, off = diff(root)
+        messy_cfg({})  # the default: on, because the adapters name raw-value wrappers
+        code_on, on = diff(root)
+        code_again, again = diff(root)
+        mjs, mpy = on.get('wallet-cap:messy-js', {}), on.get('wallet-cap:messy-py', {})
+
+        def got(r, cand, kind=None):
+            return [d for d in r.get('disagreements', []) if d['candidate'] == cand and (kind is None or d.get('kind') == kind)]
+        t_js, t_py = got(mjs, 'wrapper-throws', 'THROWS_ON_MESSY_INPUT'), got(mpy, 'wrapper-raises', 'THROWS_ON_MESSY_INPUT')
+        c_js, c_py = got(mjs, 'wrapper-coerces', 'MESSY_ANSWER'), got(mpy, 'wrapper-coerces', 'MESSY_ANSWER')
+        undef = {'__undefined__': True}
+        cases_messy = [
+            ('messy: negative control, messy off: the planted wrappers agree on well-typed inputs',
+             all(r.get('verdict') == 'DIFF_OK' and 'messy' not in r for r in off.values()) and code_off == 0),
+            ('messy: JS wrapper that throws on amount undefined/null is found (THROWS_ON_MESSY_INPUT)',
+             code_on == 1 and {d['messy']['as'] for d in t_js} >= {'undefined', 'null'}
+             and all(d['messy']['field'] == 'amount' for d in got(mjs, 'wrapper-throws'))),
+            ('messy: the throw is shrunk to that one field (cap 0, spent 0, amount undefined)',
+             {'cap': 0, 'spent': 0, 'amount': undef} in [d['input'] for d in t_js]
+             and {'cap': 0, 'spent': 0, 'amount': None} in [d['input'] for d in t_js + t_py]),
+            ('messy: Python wrapper that raises on amount None is found, only on that field',
+             'null' in {d['messy']['as'] for d in t_py} and all(d['messy']['field'] == 'amount' for d in got(mpy, 'wrapper-raises'))),
+            ('messy: a wrapper that coerces "5" to 5 is found as a disagreement (JS and Python)',
+             any(d['messy']['as'] == 'number-as-text' and isinstance(d['input']['amount'], str) for d in c_js)
+             and any(d['messy']['as'] == 'number-as-text' for d in c_py)),
+            ('messy: negative control, the fail-closed wrapper has no messy disagreement',
+             mjs.get('per_candidate', {}).get('wrapper-safe') == 0 and mpy.get('per_candidate', {}).get('wrapper-safe') == 0
+             and mjs.get('messy', {}).get('inputs', 0) > 100 and mpy.get('messy', {}).get('inputs', 0) > 100),
+            ('messy: every kind of odd value is tried (undefined only in JS) and judged',
+             mjs.get('messy', {}).get('kinds') == list(forge_diff.MESSY_KINDS)
+             and mpy.get('messy', {}).get('kinds') == [k for k in forge_diff.MESSY_KINDS if k != 'undefined']
+             and mjs['messy']['pairs_tried'] >= 30 and mpy['messy']['pairs_tried'] >= 27
+             and mjs['messy']['not_judged'] == 0 and mpy['messy']['not_judged'] == 0),
+            ('messy: saved messy cases replay first next run (a lone surrogate too)',
+             again.get('wallet-cap:messy-py', {}).get('replayed', 0) >= len(got(mpy, 'wrapper-raises')) > 0
+             and again.get('wallet-cap:messy-js', {}).get('replayed', 0) >= len(got(mjs, 'wrapper-throws')) > 0
+             and code_again == 1),
+        ]
+        for name, ok in cases_messy:
+            failed += not ok
+            extra += 1
+            print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
+            if not ok:
+                print('      ' + json.dumps({k: {kk: v.get(kk) for kk in ('verdict', 'per_candidate', 'messy', 'error')}
+                                             for k, v in on.items()}, ensure_ascii=True)[:700])
+
     # INVARIANTS.md: generated from the approved rules; CI catches a stale copy
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, 'p')
