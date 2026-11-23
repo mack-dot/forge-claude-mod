@@ -415,7 +415,8 @@ def bypass_cases():
         cases.append(('gate: a new unapproved reader gives UNAPPROVED_BYPASS (exit 1), listed under "outside"',
                       cexit == 1 and verdicts == ['UNAPPROVED_BYPASS'] and 'gift_card.py:5' in chk['detail'].get('wallet-cap', '')
                       and [(h['file'], h['function'], h['line']) for h in outside] == [('gift_card.py', 'can_send_gift', found[0]['line'] if found else -1)]
-                      and (set(outside[0]) == {'file', 'line', 'function', 'term', 'text'} if outside else False)))
+                      and (set(outside[0]) == {'file', 'line', 'function', 'term', 'text', 'decision'} if outside else False)
+                      and outside[0]['decision'] == 'comparison' if outside else False))
         # the person says "it is fine": recorded with the line's hash; forge.json changed, so approval is needed again
         line = found[0]['line'] if found else 0
         r = subprocess.run([sys.executable, CLI, 'bypass', '--root', root, '--rule', 'wallet-cap', '--record',
@@ -534,6 +535,147 @@ def bypass_cases():
                              stderr=subprocess.PIPE, universal_newlines=True).stdout
         cases.append(('bypass: check text names the places ("N places decide with body.for outside gate-mayread")',
                       '5 places decide with body.for outside gate-mayread: ' in txt and 'src/gate.ts:8 mayRetract' in txt))
+    return cases
+
+
+# Planted decision reads of a watched field, one per file (the AST bypass search must find each one).
+AST_PLANTS = {
+    'ts_ternary.ts': ('export const label = (u: User, r: Row): string =>\n  r.tenantId ? "mine" : "other"\n', 2, 'ternary'),
+    'ts_switch.ts': ('export function route(r: Row): number {\n  switch (r.tenantId) {\n    case "a": return 1\n  }\n'
+                     '  return 0\n}\n', 2, 'switch'),
+    'ts_includes.ts': ('export const allowed = (list: string[], r: Row) =>\n  list.includes(r.tenantId)\n', 2, 'includes'),
+    'ts_filter.js': ('export const mine = (rows, u) =>\n  rows.filter((r) => r.tenantId)\n', 2, 'filter-predicate'),
+    'py_ternary.py': ('def label(u, r):\n    return "mine" if r.tenantId else "other"\n', 2, 'ternary'),
+    'py_match.py': ('def route(r):\n    match r.tenantId:\n        case "a":\n            return 1\n    return 0\n',
+                    2, 'switch'),
+    'py_in.py': ('def allowed(xs, r):\n    return r.tenantId in xs\n', 2, 'in'),
+    'py_filter.py': ('def mine(rows, u):\n    return [r for r in rows if r.tenantId]\n', 2, 'filter-predicate'),
+}
+# Only declarations, annotations, imports, comments, strings, construction and logging of the field: no decision.
+AST_QUIET = {
+    'types.ts': ('// tenantId: the owner\'s tenant\nimport type { tenantId } from "./ids"\n'
+                 'export interface Row { tenantId: string }\nexport type T = { tenantId?: string }\n'
+                 '/* tenantId in a block comment */\nexport function make(id: string): Row {\n'
+                 '  const row = { tenantId: id }\n  console.log("tenantId", row.tenantId)\n  return row\n}\n'),
+    'types.py': ('# tenantId comment\nfrom ids import tenantId\n\n\nclass Row:\n    tenantId: str\n\n\n'
+                 'def make(i):\n    row = Row(tenantId=i)\n    print("tenantId", row.tenantId)\n    return {"tenantId": i}\n'),
+}
+
+
+def ast_bypass_cases():
+    """The AST bypass search (cli/forge_ast.py): decision reads count in TS/JS and Python; declarations do not;
+    a file that does not parse, and any other language, is searched as text and says so (fail closed)."""
+    cases = []
+
+    def project(tmp, files, terms=('tenantId',)):
+        root = os.path.join(tmp, 'a')
+        if os.path.isdir(root):
+            shutil.rmtree(root)
+        for rel, text in dict({'spec/S.dfy': 'abstract module S { }\n', 'impl/I.dfy': 'module I { }\n'}, **files).items():
+            os.makedirs(os.path.dirname(os.path.join(root, rel)) or root, exist_ok=True)
+            open(os.path.join(root, rel), 'w').write(text)
+        os.makedirs(os.path.join(root, '.forge'), exist_ok=True)
+        json.dump({'version': 1, 'checks': [{'name': 'tenant-gate', 'spec': 'spec/S.dfy', 'files': ['impl/I.dfy'],
+                                             'watchedFields': list(terms)}]}, open(os.path.join(root, CONFIG), 'w'))
+        return root
+
+    def run(root, env=None, text=False):
+        r = subprocess.run([sys.executable, CLI, 'bypass', '--root', root] + ([] if text else ['--json']),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                           env=dict(os.environ, **(env or {})))
+        if text:
+            return r.returncode, r.stdout
+        try:
+            return r.returncode, json.loads(r.stdout)['checks']['tenant-gate']
+        except (ValueError, KeyError):
+            return r.returncode, {'hits': [], 'not_decisions': [], 'error': (r.stderr or r.stdout)[-300:]}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for rel, (text, line, kind) in sorted(AST_PLANTS.items()):
+            code, res = run(project(tmp, {'src/' + rel: text}))
+            got = [(h['file'], h['line'], h['decision'], h['method']) for h in res['hits']]
+            cases.append(('bypass: AST: a planted decision read (%s, %s) is BYPASS_FOUND' % (rel, kind),
+                          code == 1 and got == [('src/' + rel, line, kind, 'ast')]))
+        code, res = run(project(tmp, {'src/' + k: v for k, v in AST_QUIET.items()}))
+        cases.append(('bypass: AST: a file with only types, comments, imports, strings, construction and logging of the '
+                      'field gives 0 hits (BYPASS_CLEAR)',
+                      code == 0 and res['hits'] == [] and len(res['not_decisions']) == 13
+                      and res['search']['ast'] == 2 and res['search']['fallback'] == []))
+        # fail closed: a file that does not parse is searched as text, and the report says so
+        broken = {'src/broken.ts': 'export function f(r: Row {\n  return r.tenantId\n}\n',
+                  'src/broken.py': 'def f(r:\n    return r.tenantId\n'}
+        root = project(tmp, broken)
+        code, res = run(root)
+        _, txt = run(root, text=True)
+        cases.append(('bypass: AST: a parse error falls back to text search for that file, says so, and still finds it',
+                      code == 1 and sorted((h['file'], h['method'], h['decision']) for h in res['hits'])
+                      == [('src/broken.py', 'text', None), ('src/broken.ts', 'text', None)]
+                      and all('parse error' in h.get('fallback', '') for h in res['hits'])
+                      and 'FALLBACK to text search, not AST: src/broken.ts: TS/JS parse error' in txt
+                      and 'FALLBACK to text search, not AST: src/broken.py: Python parse error' in txt))
+        # other languages keep the text search, labelled as such
+        root = project(tmp, {'src/x.go': 'package x\n\nfunc F(r Row) string { return r.tenantId }\n',
+                             'src/types.ts': AST_QUIET['types.ts']})
+        code, res = run(root)
+        _, txt = run(root, text=True)
+        cases.append(('bypass: AST: Go keeps the text search ("text search, not AST"); the TS declarations do not count',
+                      code == 1 and [(h['file'], h['method']) for h in res['hits']] == [('src/x.go', 'text')]
+                      and '(text search, not AST)' in txt))
+        # no TypeScript parser available (empty cache, downloads off): TS/JS files are searched as text (fail closed)
+        root = project(tmp, dict({'src/' + k: AST_PLANTS[k][0] for k in ('ts_ternary.ts', 'ts_switch.ts')},
+                                 **{'src/types.ts': AST_QUIET['types.ts']}))
+        code, res = run(root, env={'XDG_CACHE_HOME': os.path.join(tmp, 'empty-cache'), 'FORGE_NO_DOWNLOAD': '1'})
+        cases.append(('bypass: AST: without the TypeScript parser every TS file falls back to text search, with the reason',
+                      code == 1 and {h['file'] for h in res['hits']} == {'src/ts_ternary.ts', 'src/ts_switch.ts', 'src/types.ts'}
+                      and all(h['method'] == 'text' and 'downloads are off' in h.get('fallback', '') for h in res['hits'])))
+        # an alias read in a decision: const t = r.tenantId; if (t === u.id) ...
+        root = project(tmp, {'src/alias.ts': 'export function g(r: Row, u: User) {\n  const t = r.tenantId\n'
+                                             '  if (t !== u.id) return false\n  return true\n}\n',
+                             'src/alias.py': 'def g(r, u):\n    t = r.tenantId\n    if t != u.id:\n        return False\n'
+                                             '    return True\n',
+                             'src/sql.ts': 'export const rows = (db: Db, s: Scope) =>\n'
+                                           '  db.query("SELECT * FROM t WHERE tenant_id = $1",\n    [s.tenantId])\n'})
+        code, res = run(root)
+        cases.append(('bypass: AST: an alias later read in a decision, and a SQL WHERE parameter, are found',
+                      code == 1 and sorted((h['file'], h['line'], h['decision']) for h in res['hits'])
+                      == [('src/alias.py', 2, 'alias'), ('src/alias.ts', 2, 'alias'), ('src/sql.ts', 3, 'sql-where')]))
+
+    # migration: an allowed line stays allowed (and is not "outdated") whether or not it is a decision read
+    with tempfile.TemporaryDirectory() as tmp:
+        import hashlib
+        root = project(tmp, {'src/types.ts': AST_QUIET['types.ts'], 'src/ts_ternary.ts': AST_PLANTS['ts_ternary.ts'][0]})
+        cfg = json.load(open(os.path.join(root, CONFIG)))
+        line = lambda rel, n: open(os.path.join(root, rel)).read().split('\n')[n - 1]
+        cfg['checks'][0]['allowedBypasses'] = [
+            {'file': 'src/types.ts', 'line_text_sha256': hashlib.sha256(line('src/types.ts', 3).encode()).hexdigest(), 'note': 'old text hit'},
+            {'file': 'src/ts_ternary.ts', 'line_text_sha256': hashlib.sha256(line('src/ts_ternary.ts', 2).encode()).hexdigest(), 'note': 'reviewed'}]
+        json.dump(cfg, open(os.path.join(root, CONFIG), 'w'))
+        code, res = run(root)
+        cases.append(('bypass: AST: approved allowedBypasses entries (by line hash) stay allowed, none outdated',
+                      code == 0 and res['hits'] == [] and res['reviewed'] == 2 and res['outdated_reviews'] == []))
+
+    # the hard gate on a real proof: a planted TS ternary and a Python match outside the rule are UNAPPROVED_BYPASS
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, 'p')
+        shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
+        cfg = json.load(open(os.path.join(root, CONFIG)))
+        cfg['checks'][0]['watchedFields'].append('tenantId')
+        json.dump(cfg, open(os.path.join(root, CONFIG), 'w'), indent=2)
+        reapprove(root)
+        for rel in ('ts_ternary.ts', 'py_match.py'):
+            open(os.path.join(root, rel), 'w').write(AST_PLANTS[rel][0])
+        for rel, text in AST_QUIET.items():
+            open(os.path.join(root, rel), 'w').write(text)
+        r = subprocess.run([sys.executable, CLI, 'check', '--root', root, '--json', '--no-write'],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        try:
+            out = json.loads(r.stdout)
+        except ValueError:
+            out = {'verdicts': {}, 'outside': {}}
+        got = sorted((h['file'], h['decision']) for h in (out.get('outside') or {}).get('wallet-cap', []))
+        cases.append(('gate: AST: planted TS ternary and Python match give UNAPPROVED_BYPASS; the declarations file does not',
+                      r.returncode == 1 and list(out['verdicts'].values()) == ['UNAPPROVED_BYPASS']
+                      and got == [('py_match.py', 'switch'), ('ts_ternary.ts', 'ternary')]))
     return cases
 
 
@@ -956,7 +1098,7 @@ def main():
             failed += not ok
             extra += 1
             print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
-    for name, ok in bypass_cases():
+    for name, ok in bypass_cases() + ast_bypass_cases():
         failed += not ok
         extra += 1
         print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
