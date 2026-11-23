@@ -2,7 +2,16 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
-## Unreleased
+## 0.13.0 — 2026-11-23
+
+One release with the owner's chronicle feedback and the airlock:
+- **Bypass gate** (`watchedFields`, `UNAPPROVED_BYPASS`, `/forge:bypass`): code outside a proved rule that decides on its fields fails `check` until it is routed through the rule or allowed by a person.
+- **Messy-input fuzz** of the unproved wrapper (`THROWS_ON_MESSY_INPUT`).
+- **Scope-honest status**, `DECISION_NOTE_STALE`, notes edits without re-approval, next-rule suggestion, build syntax step over app files and their importers (`APP_SYNTAX_ERROR`), short approval digest (`--full` for every file).
+- **Fast generated JS module** (no `new Function`) and `serviceTest` (`NOT_CALLED`).
+- **forge-airlock** in the plugin: an agent box with hidden paths absent from disk, default-deny MCP, gates on the compiled #91 verifier, canary, egress allowlist, reviewed sync-back; red-team fixes (sync-back case/Unicode aliases; protocol F1–F8); model proxy so the box holds no API key, with spending capped by the proved verifier (strict 1 byte/token reservation, settled to reported usage). `prove_release.sh`: 8 gates, all exit 0 on three consecutive runs.
+- **Upgrade note:** a committed `js` build is `STALE_BUILD` until you run `/forge build` once (the new module is part of the build). Approvals from before 0.13 stay valid; approve once more to edit notes without re-approval.
+
 - New (`js` target): `build` also writes `<name>.mjs` and `<name>.d.mts` next to the emitted `<name>.js`: one ES
   module with real exports, a private pinned copy of bignumber.js 9.3.1 (SHA-256 checked) and helpers
   (`toDafnyString`/`fromDafnyString` with a bounded cache of frozen seqs, `toDafnyInt`/`fromDafnyInt`, seq and set

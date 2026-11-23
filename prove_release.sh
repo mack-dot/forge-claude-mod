@@ -44,14 +44,22 @@ claude plugin validate . >"$OUT/g1-validate.txt" 2>&1 || g=1
 grep -E "Validation (passed|failed)" "$OUT/g1-validate.txt" | sed 's/^/     /'
 # files that would be committed: tracked + untracked, not ignored
 git ls-files -co --exclude-standard -z > "$OUT/files.z"
-python3 - "$OUT" <<'PY' || g=1
+FORGE_SCAN_SELFTEST=1 python3 - "$OUT" <<'PY' || g=1
 import os, re, sys
 out = sys.argv[1]
 files = [f for f in open(f"{out}/files.z", "rb").read().decode().split("\0") if f and os.path.isfile(f)]
 SECRET = re.compile(r"sk-ant-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|"
                     r"-----BEGIN [A-Z ]*PRIVATE KEY-----|xox[abpr]-[A-Za-z0-9-]{10,}|sk_live_[A-Za-z0-9]{10,}|"
                     r"AIza[0-9A-Za-z_-]{35}")
-HOME = re.compile("/" + "Users/[A-Za-z0-9._-]+|/" + "home/[a-z][a-z0-9_-]*/")
+# Home paths, also in the dashed form of tool scratch folders (-Users-<name>-…), local temp folders, and the
+# running user's own name (a scoreboard once carried a scratch path with it; 2026-11-23).
+user = os.environ.get("USER", "")
+HOME = re.compile("/" + "Users/[A-Za-z0-9._-]+|/" + "home/[a-z][a-z0-9_-]*/|-" + "Users-[A-Za-z0-9._]+-|/private/" + "tmp/[A-Za-z]"
+                  + ("|\\b" + re.escape(user) + "\\b" if len(user) >= 4 and user not in ("root", "runner", "user") else ""))
+if os.environ.get("FORGE_SCAN_SELFTEST"):  # negative control: a planted path must be found
+    t = "out=/private/" + "tmp/claude-501/-" + "Users-someone-x/scratchpad/run"
+    assert HOME.search(t), "the home-path scan misses a planted scratch path"
+    print("     scan self-test: a planted scratch path is found")
 sec, home = [], []
 for f in files:
     try:
@@ -171,5 +179,5 @@ echo "cleanup: containers=$c volumes=$vol networks=$net (forgeair*, forge-airloc
 fail=0
 for e in "${G_EXIT[@]}"; do [ "$e" = 0 ] || fail=1; done
 [ "$c$vol$net" = 000 ] || fail=1
-echo "prove_release: $([ $fail = 0 ] && echo PASS || echo FAIL) total=$((SECONDS-T0))s out=$OUT" | tee -a "$OUT/scoreboard.txt"
+echo "prove_release: $([ $fail = 0 ] && echo PASS || echo FAIL) total=$((SECONDS-T0))s out=${OUT#"$PWD"/}" | tee -a "$OUT/scoreboard.txt"
 exit $fail

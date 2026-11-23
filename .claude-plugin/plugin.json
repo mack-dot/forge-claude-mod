@@ -1,1 +1,1 @@
-{"name": "forge", "version": "0.12.2", "description": "Forge proof gate in Claude Code: /forge guided setup, /forge check, status line verdict, spec guard", "license": "MIT"}
+{"name": "forge", "version": "0.13.0", "description": "Forge proof gate in Claude Code: /forge guided setup, proofs, differential fuzz, bypass gate, and forge-airlock (an agent box with default-deny MCP and proved spending caps)", "license": "MIT"}
