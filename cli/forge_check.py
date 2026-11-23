@@ -340,7 +340,8 @@ def changed_since(root, base, paths):
     out = []
     for rel in paths:
         if rel.endswith('.md') and os.path.isfile(inside(root, rel)):
-            old = subprocess.run(['git', '-C', root, 'show', '%s:%s' % (base, rel)], stdout=subprocess.PIPE,
+            # './': the path is relative to root (git -C), not to the top of the repository.
+            old = subprocess.run(['git', '-C', root, 'show', '%s:./%s' % (base, rel)], stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, universal_newlines=True)
             if old.returncode == 0:
                 if normative_text(old.stdout) != normative_text(read_text(inside(root, rel))):

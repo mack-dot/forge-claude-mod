@@ -1,0 +1,18 @@
+# Forge in CI with zero configuration. Copy this file to .github/workflows/forge.yml in a repository that has
+# .forge/forge.json and .forge/approved.json at its top. See docs/ci.md for what each gate checks.
+name: forge
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+permissions:
+  contents: read
+jobs:
+  forge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # Replace main with the commit hash of the release you reviewed: branches and tags can move.
+      - uses: mack-dot/forge-claude-mod@main

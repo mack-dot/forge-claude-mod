@@ -40,6 +40,37 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
 - Not tested: coverage of Go, Rust, Java, C# (not built); `mutate --app` on C# (no .NET SDK here); JS regular
   expression literals are not masked, so a mutation inside one may be planted (it then shows as caught, survived
   or not run like any other).
+- **Zero-config CI** (M1.3): `examples/workflows/forge.yml` plus the Action with no inputs runs every gate the
+  project's `.forge/forge.json` makes possible: `check` with `--base` taken from the event (pull_request base
+  branch, merge_group base commit, the commit before a push; other events: not compared, and the summary says so),
+  the bypass gate, `build --check` when a check has a build, `invariants --check`, and a diff sweep when checks
+  have diff entries (`diff-inputs` 50,000, `diff-budget-seconds` 600 per entry, `diff-seed` = the run ID by
+  default). Node and Go are installed only when a check uses them. New driver `cli/forge_ci.py`; every verdict
+  still comes from `forge_check.py`. Outputs `result` and `report` (JSON). See `docs/ci.md`.
+- Job summary: one scope-honest status line per rule, a table of every gate's verdicts, the bypass count, the fuzz
+  counts and times, and the exact commands (base commit and seed) that reproduce the run.
+- Fixed: `check --base` with the project in a subfolder compared a decision record's whole file instead of its
+  binding part (`git show ref:path` reads from the repository top; now `ref:./path`), so a notes-only edit gave
+  `APPROVAL_CHANGED`.
+- **Upgrade note:** the defaults change. `build` was off and is now `auto`; `invariants` was off and is now on
+  (commit `INVARIANTS.md`, or set `invariants: "false"`); the diff sweep is new and on (`diff: "false"` turns it
+  off). `build: "true"` still works.
+- Tested on GitHub-hosted `ubuntu-latest` (selftest run 45113316698): job `action-controls` makes a fixture
+  repository from the example (Python only; only the correct wrapper fuzzed) and runs the Action with no inputs.
+  Unchanged: pass, 50,000 inputs, `DIFF_OK`. Spec clause W1 removed: `APPROVAL_CHANGED` (with `base: none`:
+  `SPEC_CHANGED`). A new `refund.py` comparing `spent + amount <= cap`: `UNAPPROVED_BYPASS`. A hand edit of
+  `INVARIANTS.md`: `INVARIANTS_STALE`. A rare wrapper bug (exact-cap spend rejected when `cap % 250 == 27`):
+  `DISAGREE` in the 50,000-input sweep (detection numbers: see docs/ci.md). A first version of that bug (cap ends
+  in 777, about 0.9 hits in 10,000 inputs) was missed by the 50,000-input sweep in run 45113930328 (seed
+  2164257368): a flaky control, replaced. Base
+  detection per event and the subfolder fix have their own steps in `checker-tests` (the old code fails the
+  subfolder step: checked on one machine).
+- Measured on the runner: the 50,000-input Python sweep took 1,500–4,054 ms per job (run 45113316698) and
+  2,158–2,198 ms (run 45114616292); the example's five languages, 50,000 inputs each, 1,901–2,813 ms per language
+  (run 45113316698) and 3,829–5,389 ms (run 45114616292). The replaced bug in run 45114616292: 1,500 inputs found
+  it in 8 of 20 seeds, 50,000 in 10 of 10.
+- Not tested: macOS and Windows runners with the Action; `pull_request_target` and `merge_group` events on GitHub
+  (only the detection from a stored event file); Java, Rust and .NET versions other than the runner's own.
 
 ## 0.13.0 — 2026-11-23
 
