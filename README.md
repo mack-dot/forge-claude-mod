@@ -12,7 +12,7 @@ That is all you need to remember: `/forge` runs whatever comes next (a read-only
 the fuzz). Nothing in your app changes until you approve. What it looks like on the included example:
 
 ```
-forge ✓ VERIFIED 1/1
+forge ✓ VERIFIED 1/1 (model PROVED; wrappers and other app code NOT proved)
 ✗ wallet-cap:py: 3 failing decision(s) in 1500 random inputs (177 ms)
   your recorded decisions: 1 of 4 agree; failing: D1 exact cap allowed, D3 zero rejected, D4 negative rejected
 ✗ wallet-cap:java: … legacy-java says {"ok": true, "spent": -9223372036854775808}   (a long overflow, found by itself)
@@ -61,7 +61,7 @@ conversation with Claude; commands with a **space** (`/forge approve`) run a fix
 | State a rule | `/forge:add <the rule in your own words>` | A conversation: Claude says whether the rule can be proved, confirms safe defaults, asks edge-case questions with concrete numbers (as many rounds as needed), probes the spec with Dafny for cases nobody asked about, then writes the spec, **your answers as Dafny checks**, a decision record and the implementation. |
 | Read it | `/forge:explain` | Claude explains every clause in plain words, checks that each of your answers is covered, and lists what is not guaranteed. |
 | Approve it | `/forge approve`, then `/forge approve yes` | Shows exactly what you approve (spec, your answers, decision record, `forge.json`); "yes" approves exactly that, even after a restart. Typing "yes" first only shows it. If a file changed in between, it shows the new version instead. Only you can do this. |
-| Prove it | `/forge check` | Your answers are checked against the spec (`EXAMPLES_FAILED` if the spec says otherwise or leaves one open), then the code against the spec. The status line shows `forge ✓ VERIFIED n/n` or what failed. |
+| Prove it | `/forge check` | Your answers are checked against the spec (`EXAMPLES_FAILED` if the spec says otherwise or leaves one open), then the code against the spec. The status line says what a green check covers, for example `forge ✓ wallet-cap: model PROVED · fuzzed 1,500 cases, wrapper NOT proved · records current`, or what failed. |
 | Find bugs in your real code | automatic (set up by `/forge add` when the rule already exists in your code), or `/forge fuzz` | Runs your shipped code and the proved rule on fresh random inputs at the end of each turn that changed them (about a second), saves each disagreement as a small repeatable case. `/forge fuzz` on its own is a deep run. See **Fuzz** below. |
 | Measure it | `/forge mutate` | Plants up to 30 small bugs in the proved code, one at a time in a temporary copy, and counts how many the proof catches. A survivor is a change your spec allows: harmless, or a gap in the spec. Changes nothing. |
 | Something failed | `/forge:fix` | Claude explains the verdict and proposes a fix to the code; it never weakens the spec without your word. |
@@ -227,3 +227,12 @@ See `PLAN.md` for what is built and what is not.
 ## License
 
 MIT. See `LICENSE`. Also: `CHANGELOG.md`, `SECURITY.md`, `CONTRIBUTING.md`, `PLAN.md`, `TRIAL.md`.
+
+## What a green check covers (and what it does not)
+
+- **Status line:** `model PROVED` (the Dafny model meets the approved spec) · `fuzzed N cases, wrapper NOT proved` (a finite test of the code people run) · bypass count, once a rule names its fields · `records current` or `decision record may be stale`.
+- **Stale decision records:** at approval Forge remembers the code a decision record names (file paths, and functions in backticks defined in at most two non-test files). When that code changes, `check` prints `DECISION_NOTE_STALE` (a warning; the proof approval stands).
+- **Notes do not need re-approval:** an approval hashes the binding part of a decision record (the rule in words, the defaults, the choices). Sections headed Out of scope, Notes, Background or History can be fixed freely. Approvals written before 0.13 hold the full-file hash; approve once more to get this.
+- **Next rule:** `check` names the first Out-of-scope item that points at code in your repo, as the next `/forge:add`.
+- **Build sanity step:** `build` first parses every app file a check touches and every JS/TS file that imports them, directly or not (`APP_SYNTAX_ERROR`). `check` reports the same as a warning. Optional `"typecheck": ["npx", "--no-install", "tsc", "--noEmit"]` in a check's build entry runs a real type check. Parsing is not proving: it catches a missing brace, not a wrong type.
+- **Shorter approval screen:** `/forge approve` shows a digest: every spec clause in full (predicate and function bodies included; lemma and method bodies left out), the answers by id, the whole decision record, and files that are already approved and unchanged as one line. `/forge approve --full` prints every file. The approval always covers the complete files by hash.
