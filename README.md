@@ -458,7 +458,7 @@ its minimal trace:
 | `reject-leaks`: Renew changes the state before it checks expiry; the rejected step keeps the change | 2 |
 
 The correct code had 0 disagreements over 50,000 traces (about 275,000 steps) in each language. Wall time for
-50,000 traces, correct code only, one machine: JS 11.6–21.4 s, Python 11.2–15.1 s (four runs; the highest JS time
+50,000 traces, correct code only, one machine: JS 11.6–21.4 s, Python 11.2–17.0 s (five runs, one in a clean clone; the highest JS time
 was measured while other heavy work ran on the machine). Negative controls in `tests/run_tests.py`: with `max_len: 1`, no
 planted bug is found; with `restart: 0`, the restart bug is not found.
 
