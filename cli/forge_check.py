@@ -101,8 +101,11 @@ LAST_DIFF = DIR + '/last-diff.json'
 DIFF_STATS = DIR + '/diff-stats.json'
 REGRESSIONS = DIR + '/regressions'
 
-# Constructs that make Dafny accept a claim without proof. A text scan, not a parser.
-UNSOUND = [r'\bassume\b', r'\{:\s*verify\s+false', r'\{:\s*axiom', r'\{:\s*extern', r'\{:\s*only']
+# Constructs that make Dafny accept a claim without proof. A text scan, not a parser. Dafny 4 also has an attribute
+# syntax (@Axiom is {:axiom}, @VerifyOnly is {:only}). Before these were listed, a body-less
+# `@Axiom lemma L() ensures false` passed the scan and `dafny verify` exited 0: VERIFIED with a proof of false.
+UNSOUND = [r'\bassume\b', r'\{:\s*verify\s+false', r'\{:\s*axiom', r'\{:\s*extern', r'\{:\s*only',
+           r'@\s*Axiom\b', r'@\s*VerifyOnly\b']
 TIMEOUT_S = 600
 DAFNY_VERSION = '4.11.0'
 # Release files of dafny-lang/dafny v4.11.0 and the SHA-256 that GitHub publishes for each.
@@ -814,7 +817,7 @@ def fuzz_target(dafny, work, harness_rel, target, log):
             return 'TOOLCHAIN_MISSING', 'npm could not install bignumber.js'
         code = run_to_file([dafny, 'translate', 'js', '--no-verify', '--include-runtime', harness_rel], work, log)
         if code != 0:
-            return 'FAILED', 'dafny translate js: exit %s\n%s' % (code, read_text(log)[-600:])
+            return 'BUILD_FAILED', 'dafny translate js: exit %s\n%s' % (code, read_text(log)[-600:])
         env = dict(os.environ, NODE_PATH=modules)
         code = run_to_file(['node', os.path.splitext(harness_rel)[0] + '.js'], work, log, env)
         if code == 0:  # the same harness through the generated ES module (js_wrapper.py) must print the same
@@ -822,6 +825,12 @@ def fuzz_target(dafny, work, harness_rel, target, log):
             if err:
                 return 'FAILED', err
     else:
+        # Compile first: `dafny run` exits 3 both when the target's compiler fails and when the harness fails at run
+        # time, and a compiler failure is not a wrong result (FUZZ_BUILD_FAILED). The run after it reuses the build.
+        code = run_to_file([dafny, 'build', '--no-verify', '--target:' + target] + extra + [harness_rel], work, log)
+        if code != 0:
+            return 'BUILD_FAILED', 'dafny build --target:%s: exit %s\n%s' % (
+                target, 'timeout' if code is None else code, read_text(log)[-600:])
         code = run_to_file([dafny, 'run', '--no-verify', '--target:' + target] + extra + [harness_rel], work, log)
     text = read_text(log)
     if code != 0:
@@ -957,6 +966,9 @@ def syntax_errors(root, files):
     return errors, unchecked
 
 
+WEAK = ('TOOLCHAIN_MISSING', 'FUZZ_BUILD_FAILED')  # build verdicts about the toolchain, not about the code
+
+
 def build_one(root, cfg, c, dafny, check_only):
     bd = c['build']
     name = c['name'].replace('-', '_')
@@ -964,7 +976,10 @@ def build_one(root, cfg, c, dafny, check_only):
     res = {'verdict': 'BUILT', 'targets': {}, 'notes': []}
 
     def fail(verdict, note):
-        if res['verdict'] == 'BUILT':
+        # The first failure is the verdict, except that a toolchain problem (a compiler that is missing or fails)
+        # gives way to a later finding about the code itself: before, a failing Rust build (FUZZ_FAILED) hid a
+        # STALE_BUILD. Every failure stays in the notes, and every one of them exits 1.
+        if res['verdict'] == 'BUILT' or res['verdict'] in WEAK and verdict not in WEAK:
             res['verdict'] = verdict
         res['notes'].append(note)
 
@@ -999,10 +1014,14 @@ def build_one(root, cfg, c, dafny, check_only):
             pattern = unsound_in(inside(root, fuzz))
             if pattern:
                 fail('UNSOUND_CONSTRUCT', '%s matches %s' % (fuzz, pattern))
-            r = subprocess.run([dafny, 'verify', inside(root, fuzz)], cwd=root, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, universal_newlines=True)
+            try:
+                r = subprocess.run([dafny, 'verify', inside(root, fuzz)], cwd=root, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, universal_newlines=True,
+                                   timeout=TIMEOUT_S)
+            except subprocess.TimeoutExpired:  # before, no limit: a hang here hung the build
+                r = subprocess.CompletedProcess([], None, 'dafny ran longer than %d s' % TIMEOUT_S)
             if r.returncode != 0:
-                fail('FUZZ_NOT_VERIFIED', 'dafny verify %s: exit %d\n%s' % (fuzz, r.returncode, r.stdout[-600:]))
+                fail('FUZZ_NOT_VERIFIED', 'dafny verify %s: exit %s\n%s' % (fuzz, r.returncode, r.stdout[-600:]))
             else:
                 for t in bd['targets']:
                     work = os.path.join(tmp, 'fuzz-' + t)
@@ -1015,7 +1034,8 @@ def build_one(root, cfg, c, dafny, check_only):
                         entry['fuzz_output_lines'] = text.count('\n') + 1
                     else:
                         entry['fuzz_detail'] = text
-                        fail('TOOLCHAIN_MISSING' if status == 'TOOLCHAIN_MISSING' else 'FUZZ_FAILED',
+                        fail({'TOOLCHAIN_MISSING': 'TOOLCHAIN_MISSING', 'BUILD_FAILED': 'FUZZ_BUILD_FAILED'}.get(
+                             status, 'FUZZ_FAILED'),
                              '%s: %s' % (t, text.split('\n')[0]))
                     res['targets'][t] = entry
                 if len(set(outputs.values())) > 1:
@@ -1178,7 +1198,7 @@ def run_mutate(root, limit):
     if any(v != 'VERIFIED' for v in base['verdicts'].values()):
         raise ConfigError('every check must be VERIFIED before mutation testing: ' + json.dumps(base['verdicts']))
     cfg = load_config(root)
-    out = {'mutants': [], 'caught': 0, 'survived': 0, 'skipped': 0}
+    out = {'mutants': [], 'caught': 0, 'survived': 0, 'skipped': 0, 'errors': 0}
     jobs = []
     for c in cfg['checks']:
         for f in c['files']:
@@ -1199,8 +1219,10 @@ def run_mutate(root, limit):
             with open(os.path.join(copy, f), 'w', encoding='utf-8') as fh:
                 fh.write(mutated)
             verdict = run_checks(copy, signed=False, callers=False)['verdicts'].get(name, 'ERROR')
-        status = 'survived' if verdict == 'VERIFIED' else 'caught'
-        out[status] += 1
+        # ERROR: Dafny did not judge the mutant (it does not resolve or type-check, or Dafny timed out). Counting it
+        # as caught made the score look better than the spec is; it is reported apart and not scored.
+        status = 'survived' if verdict == 'VERIFIED' else 'error' if verdict == 'ERROR' else 'caught'
+        out['errors' if status == 'error' else status] += 1
         out['mutants'].append({'check': name, 'file': f, 'line': line, 'mutation': mname,
                                'verdict': verdict, 'status': status,
                                'text': text.split('\n')[line - 1].strip()[:120]})
@@ -1209,7 +1231,9 @@ def run_mutate(root, limit):
 
 def mutate_report(out):
     total = out['caught'] + out['survived']
-    lines = ['forge mutate: %d of %d planted bugs caught' % (out['caught'], total)]
+    lines = ['forge mutate: %d of %d planted bugs caught%s' % (
+        out['caught'], total, '; %d not scored (ERROR: the mutant does not resolve, or Dafny timed out)'
+        % out['errors'] if out.get('errors') else '')]
     for m in out['mutants']:
         if m['status'] == 'survived':
             lines.append('  SURVIVED %s:%d  %s  in: %s' % (m['file'], m['line'], m['mutation'], m['text']))
@@ -1226,9 +1250,18 @@ def build_is_fresh(root, c):
     manifest = os.path.join(inside(root, c['build']['out']), c['name'], 'forge-build.json')
     if not os.path.isfile(manifest):
         return False
-    sources = (read_json(manifest, {}) or {}).get('sources', {})
+    data = read_json(manifest, {}) or {}
+    sources = data.get('sources', {})
     want = build_sources(root, c)
-    return sorted(sources) == sorted(want) and all(sources[f] == sha256(inside(root, f)) for f in want)
+    if not (sorted(sources) == sorted(want) and all(sources[f] == sha256(inside(root, f)) for f in want)):
+        return False
+    # The diff runs the emitted code as the reference: a hand edit there (one that agrees with the code under test)
+    # would make every disagreement vanish. The manifest holds the hash of every emitted file; `build --check` does
+    # the same comparison against a fresh build.
+    folder = os.path.join(inside(root, c['build']['out']), c['name'])
+    targets = data.get('targets') or {}
+    return all(t in targets and isinstance(targets[t].get('files'), dict) and
+               tree_hashes(os.path.join(folder, t)) == targets[t]['files'] for t in c['build'].get('targets', []))
 
 
 def run_diff(root, inputs=None, budget_ms=None, seed=None, coverage=False, only=None, tier=None, steer=None):
@@ -1257,103 +1290,136 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None, coverage=False, only=
         if only is not None and key not in only:
             continue
         res = out['checks'][key] = {}
-        if not c.get('build'):
-            res['verdict'] = 'NO_BUILD'
-            res['detail'] = 'diff compares against the compiled proved code: add a "build" entry first'
-            continue
-        if not build_is_fresh(root, c):
-            res['verdict'] = 'BUILD_STALE'
-            res['detail'] = 'the compiled proved code does not match the current Dafny files: run build'
-            continue
-        local = tset['name'] == 'local'  # an entry's own numbers apply to the local tier only
-        n = inputs if inputs is not None else df.get('inputs_per_run', tset['inputs']) if local else tset['inputs']
-        ms = budget_ms if budget_ms is not None else df.get('budget_ms', tset['budget_ms']) if local else tset['budget_ms']
-        s = seed if seed is not None else int.from_bytes(os.urandom(4), 'little')
-        env = dict(os.environ)
-        if df['lang'] == 'js':
-            if not shutil.which('node'):
-                res['verdict'], res['detail'] = 'TOOLCHAIN_MISSING', 'node is not on PATH'
-                continue
-            modules = js_node_path()
-            if not modules:
-                res['verdict'], res['detail'] = 'TOOLCHAIN_MISSING', 'npm could not install bignumber.js'
-                continue
-            env['NODE_PATH'] = modules
-            cmd = ['node', os.path.join(here, 'eval', 'node_eval.mjs'), inside(root, df['adapter'])]
-        elif df['lang'] == 'py':
-            cmd = [sys.executable, os.path.join(here, 'eval', 'py_eval.py'), inside(root, df['adapter'])]
-        elif df['lang'] in ('go', 'rs', 'java', 'cs'):
-            import eval_build
-            target = df['lang']
-            if target not in c['build'].get('targets', []):
-                res['verdict'] = 'NO_BUILD'
-                res['detail'] = 'add "%s" to the check\'s build targets, approve, and run build' % target
-                continue
-            name = c['name'].replace('-', '_')
-            emitted = os.path.join(inside(root, c['build']['out']), c['name'], target)
-            if target != 'cs':  # C# output is one file directly in <out>/<check>/cs
-                emitted = os.path.join(emitted, '%s-%s' % (name, {'go': 'go', 'rs': 'rust', 'java': 'java'}[target]))
-            work = os.path.join(root, DIR, 'cache', 'diff-%s-%s' % (key.replace(':', '-'), target))
-            try:
-                if target == 'go':
-                    cmd = eval_build.build_go(root, emitted, inside(root, df['adapter']), work)
-                elif target == 'java':
-                    cmd = eval_build.build_java(root, emitted, inside(root, df['adapter']), work, df.get('java_sources'))
-                elif target == 'cs':
-                    cmd = eval_build.build_cs(root, emitted, inside(root, df['adapter']), work, df.get('cs_sources'))
-                else:
-                    cmd = eval_build.build_rust(root, emitted, inside(root, df['adapter']), work, df.get('rust_deps'))
-            except eval_build.BuildError as e:
-                missing = 'is not on PATH' in str(e)
-                res['verdict'] = 'TOOLCHAIN_MISSING' if missing else 'DIFF_ERROR'
-                res['detail' if missing else 'error'] = str(e)
-                continue
-        else:
-            cmd = list(df['run'])
-        cov = None
-        st = forge_steer.make(df, root, steer)
-        if st:
-            cmd, env = st.wrap(cmd, env)
-        elif steer:
-            res['steer_note'] = 'not steered (%s): blind random inputs' % (
-                'no per-input coverage for %s' % df['lang'] if df['lang'] not in forge_steer.STEERED_LANGS
-                else 'no "watch" files')
-        if coverage and not st:  # a steered run measures coverage itself
-            import forge_coverage
-            cov = forge_coverage.Session(df['lang'], root, df.get('watch'))
-            cmd, env = cov.wrap(cmd, env)
-        if df.get('trace') is not None:
-            import forge_trace
-            data = forge_trace.run_trace_entry(cmd, root, env, inside(root, df['inputs']), s, df['trace'],
-                                               os.path.join(root, REGRESSIONS, key.replace(':', '-')),
-                                               count=inputs, budget_ms=budget_ms)
-        else:
-            data = forge_diff.run_entry(cmd, root, env, inside(root, df['inputs']), s, n, ms,
-                                        os.path.join(root, REGRESSIONS, key.replace(':', '-')),
-                                        messy=df.get('messy', True) is not False, steer=st)
-        data['repro'] = [sys.executable, os.path.abspath(__file__), 'diff', '--root', root, '--seed', str(s)]
-        res.update(data)
-        if cov:
-            res['coverage'] = cov.collect()
-        if st:
-            res['coverage'] = st.collect()
-        if data.get('error') and 'Unknown file extension ".ts"' in data['error']:
-            res['verdict'] = 'TOOLCHAIN_MISSING'
-            res['detail'] = ('this Node cannot import TypeScript directly (%s); it needs Node 22.18 or newer'
-                             % subprocess.run(['node', '--version'], stdout=subprocess.PIPE,
-                                              universal_newlines=True).stdout.strip())
-        elif data.get('error'):
-            res['verdict'] = 'DIFF_ERROR'
-        elif data.get('disagreements') or (data.get('decisions') or {}).get('failing'):
-            res['verdict'] = 'DISAGREE'
-        else:
-            res['verdict'] = 'DIFF_OK'
+        # One run at a time per entry: the build folder in .forge/cache and the saved cases are shared by a second
+        # run (the end-of-turn fuzz and a manual diff); see forge_diff.Locked.
+        try:
+            with forge_diff.Locked(os.path.join(root, DIR, 'cache', 'diff-%s.lock' % key.replace(':', '-'))):
+                _diff_job(root, c, df, key, res, tset, inputs, budget_ms, seed, coverage, steer, here)
+        except forge_diff.LockTimeout as e:
+            res['verdict'], res['error'] = 'DIFF_ERROR', str(e)
     return out
+
+
+def _diff_job(root, c, df, key, res, tset, inputs, budget_ms, seed, coverage, steer, here):
+    """One diff entry (run_diff holds its lock)."""
+    import forge_diff
+    import forge_steer
+    if not c.get('build'):
+        res['verdict'] = 'NO_BUILD'
+        res['detail'] = 'diff compares against the compiled proved code: add a "build" entry first'
+        return
+    if not build_is_fresh(root, c):
+        res['verdict'] = 'BUILD_STALE'
+        res['detail'] = ('the compiled proved code does not match the current Dafny files, or a file under %s/%s '
+                         'differs from what build wrote (never edit emitted code by hand): run build'
+                         % (c['build']['out'], c['name']))
+        return
+    local = tset['name'] == 'local'  # an entry's own numbers apply to the local tier only
+    n = inputs if inputs is not None else df.get('inputs_per_run', tset['inputs']) if local else tset['inputs']
+    ms = budget_ms if budget_ms is not None else df.get('budget_ms', tset['budget_ms']) if local else tset['budget_ms']
+    s = seed if seed is not None else int.from_bytes(os.urandom(4), 'little')
+    env = dict(os.environ)
+    if df['lang'] == 'js':
+        if not shutil.which('node'):
+            res['verdict'], res['detail'] = 'TOOLCHAIN_MISSING', 'node is not on PATH'
+            return
+        modules = js_node_path()
+        if not modules:
+            res['verdict'], res['detail'] = 'TOOLCHAIN_MISSING', 'npm could not install bignumber.js'
+            return
+        env['NODE_PATH'] = modules
+        cmd = ['node', os.path.join(here, 'eval', 'node_eval.mjs'), inside(root, df['adapter'])]
+    elif df['lang'] == 'py':
+        cmd = [sys.executable, os.path.join(here, 'eval', 'py_eval.py'), inside(root, df['adapter'])]
+    elif df['lang'] in ('go', 'rs', 'java', 'cs'):
+        import eval_build
+        target = df['lang']
+        if target not in c['build'].get('targets', []):
+            res['verdict'] = 'NO_BUILD'
+            res['detail'] = 'add "%s" to the check\'s build targets, approve, and run build' % target
+            return
+        name = c['name'].replace('-', '_')
+        emitted = os.path.join(inside(root, c['build']['out']), c['name'], target)
+        if target != 'cs':  # C# output is one file directly in <out>/<check>/cs
+            emitted = os.path.join(emitted, '%s-%s' % (name, {'go': 'go', 'rs': 'rust', 'java': 'java'}[target]))
+        work = os.path.join(root, DIR, 'cache', 'diff-%s-%s' % (key.replace(':', '-'), target))
+        try:
+            if target == 'go':
+                cmd = eval_build.build_go(root, emitted, inside(root, df['adapter']), work)
+            elif target == 'java':
+                cmd = eval_build.build_java(root, emitted, inside(root, df['adapter']), work, df.get('java_sources'))
+            elif target == 'cs':
+                cmd = eval_build.build_cs(root, emitted, inside(root, df['adapter']), work, df.get('cs_sources'))
+            else:
+                cmd = eval_build.build_rust(root, emitted, inside(root, df['adapter']), work, df.get('rust_deps'))
+        except eval_build.BuildError as e:
+            missing = 'is not on PATH' in str(e)
+            res['verdict'] = 'TOOLCHAIN_MISSING' if missing else 'DIFF_ERROR'
+            res['detail' if missing else 'error'] = str(e)
+            return
+    else:
+        cmd = list(df['run'])
+    cov = None
+    st = forge_steer.make(df, root, steer)
+    if st:
+        cmd, env = st.wrap(cmd, env)
+    elif steer:
+        res['steer_note'] = 'not steered (%s): blind random inputs' % (
+            'no per-input coverage for %s' % df['lang'] if df['lang'] not in forge_steer.STEERED_LANGS
+            else 'no "watch" files')
+    if coverage and not st:  # a steered run measures coverage itself
+        import forge_coverage
+        cov = forge_coverage.Session(df['lang'], root, df.get('watch'))
+        cmd, env = cov.wrap(cmd, env)
+    if df.get('trace') is not None:
+        import forge_trace
+        data = forge_trace.run_trace_entry(cmd, root, env, inside(root, df['inputs']), s, df['trace'],
+                                           os.path.join(root, REGRESSIONS, key.replace(':', '-')),
+                                           count=inputs, budget_ms=budget_ms)
+    else:
+        data = forge_diff.run_entry(cmd, root, env, inside(root, df['inputs']), s, n, ms,
+                                    os.path.join(root, REGRESSIONS, key.replace(':', '-')),
+                                    messy=df.get('messy', True) is not False, steer=st)
+    data['repro'] = [sys.executable, os.path.abspath(__file__), 'diff', '--root', root, '--seed', str(s)]
+    res.update(data)
+    if cov:
+        res['coverage'] = cov.collect()
+    if st:
+        res['coverage'] = st.collect()
+    if data.get('error') and 'Unknown file extension ".ts"' in data['error']:
+        res['verdict'] = 'TOOLCHAIN_MISSING'
+        res['detail'] = ('this Node cannot import TypeScript directly (%s); it needs Node 22.18 or newer'
+                         % subprocess.run(['node', '--version'], stdout=subprocess.PIPE,
+                                          universal_newlines=True).stdout.strip())
+    elif data.get('error'):
+        res['verdict'] = 'DIFF_ERROR'
+    elif not data.get('candidates'):
+        # an adapter that names no candidates (a typo in "candidates") compares nothing
+        res['verdict'], res['error'] = 'DIFF_ERROR', 'the adapter names no candidates: nothing was compared'
+    elif (data.get('decisions') or {}).get('out_of_domain'):
+        res['verdict'], res['error'] = 'DIFF_ERROR', (
+            'recorded decision(s) %s are outside the rule (in_domain is false for them), so they were never '
+            'compared: fix the decision input or in_domain' % ', '.join(str(x) for x in data['decisions']['out_of_domain']))
+    elif data.get('inputs') and data['inputs'] <= data.get('out_of_domain', 0) + data.get('not_judged', 0) \
+            and not data.get('disagreements'):
+        res['verdict'], res['error'] = 'DIFF_ERROR', (
+            'no input was compared: all %d were outside the rule (in_domain) or not judged' % data['inputs'])
+    elif data.get('disagreements') or (data.get('decisions') or {}).get('failing'):
+        res['verdict'] = 'DISAGREE'
+    else:
+        res['verdict'] = 'DIFF_OK'
 
 
 def update_diff_stats(root, out):
     """Running totals per diff key: how much searching has happened, and how much since the last NEW failure.
     A long stretch with nothing new is evidence (not proof) that the easy bugs are gone."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import forge_diff
+    with forge_diff.Locked(os.path.join(root, DIR, 'cache', 'diff-stats.lock'), timeout=120):  # read-modify-write
+        _update_diff_stats(root, out)
+
+
+def _update_diff_stats(root, out):
     path = os.path.join(root, DIFF_STATS)
     stats = read_json(path, {}) or {}
     for key, r in out['checks'].items():
@@ -1823,9 +1889,13 @@ def next_rules(root, cfg, callers=None):
 
 
 def write_json(root, rel, value):
+    """Atomic (forge_diff.write_atomic): the status line (or a second run) reads these files while a run writes them;
+    a reader saw a half-written file before (ConfigError: not valid JSON), and a run killed mid-write left one."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import forge_diff
     os.makedirs(os.path.join(root, DIR), exist_ok=True)
-    with open(os.path.join(root, rel), 'w', encoding='utf-8', errors='backslashreplace') as f:  # a lone surrogate
-        f.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')  # (messy fuzz) is written as its JSON escape
+    forge_diff.write_atomic(os.path.join(root, rel), json.dumps(value, indent=2, ensure_ascii=False) + '\n',
+                            errors='backslashreplace')  # a lone surrogate (messy fuzz) is written as its JSON escape
 
 
 # ---------------------------------------------------------------------------- bypass
