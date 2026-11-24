@@ -263,9 +263,11 @@ def claude_args(cmd):
 
 # ---------------------------------------------------------------- sync back
 def ignored_fn(repo):
+    """True when the repository's .gitignore ignores rel. './' keeps git from reading a name that starts
+    with ':' as pathspec magic, and any git error counts as ignored (the change is refused: fail closed)."""
     def ignored(rel):
-        r = out(["git", "-C", repo, "check-ignore", "-q", "--", rel])
-        return r.returncode == 0
+        r = out(["git", "-C", repo, "check-ignore", "-q", "--", "./" + rel])
+        return r.returncode != 1
     return ignored
 
 
@@ -287,7 +289,7 @@ def sync_back(pol, run_dir, stage, repo):
     apply, rejected = sync.plan(pol, changes, os.path.join(run_dir, "export"), stage, repo, ignored_fn(repo))
     for rel, why in rejected:
         flag = "   <-- SENSITIVE (refused)" if sync.sensitive(rel) else ""
-        print(f"  not applied: {rel}: {why}{flag}")
+        print(f"  not applied: {sync.display(rel)}: {sync.display(why)}{flag}")  # no raw control character
     if not apply:
         say("no change that may be applied; your repository is unchanged")
         return 0
@@ -353,6 +355,19 @@ def cmd_up(a):
     os.environ["FORGE_CANARY_TOKEN"] = secrets.token_hex(24)
     code = 1
     old_int = signal.getsignal(signal.SIGINT)
+    # A closed terminal (SIGHUP) or a kill (SIGTERM) must still run the cleanup below: without a handler
+    # Python ends at once, the airlock container (it holds the upstream credentials) keeps running and the
+    # run folder with the staged repository stays. The first signal raises SystemExit; later ones are
+    # ignored until the cleanup is done.
+    old_term = {sg: signal.getsignal(sg) for sg in (signal.SIGTERM, signal.SIGHUP)}
+
+    def stop(signum, _frame):
+        for sg in old_term:
+            signal.signal(sg, signal.SIG_IGN)
+        say(f"signal {signum}: stopping the box and cleaning up")
+        raise SystemExit(128 + signum)
+    for sg in old_term:
+        signal.signal(sg, stop)
     try:
         stage = stage_repo(repo, os.path.join(run_dir, "source"))
         os.makedirs(os.path.join(run_dir, "agent"))
@@ -416,13 +431,17 @@ def cmd_up(a):
         code = rc
         return code
     finally:
-        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGINT, old_int)  # Ctrl-C can still stop a cleanup that hangs
+        for sg in old_term:
+            signal.signal(sg, signal.SIG_IGN)  # a second TERM or HUP does not cut the cleanup short
         run(dc + ["--profile", "export", "down", "-v", "--remove-orphans"], stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)
         if a.keep:
             say(f"kept {run_dir}")
         else:
             shutil.rmtree(run_dir, ignore_errors=True)
+        for sg, h in old_term.items():
+            signal.signal(sg, h)
 
 
 WRAPPER = """#!/bin/sh

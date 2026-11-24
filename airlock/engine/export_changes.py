@@ -8,10 +8,12 @@
 # Writes <out>/changes.json and <out>/files/<n> (new content). Paths that the policy hides,
 # makes read-only or that are inside .git are listed as REFUSED and never exported; so are their
 # case and Unicode-normalization aliases (sync.refusal) and two names that fold to one (sync.fold).
+# A FIFO, socket or device file is listed as REFUSED and never opened (a FIFO would hang the export).
 # Label: NATIVE CHECK (hand-written, not proved).
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 
@@ -73,6 +75,10 @@ def main():
                 data = os.readlink(full).encode("utf-8", "surrogateescape")
                 mode = "120000"
             else:
+                if not stat.S_ISREG(os.lstat(full).st_mode):  # a FIFO would block the read forever
+                    changes.append({"path": rel, "status": "modified" if rel in base else "added",
+                                    "refused": "not a regular file (FIFO, socket or device); not exported"})
+                    continue
                 if os.path.getsize(full) > MAX_FILE:
                     changes.append({"path": rel, "status": "modified" if rel in base else "added",
                                     "refused": "larger than 20 MiB; not exported"})

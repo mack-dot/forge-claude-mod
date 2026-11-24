@@ -669,10 +669,19 @@ def test_concurrency():
         case(name, bool(ok), detail[0] if detail else "")
 
 
+def test_rest():
+    """Review findings V1 to V6: sync review display, held-call display, .gitignore check, conflict check,
+    export of special files, signal cleanup of forge up (tests/rest_regress.py)."""
+    sys.path.insert(0, HERE)
+    import rest_regress
+    for name, ok, *detail in rest_regress.cases():
+        case(name, bool(ok), detail[0] if detail else "")
+
+
 def main():
     for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static,
               test_redteam, test_human_approval, test_isolation, test_names, test_m22, test_m22_controls, test_mcp_client,
-              test_concurrency):
+              test_concurrency, test_rest):
         try:
             t()
         except Exception as e:  # noqa: BLE001

@@ -23,6 +23,7 @@ import difflib
 import hashlib
 import os
 import re
+import stat
 import unicodedata
 
 # Paths that change what tools on YOUR machine run or trust: flagged in the review, not refused.
@@ -33,6 +34,35 @@ SENSITIVE = (".git/", "forge.yaml", ".mcp.json", ".claude/", ".github/", ".vscod
 # Default-ignorable code points (HFS+ ignores some of them in names; git's core.protectHFS list).
 _IGNORABLE = re.compile("[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f"
                         "\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0]")
+
+
+_SHOWN = ("Cc", "Cf", "Zl", "Zp", "Co", "Cs")  # control, format (bidi, zero width), separators, private, surrogates
+
+
+def display(text):
+    """Text from the box as the terminal may show it: every control, format (bidi override, zero width),
+    line or paragraph separator, private-use and surrogate character becomes a visible escape (\\x1b,
+    \\u202e). An escape sequence or a bidi override in a name or a diff line can otherwise hide or reorder
+    what the person reads before typing y. Display only: the applied bytes do not change."""
+    out = []
+    for ch in text:
+        if unicodedata.category(ch) in _SHOWN:
+            o = ord(ch)
+            out.append(f"\\x{o:02x}" if o < 0x100 else f"\\u{o:04x}" if o < 0x10000 else f"\\U{o:08x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _shown_line(line):
+    """One diff line for the terminal: its own line end removed, everything else through display()."""
+    if line.endswith("\n"):
+        line = line[:-1]
+        if line.endswith("\r"):
+            line = line[:-1]
+    elif line.endswith("\r"):
+        line = line[:-1]
+    return display(line)
 
 
 def fold_seg(seg):
@@ -143,6 +173,21 @@ def _sha_file(path):
         return None
 
 
+def _content_state(path):
+    """None = absent; the sha256 of a regular file that can be read; else the string 'other' (a directory,
+    a special file or a file that cannot be read). 'other' never equals anything: such a target is a
+    conflict, never 'absent' (an unreadable file of yours is not overwritten without the check)."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "other"
+    if not stat.S_ISREG(st.st_mode):
+        return "other"
+    return _sha_file(path) or "other"
+
+
 def _inside(root, path):
     real_root = os.path.realpath(root)
     parent = os.path.realpath(os.path.dirname(path))
@@ -187,8 +232,11 @@ def plan(pol, changes, export_dir, stage_root, real_root, ignored=lambda rel: Fa
             rejected.append((rel, why))
             continue
         base = os.path.join(stage_root, rel)
-        base_sha = _sha_file(base) if os.path.lexists(base) else None
-        real_sha = _sha_file(real) if os.path.lexists(real) else None
+        base_sha, real_sha = _content_state(base), _content_state(real)
+        if "other" in (base_sha, real_sha):
+            rejected.append((rel, "the real or the staged path is a directory, a special file or a file that "
+                                  "cannot be read (not overwritten)"))
+            continue
         if base_sha != real_sha:
             rejected.append((rel, "changed in the real repository since the box started (not overwritten)"))
             continue
@@ -210,15 +258,19 @@ def render(apply, max_lines=4000):
             old = open(c["base"], "rb").read()
         new = c["new"] or b""
         flag = "   <-- SENSITIVE: changes what tools on your machine run; read it" if sensitive(c["path"]) else ""
+        name = display(c["path"])
         if b"\x00" in old[:8192] or b"\x00" in new[:8192]:
-            out.append(f"binary {c['status']}: {c['path']} ({len(new)} bytes){flag}")
+            out.append(f"binary {c['status']}: {name} ({len(new)} bytes){flag}")
             continue
         a = old.decode("utf-8", "replace").splitlines(keepends=True)
         b = new.decode("utf-8", "replace").splitlines(keepends=True)
-        out.append(f"{c['status']}: {c['path']}{flag}")
-        out.extend(x.rstrip("\n") for x in difflib.unified_diff(
+        lines = [_shown_line(x) for x in difflib.unified_diff(
             a, b, "a/" + c["path"] if c["status"] != "added" else "/dev/null",
-            "b/" + c["path"] if c["status"] != "deleted" else "/dev/null"))
+            "b/" + c["path"] if c["status"] != "deleted" else "/dev/null")]
+        if name != c["path"] or any(_shown_line(x) != x.rstrip("\r\n") for x in a + b):
+            flag += "   <-- holds control or invisible characters (shown as \\x / \\u escapes)"
+        out.append(f"{c['status']}: {name}{flag}")
+        out.extend(lines)
     if len(out) > max_lines:
         out = out[:max_lines] + [f"... {len(out) - max_lines} more lines (all of them are applied on y)"]
     return "\n".join(out)
@@ -230,7 +282,10 @@ def _mkdirs(real_root, rel_dir):
     for seg in [x for x in rel_dir.split("/") if x]:
         cur = os.path.join(cur, seg)
         if not os.path.lexists(cur):
-            os.mkdir(cur, 0o755)
+            try:
+                os.mkdir(cur, 0o755)
+            except OSError:
+                return False
         if os.path.islink(cur) or not os.path.isdir(cur):
             return False
     return True
@@ -238,7 +293,9 @@ def _mkdirs(real_root, rel_dir):
 
 def apply_changes(apply, real_root):
     """Write the approved changes. Every target is checked again right before its write (TOCTOU):
-    the alias, symlink and .git checks of target_problem, before and after creating parents."""
+    the alias, symlink and .git checks of target_problem, before and after creating parents.
+    A write or delete that fails (the target became a directory, a full disk) is skipped: the other changes
+    still go on, the failed one is not in the returned list, and no temp file is left behind."""
     done = []
     for c in apply:
         rel = c["path"].strip("/")
@@ -248,7 +305,10 @@ def apply_changes(apply, real_root):
             continue
         if c["status"] == "deleted":
             if os.path.lexists(real) and not os.path.islink(real):
-                os.remove(real)
+                try:
+                    os.remove(real)
+                except OSError:
+                    continue
                 done.append(c["path"])
             continue
         if not _mkdirs(real_root, os.path.dirname(rel)):
@@ -260,12 +320,20 @@ def apply_changes(apply, real_root):
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
         except OSError:
             continue
-        with os.fdopen(fd, "wb") as f:
-            f.write(c["new"])
-            os.fchmod(f.fileno(), 0o755 if c.get("mode") == "100755" else 0o644)
-        if target_problem(real_root, rel)[0] or (os.path.lexists(real) and os.path.islink(real)):
-            os.remove(tmp)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(c["new"])
+                os.fchmod(f.fileno(), 0o755 if c.get("mode") == "100755" else 0o644)
+            if target_problem(real_root, rel)[0] or (os.path.lexists(real) and os.path.islink(real)):
+                continue
+            os.replace(tmp, real)
+        except OSError:
             continue
-        os.replace(tmp, real)
+        finally:
+            if os.path.lexists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
         done.append(c["path"])
     return done
