@@ -154,7 +154,7 @@ traced (Node 22.3 or newer): an app that loads the emitted `.js` with its own lo
 
 `build --check` writes nothing and requires the emitted code on disk to equal a fresh build, so a hand
 edit of emitted code gives `STALE_BUILD`. Commit the emitted code and run `build --check` in CI
-(`build: "true"` in the Action).
+(the Action does this by default when a check has a build).
 
 | Build verdict | Meaning |
 | --- | --- |
@@ -212,10 +212,10 @@ Measured (one machine, Node 24.3.0, warm, median of 5 passes):
 | Case (one pass) | old loader (`new Function` / `Module._compile`) | generated module |
 | --- | --- | --- |
 | wallet-cap `Spend`, 2,000 entries x 10 calls, ints only | 6.34–6.42 ms | 6.48–6.73 ms |
-| a chronicle rule (strings, 10 consent limits), 2,000 calls | 62.6–81.9 ms | 26.7–41.3 ms |
+| a string-heavy rule from a real app (10 limits per call), 2,000 calls | 62.6–81.9 ms | 26.7–41.3 ms |
 | wallet variant with a bounded `newtype` instead of `int` (not the approved spec) | — | 0.40–0.46 ms |
 
-Ranges are the medians of 3 runs. Same answers on every call compared (20,000 wallet calls, 8,000 chronicle calls).
+Ranges are the medians of 3 runs. Same answers on every call compared (20,000 wallet calls, and every call of the app rule).
 The gain comes from the string cache; code that uses only `int` is not faster, because bignumber.js does the work
 (`tests/js_module/bench_wallet.mjs` reproduces the wallet row).
 
@@ -273,14 +273,53 @@ Rust evaluators takes about 7 s.
 Labels: the inputs, the evaluators and the core are test code (not proved); a run is a FINITE TEST. It compares
 returned values only; side effects of the code under test are not checked.
 
+### How good is the fuzz? Coverage and `mutate --app`
+
+A green diff says only that the inputs found no disagreement. Two measures say how much the inputs tried:
+
+- **`forge_check.py diff --coverage`** (off by default): which lines and branches of each watched file the run
+  reached, and the name of every branch it never took (`file:line`, what was never taken, the source line).
+  Python uses coverage.py if the Python that runs Forge can import it, else a standard-library tracer with the
+  same counts on the example; JavaScript/TypeScript uses Node's built-in V8 coverage (`NODE_V8_COVERAGE`, no
+  dependency). V8 lists a block only when it ran a different number of times than the code around it, so for JS
+  the report names blocks never run but gives no branch total. Go, Rust, Java and C# are not measured.
+- **`forge_check.py mutate --app`**: plants one small bug at a time (the `mutate` list: `<=` to `<`, `&&` to `||`,
+  `+ 1` removed, …; for Python also `and`/`or`, `True`/`False`) in the watched files, in a temporary copy (never in
+  your project), and runs that diff entry on each mutant with a fixed seed and input count. **Caught**: the diff
+  report changes (for code that agrees with the proved rule: it now disagrees). **Survived**: the report is the
+  same. A survivor on a line the fuzz never reached is an input gap; on a reached line it is either an input gap or
+  a mutant **equivalent to the original under the spec** (harmless: no input can tell them apart). Forge cannot
+  tell which; read each one. Python and JS/TS by default; `--langs all` adds Go, Rust, Java and C#, which rebuild
+  the evaluator per mutant. `--max N` caps the mutants (default 40; `/forge mutate app` in Claude Code runs it with 30).
+
+```
+forge mutate --app: 8 of 21 planted bugs in the shipped code caught by the diff (13 survived, 1 not run); seed 1, 4,163 ms
+  SURVIVED legacy_wallet.py:2  <= to <  in: if 0 < amount and spent + amount <= cap:  [line reached by the fuzz: equivalent, or the inputs miss the case]
+  SURVIVED legacy_wallet.py:4  False to True  in: return False, spent  [line NEVER reached by the fuzz]
+```
+
+Measured on the example (one machine, macOS arm64, Python 3.10, Node 24.3; the shipped Python and TypeScript code
+fixed so that it has no planted bug):
+
+| Inputs module | `legacy_wallet.py` lines / branches | `legacy_wallet.ts` lines / blocks never run | `mutate --app` caught |
+| --- | --- | --- | --- |
+| the example's own (`diff/wallet_inputs.py`) | 4/4, 2/2 | 3/3, 0 | 19 of 21; both survivors in `app.py` (`sys.path.insert(0, …)` to 1, and a demo line under `__main__`): equivalent |
+| a deliberately weak one (amount 1–100, spent 0–100, cap 10000, no decisions) | 3/4, 1/2: `legacy_wallet.py:2 condition never False` | 2/3, 1: `legacy_wallet.ts:3 block never run` | 8 of 21; every `<=`/`<`/`&&` mutant of the cap comparison survives |
+
+Time cost (medians of 7 runs, 1,500 inputs): `--coverage` takes a Python diff from 156 to 241 ms with the stdlib
+tracer (148 to 342 ms with coverage.py 7.16) and a TypeScript diff from 196 to 281 ms. `mutate --app` costs one
+diff run per mutant: on the example 150–220 ms (Python), 210–430 ms (TypeScript), about 0.4 s (Go), 0.6 s (Rust,
+warm cargo cache) and 1.4 s (Java) per mutant. Labels: both measures are test tooling (not proved); a mutation
+score is a FINITE TEST of the fuzz, not of the code.
+
 ## Bypass: code that goes around a proved rule
 
 A proof is only as strong as the guarantee that nothing goes around it. On a real app, a proved read rule decided that
-`body.for` counts only on Companion's rows, but two other functions still trusted `body.for` on any row. A person
+one field counts only on one kind of row, but two other functions still trusted that field on any row. A person
 found that by hand. `bypass` finds such places.
 
-Add `"watchedFields"` to a check: the texts that name what the rule decides on (field names such as `body.for` or
-`householdId`, a comparison, function names). A text between slashes is a regular expression
+Add `"watchedFields"` to a check: the texts that name what the rule decides on (field names such as `body.owner` or
+`groupId`, a comparison, function names). A text between slashes is a regular expression
 (`"/spent\\s*\\+\\s*amount[^;{]*<=?\\s*cap/"`); anything else is literal. `/forge:bypass` proposes them from the approved
 spec and decision record. Then:
 
@@ -303,7 +342,7 @@ but a line outside the rule matches and is not in its approved `allowedBypasses`
 proof (or any other verdict) still wins. A check without `watchedFields` behaves as before.
 
 **Specific terms.** Because it is a gate, a term must name the forms that decide, not every mention:
-`.body.for` (a property access), `/\\bhouseholdId\\s*(===|!==|==|!=)/` (a comparison), not a bare `householdId`.
+`.body.owner` (a property access), `/\\bgroupId\\s*(===|!==|==|!=)/` (a comparison), not a bare `groupId`.
 `bypass --count --rule NAME --set-terms TERM…` previews the number of lines per term and writes nothing.
 
 | Bypass verdict | Meaning | Exit |
@@ -314,18 +353,39 @@ proof (or any other verdict) still wins. A check without `watchedFields` behaves
 | `UNAPPROVED_BYPASS` (a `check` verdict) | The proof passed, but an unallowed line outside the rule matches | 1 |
 
 `check` runs the same search: the unreviewed places also go under `"outside"` in its JSON and on one line of its
-report (`3 places decide with body.for outside gate-mayread: gate.ts:83 mayRetract, …`).
+report (`3 places decide with body.owner outside policy-view: src/policy.ts:8 canCancel, …`).
 `/forge approve yes` prints the count; bare `/forge` offers `/forge:bypass` for a check without watched fields.
 
-Measured on that app (a copy, 205 files searched, about 0.3 s): the bare terms `body.for` and `householdId` match 290
-lines in 25 files (275 of them for `householdId`): too many for a gate. The specific terms `.body.for`,
-`/\\bhouseholdId\\s*(===|!==|==|!=)/` and `/(===|!==|==|!=)\\s*[\\w.]*\\bhouseholdId\\b/` match 19 lines in 10 files,
-and still name the three places found by hand (`gate.ts:83 mayRetract`, `companion.ts:186 retract`,
-`companion.ts:224 forget`).
+Measured on that app (a copy, 205 files searched, about 0.3 s): the two bare field names match 290 lines in 25
+files (275 of them for the id field): too many for a gate. The specific terms (the property access with its dot, and
+a comparison on the id field from each side, the forms shown above) match 19 lines in 10 files, and still name the
+three places found by hand.
 
-Limits: a text search per line, not a data-flow analysis (a FINITE TEST of the listed terms). It misses aliases
-(`const f = body.for`), dynamic access (`body[key]`), destructuring (`const { for: f } = body`), a term split over
-lines, and code that decides the same question under other names. The function name is a heuristic on indentation.
+**Decision reads only (AST), in TypeScript / JavaScript and Python.** In these files a line counts only where the
+watched field is READ in a decision. Each hit names its kind: `if-condition`, `early-return-guard`, `loop-condition`,
+`comparison` (`===`, `!==`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `instanceof`), `in`, `includes` (also `.has`,
+`.indexOf`, `.startsWith`, ...), `ternary`, `switch`, `case`, `logical-guard` (the left side of `&&` / `||`, not an
+`x || ''` default), `filter-predicate` / `find-predicate` / `predicate` (`filter`, `find`, `some`, `every`; Python
+comprehension `if`, `filter`, `any`, `all`), `assert`, `sql-where` (a parameter of a query whose SQL text has a
+`WHERE`), and `alias` (`const v = row.f` where `v` is read in a decision in the same function). Type and interface
+declarations, type annotations, imports, comments, string literals, plain assignment, object construction and
+logging are not hits. TS / JS files are parsed with the TypeScript compiler API (TypeScript 5.6.3, downloaded once
+into the cache and checked against its pinned SHA-256, as Dafny is; it only parses, it never runs the app); Python
+files with `ast`. Every other file (Go, Rust, Java, C#, data files) keeps the text search per line, labelled
+`text search, not AST`. A TS / JS / Python file that does not parse, or a machine without Node or without the
+TypeScript package (offline, `FORGE_NO_DOWNLOAD=1`), falls back to the text search for that file and the report
+says `FALLBACK to text search, not AST` with the reason: fail closed, never skipped. An approved `allowedBypasses`
+entry stays allowed by its line hash. `bypass --json` lists the text hits that are not decision reads under
+`"not_decisions"`.
+
+Measured on a copy of the same app with the bare terms (290 text lines): 76 hits remain, 46 decision reads found by
+the AST (all 46 checked by hand: each is a decision site) and 30 lines in data files (text search, not AST); the
+three places found by hand are still found. Of the 214 dropped lines, 85 were checked by hand: 81 are not decisions;
+4 feed a decision that the search cannot see (2 checks through a computed key, 2 inputs to a policy engine).
+
+Limits: a syntactic search, not a data-flow analysis (a FINITE TEST of the listed terms). It misses a value passed
+to another function or returned to a caller that decides, dynamic access (`body[key]`), and code that decides the
+same question under other names. The alias rule is name-based. The function name is a heuristic on indentation.
 
 ## INVARIANTS.md: every approved rule in one place
 
@@ -333,18 +393,91 @@ lines, and code that decides the same question under other names. The function n
 one section per rule with the owner's own words, the guarantees in plain words (the spec's numbered clause
 comments), the decisions, what the rule does not guarantee, the code it covers, the languages it is compiled to
 and the shipped code it is fuzzed against, plus the trust base every rule rests on. It is generated only from the
-approved files, so it cannot drift from them. With `invariants: "true"` in the Action, a pull request fails when
+approved files, so it cannot drift from them. The Action checks it by default: a pull request fails when
 the file is out of date, so any change to a rule shows up in review as a readable diff. See
 `examples/wallet-cap/INVARIANTS.md`.
 
+## Signed approvals: only a person with a hardware key can approve (optional)
+
+Without this, an approval is a file. An agent with a shell can write `.forge/approved.json` itself. With signed
+approvals, `check` says `VERIFIED` only for an approval that a listed key signed, and the list of keys is read from
+a place the agent cannot write.
+
+Set up once (the owner, in a terminal; do not let an agent do it):
+
+```
+ssh-keygen -t ed25519-sk -C forge-approval -f ~/.ssh/forge_approval_sk   # FIDO2 key, for example a YubiKey; touch it
+mkdir -p ~/.config/forge
+echo "you@example.com namespaces=\"forge-approval,forge-call-approval\" $(cut -d' ' -f1,2 ~/.ssh/forge_approval_sk.pub)" \
+  | tee .forge/allowed_signers > ~/.config/forge/allowed_signers
+export FORGE_APPROVAL_KEY=~/.ssh/forge_approval_sk FORGE_ALLOWED_SIGNERS=~/.config/forge/allowed_signers
+```
+
+On macOS the system `ssh-keygen` has no FIDO2 support (measured on macOS 27.0.1: "No FIDO SecurityKeyProvider
+specified"). Use Homebrew's OpenSSH (`brew install openssh`; set `FORGE_SSH_KEYGEN=/opt/homebrew/bin/ssh-keygen`
+or put it first in PATH), or try Apple's provider: `SSH_SK_PROVIDER=/usr/lib/ssh-keychain.dylib ssh-keygen -t
+ecdsa-sk ...` (the library exports the security-key API and refers to LocalAuthentication; whether it keeps the key
+in the Secure Enclave behind Touch ID is NOT tested here).
+
+Then in `.forge/forge.json`:
+
+```json
+"require_signed_approval": true,
+"signed_files": ["forge.yaml", "INVARIANTS.md"],
+"signer_key_types": ["sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"]
+```
+
+and approve with `/forge approve yes --hardware` (or `forge_check.py approve --hardware`). The key blinks; touch it.
+
+- **What is signed:** the canonical content of `approved.json` (sorted keys, no spaces, ASCII), with
+  `ssh-keygen -Y sign -n forge-approval`, into `.forge/approved.json.sig`. In signed mode `approved.json` also holds
+  the SHA-256 of `.forge/allowed_signers` and of every `signed_files` entry (byte for byte; `INVARIANTS.md` is
+  generated at approval, then covered).
+- **What is verified:** `check` runs `ssh-keygen -Y find-principals` and `-Y verify` against a **trust anchor that is
+  not the working tree**: `--allowed-signers FILE` or `FORGE_ALLOWED_SIGNERS` (a file outside the project; one inside
+  is refused), else `.forge/allowed_signers` at the `--base` git ref (CI on a pull request: the protected branch).
+  Then every covered file must match its signed hash. Anything else is `APPROVAL_UNSIGNED`, **exit 2**: no anchor,
+  missing or broken `.sig`, a key that is not in the anchor, a key type outside `signer_key_types`, or any covered
+  file changed. The requirement holds if the working `forge.json`, **or the `--base` ref's `forge.json`**, or an
+  anchor on the command line asks for it, so a pull request cannot switch it off.
+- **Keys:** a FIDO2 `sk-ssh-ed25519@openssh.com` key (OpenSSH checks the touch flag in every signature unless the
+  signer line says `no-touch-required`; add `verify-required` to also demand the PIN). On macOS, a Secure Enclave key
+  in an ssh-agent (for example the open-source Secretive app) uses the same path (`ssh-keygen -Y sign -f <its .pub>`
+  with `SSH_AUTH_SOCK` set; NOT tested here). Such a key is an ordinary `ecdsa-sha2-nistp256` key to the verifier:
+  the signature does not show that a person was present, so with `signer_key_types` set to `sk-` types only, it is
+  refused. A PIN prompt needs a terminal: use `forge_check.py approve --hardware` there, not the mod.
+- **CI:** the Action runs `check --base <base>` on pull requests, so the anchor is the base branch. A push run has no
+  base: pass `FORGE_ALLOWED_SIGNERS`, or run `check --base HEAD` on the protected branch. `build` and `mutate` do not
+  check the signature (they run after `check`). To turn signing on in a repository with CI, merge
+  `.forge/allowed_signers` first (one pull request), then the signed approval with `"require_signed_approval": true`
+  (a second one): the second is checked against the keys the first put on the base branch.
+
+Exit gate (`tests/run_signed_approval.py`, also run by `tests/run_tests.py`): a rogue agent with full write access
+to the project (`tests/rogue_agent.py`) rewrites the spec, `forge.yaml`, `INVARIANTS.md`, `approved.json` and the
+`.sig`, deletes or replaces the `.sig`, switches the requirement off, and adds its own key to `allowed_signers`
+and signs with it through the checker's own `approve --hardware`. Every attack gives `APPROVAL_UNSIGNED`, exit 2,
+with the anchor outside the project and with the anchor at `--base`; the owner's signed approval gives `VERIFIED`,
+exit 0. LABEL: FINITE TEST with **software** ed25519 keys made in a temp folder at test time (no hardware in CI, no
+key in the repository); a FIDO2 key goes through the same `ssh-keygen -Y` code path, but its touch is not tested.
+
+Limits (what S1 still trusts): OpenSSH's `ssh-keygen` (NATIVE CHECK, not proved); the anchor (a file outside the
+project that the same OS user can still write, or branch protection on the base branch); the owner's key and how it
+is kept (only `sk-` keys show a touch); the person reading what they sign. With no anchor and the requirement
+switched off in the working tree, nothing is signed (the test measures this too). A signature has no date: an old
+signed approval of old files verifies again (rollback); on a pull request `APPROVAL_CHANGED` still shows it.
+
 ## Use it in CI (GitHub Action)
 
-The same checker runs in CI. Commit `.forge/forge.json` and `.forge/approved.json`, then add:
+The same checker runs in CI with no configuration. Commit `.forge/` (and the emitted code and `INVARIANTS.md`), then
+copy [`examples/workflows/forge.yml`](examples/workflows/forge.yml) to `.github/workflows/forge.yml`:
 
 ```yaml
-# .github/workflows/forge.yml
 name: forge
-on: [pull_request]
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
 permissions:
   contents: read
 jobs:
@@ -352,13 +485,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mack-dot/forge-claude-mod@v0.13.0   # better: pin the commit hash, tags can move
+      - uses: mack-dot/forge-claude-mod@main   # pin the commit hash of the release you reviewed
 ```
 
-The job fails unless every check is `VERIFIED`. On a pull request, any change to `forge.json`,
-`approved.json` or a spec gives `APPROVAL_CHANGED`: a person with the right to approve specs must
-review that change. To make this a lock, require the job in branch protection and protect `.forge/`
-and `.github/` with CODEOWNERS.
+With no inputs, the Action reads `.forge/forge.json`, installs Dafny and only the toolchains the checks use (Node
+for `js` or JS/TS app files, Go for `go`; Java, Rust and .NET come from the runner), and fails the job if any gate fails:
+
+| Gate | Runs | Fails with |
+| --- | --- | --- |
+| `check` | always | the proof (`FAILED`), `NOT_APPROVED`, `SPEC_CHANGED`, `CONFIG_CHANGED`, `BINDING_BROKEN`, `UNSOUND_CONSTRUCT` (included files too), `EXAMPLES_FAILED`, `UNAPPROVED_BYPASS` |
+| approvals against the base | when the event has a base: the pull request's base branch, the merge group's base commit, or the commit before a push | `APPROVAL_CHANGED` |
+| `build --check` | when a check has a `build` entry | `STALE_BUILD`, `APP_SYNTAX_ERROR`, `NOT_CALLED`, a target's fuzz |
+| `invariants --check` | always | `INVARIANTS_STALE` |
+| diff sweep | when a check has `diff` entries: 50,000 inputs per entry, a 600 s budget per entry, seed = the workflow run ID | `DISAGREE`, `THROWS_ON_MESSY_INPUT`, `TOOLCHAIN_MISSING` |
+
+The job summary has one status line per rule in the same scope-honest words as the Claude Code status line
+(`model PROVED · fuzzed 50,000 cases, wrapper NOT proved · 0 bypasses (6 allowed by a person) · build BUILT ·
+INVARIANTS.md current`), a table with each gate's verdicts, the bypass count, the fuzz counts and time, and the
+exact commands (base commit and seed included) that reproduce the run on your machine. A re-run of the same
+workflow run uses the same seed. On an event without a base (for example `workflow_dispatch`), the summary says
+`APPROVAL_CHANGED` was NOT checked.
+
+Inputs, all optional: `root`, `base` (a git ref, or `none` only for repositories whose approvals are test
+fixtures), `build`/`diff` (`auto` or `false`), `invariants` (`true` or `false`), `diff-inputs`,
+`diff-budget-seconds`, `diff-seed`, `dafny-version`, `node-version`, `go-version`. Outputs: `result` (`pass` or
+`fail`) and `report` (a JSON file with every verdict). More in [docs/ci.md](docs/ci.md).
+
+`APPROVAL_CHANGED` means a person with the right to approve specs must review the change. To make this a lock,
+require the job in branch protection and protect `.forge/` and `.github/` with CODEOWNERS.
 
 Without Claude Code, from a shell (Python 3.8+, Dafny on PATH or `FORGE_DAFNY`):
 
@@ -376,10 +530,10 @@ python3 cli/forge_check.py mutate    # plant small bugs, count how many the proo
 
 The wrapper that turns your app's values (often JSON) into the proved code's values is not proved. Runtime JSON
 does not follow your types: a field can be `undefined`, `null`, a number where text was expected, or missing. On a
-real app, `householdId: undefined` reached such a wrapper and it threw instead of answering "forbid". The plain
+real app, an id field set to `undefined` reached such a wrapper and it threw instead of answering "forbid". The plain
 fuzz never sent that value, so it did not see it.
 
-If the JavaScript/TypeScript or Python adapter exports a raw-value wrapper, the fuzz also sends **messy variants**
+If the adapter (any of the six languages) exports a raw-value wrapper, the fuzz also sends **messy variants**
 of its inputs to it: each field (nested objects and lists too, bounded) is in turn made `undefined` (JavaScript
 only), `null`, a number, a boolean, `""`, a lone surrogate, a 20,000-character text, `[]`, `{}`, the number as
 text (`"5"` for `5`), or removed. Big integers in the other fields stay exact.
@@ -389,16 +543,24 @@ text (`"5"` for `5`), or removed. Big integers in the other fields stay exact.
 export const wrapper = (i) => myRealWrapper(i)        // the app's REAL wrapper, raw values, no conversion here
 // or: export const wrappers = { name: fn, ... }
 export function failClosed(i) {                        // the spec's fail-closed answer for a value the
-  return typeof i.householdId === 'string' ? undefined // proved rule does not take; undefined: the rule
-    : { effect: 'forbid', rule: 'other_household' }    // takes it, so the proved rule's answer is expected
+  return typeof i.groupId === 'string' ? undefined     // proved rule does not take; undefined: the rule
+    : { effect: 'forbid', rule: 'other_group' }        // takes it, so the proved rule's answer is expected
 }
 ```
+
+The compiled languages take the raw JSON in their own types: Go `json.RawMessage` (`var wrappers =
+map[string]func(json.RawMessage) any{…}`, `func failClosed(raw json.RawMessage) any`, nil: the rule takes it),
+Rust `serde_json::Value` (`pub fn wrappers()`, `pub fn fail_closed(raw: &Value) -> Option<Value>`), Java the
+evaluator's parsed value (Map / List / String / Boolean / BigInteger / BigDecimal / null; `wrappers()`,
+`failClosed(Object)`), C# `JsonElement` (`Wrappers()`, `FailClosed(JsonElement)`). `undefined` is sent only to
+JavaScript. Rust does not get the lone surrogate: serde_json rejects it while it parses, before any wrapper could run
+(listed under `skipped_kinds`). A panic (Go, Rust) or an exception (Java, C#) is `THROWS_ON_MESSY_INPUT`.
 
 Rules: a throw from the wrapper on any messy input is always a disagreement of kind `THROWS_ON_MESSY_INPUT`.
 Otherwise its answer must equal `failClosed(input)`, or the proved rule's answer where `failClosed` returns
 `undefined`. Messy disagreements are grouped, shrunk (the messy field and its kind stay; the rest of the input
 shrinks) and saved like the others. `"messy": false` on a diff entry turns them off; an inputs module can list
-fields to leave alone in `messy_skip = ['retracted', 'limits[].setBy']`. A messy input that has no fail-closed
+fields to leave alone in `messy_skip = ['archived', 'limits[].label']`. A messy input that has no fail-closed
 answer and that the proved rule cannot take is counted as "not judged" (only a throw is reported for it).
 
 ```
@@ -406,13 +568,16 @@ answer and that the proved rule cannot take is counted as "not judged" (only a t
     messy field amount = undefined: THROWS_ON_MESSY_INPUT (TypeError): the wrapper crashed instead of failing closed
 ```
 
-The example has three planted wrappers (`examples/wallet-cap/messy_wrappers.ts` and `.py`, adapters
-`diff/wallet_messy.*`): one that throws on `amount` undefined/null, one that turns `"5"` into `5`, and a correct one
-that fails closed (the negative control). They are not in the example's `forge.json`; the tests add them.
+The example has three planted wrappers per language (`examples/wallet-cap/messy_wrappers.ts`, `.py`, `.rs`,
+`messygo/`, `messyjava/`, `messycs/`; adapters `diff/wallet_messy.*`): one that throws or panics on a null, missing or
+wrong-typed `amount`, one that turns `"5"` into `5`, and a correct one that fails closed (the negative control). They
+are not in the example's `forge.json`; the tests add them (C# in `tests/run_cs_diff.py`, in CI).
 
 Time, measured on the example (one machine, warm, 1,500 inputs, median of 3 runs): the three wrappers with messy
 off 324 ms (JS) and 216 ms (Python); with messy on (about 1,530 messy inputs, including shrinking the planted bugs)
-1,192 ms and 1,236 ms. An entry without a wrapper does not change. With the default time budget (1.5 s per entry)
+1,192 ms and 1,236 ms before M1.1b. After M1.1b (the messy step no longer writes the 20,000-character text once per
+field and kind; same inputs for a seed), messy on, entry time: JS 473 ms, Python 393 ms, Go 429 ms, Rust 467 ms,
+Java 519 ms; the whole `diff` command 0.49–0.62 s. An entry without a wrapper does not change. With the default time budget (1.5 s per entry)
 messy inputs share the budget, so fewer plain inputs run (584 instead of 1,500 for JS in one measured run).
 
 Labels: the messy values are a fixed list, not every possible value; the fail-closed answer is the adapter's (the
@@ -423,7 +588,8 @@ See `PLAN.md` for what is built and what is not.
 ## Limits
 
 - Without the airlock this is a feedback loop, not a security boundary. The mod blocks Claude's Edit and Write tools on
-  approved specs and on `.forge/approved.json`, but a shell command can still change them.
+  approved specs and on `.forge/approved.json`, but a shell command can still change them. Signed approvals (above) make
+  such a change fail `check` with `APPROVAL_UNSIGNED`, if the trust anchor is outside the project.
 - A spec covers only what it says. Files without a spec are not checked.
 - Dafny runs can take seconds to minutes.
 

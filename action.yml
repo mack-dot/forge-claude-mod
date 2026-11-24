@@ -1,59 +1,101 @@
 name: "Forge check"
-description: "Prove the checks in .forge/forge.json with Dafny and fail the job unless every check is VERIFIED"
+description: "Prove the checks in .forge/forge.json with Dafny, gate approvals, bypasses, builds, INVARIANTS.md and a differential fuzz sweep; fail the job on any finding"
 branding:
   icon: check-circle
   color: green
+# With no inputs, every gate that the project's .forge/forge.json makes possible runs. See docs/ci.md.
 inputs:
   root:
     description: "Project folder that holds .forge/forge.json"
     required: false
     default: "."
   base:
-    description: "Git ref to compare with. Any change to forge.json, approved.json or a spec against it gives APPROVAL_CHANGED. Default: the pull request's base branch; empty on other events. \"none\" turns the comparison off (only for repositories whose approvals are test fixtures)."
+    description: "Git ref to compare with for APPROVAL_CHANGED. Empty (default): taken from the event (pull_request: the base branch; merge_group: the base commit; push: the commit before the push; other events: not compared, and the job summary says so). \"none\" turns the comparison off (only for repositories whose approvals are test fixtures)."
     required: false
     default: ""
   build:
-    description: "Also run `build --check`: fuzz the compiled code in every target and require the committed emitted code to equal a fresh build. The job must have each target's toolchain."
+    description: "\"auto\" (default): run `build --check` when any check has a build entry (STALE_BUILD, APP_SYNTAX_ERROR, serviceTest NOT_CALLED). \"false\": skip it."
     required: false
-    default: "false"
+    default: "auto"
   invariants:
-    description: "Also require INVARIANTS.md (every approved rule in plain words) to equal a fresh generation"
+    description: "\"true\" (default): INVARIANTS.md must equal a fresh generation (INVARIANTS_STALE otherwise). \"false\": skip it."
     required: false
-    default: "false"
+    default: "true"
+  diff:
+    description: "\"auto\" (default): run the differential fuzz sweep when any check has diff entries. \"false\": skip it."
+    required: false
+    default: "auto"
+  diff-inputs:
+    description: "Random inputs per diff entry in the CI sweep"
+    required: false
+    default: "50000"
+  diff-budget-seconds:
+    description: "Time budget per diff entry, in seconds. The sweep stops at the input count or the budget, whichever comes first; the summary says when the budget cut it short."
+    required: false
+    default: "600"
+  diff-seed:
+    description: "Seed for the sweep. Empty (default): the workflow run ID, so a re-run uses the same inputs. Printed in the summary."
+    required: false
+    default: ""
   dafny-version:
     description: "Dafny version to install"
     required: false
     default: "4.11.0"
+  node-version:
+    description: "Node version, installed only when a check uses JavaScript or TypeScript"
+    required: false
+    default: "24"
+  go-version:
+    description: "Go version, installed only when a check uses Go"
+    required: false
+    default: "1.22"
+outputs:
+  result:
+    description: "pass or fail"
+    value: ${{ steps.forge.outputs.result }}
+  report:
+    description: "Path of the JSON report (verdicts per gate)"
+    value: ${{ steps.forge.outputs.report }}
 runs:
   using: "composite"
   steps:
+    - name: forge plan (which toolchains the checks use)
+      id: plan
+      shell: bash
+      env:
+        FORGE_ROOT: ${{ inputs.root }}
+      run: python3 "$GITHUB_ACTION_PATH/cli/forge_ci.py" plan --root "$FORGE_ROOT"
     - uses: dafny-lang/setup-dafny-action@be023fc606339d46ed6b077dcb8614d0279ded31 # v1.9.1
       with:
         dafny-version: ${{ inputs.dafny-version }}
-    - name: forge check
+    # After the Dafny setup, which installs an old Node for itself.
+    - if: steps.plan.outputs.node == 'true'
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      with:
+        node-version: ${{ inputs.node-version }}
+    - if: steps.plan.outputs.go == 'true'
+      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      with:
+        go-version: ${{ inputs.go-version }}
+        cache: false
+    - if: steps.plan.outputs.go == 'true'
+      shell: bash
+      run: go install golang.org/x/tools/cmd/goimports@v0.24.0 && echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+    - name: forge (check, bypass, build --check, invariants --check, diff sweep)
+      id: forge
       shell: bash
       env:
         FORGE_ROOT: ${{ inputs.root }}
         FORGE_BASE: ${{ inputs.base }}
         FORGE_BUILD: ${{ inputs.build }}
         FORGE_INVARIANTS: ${{ inputs.invariants }}
-        PR_BASE: ${{ github.base_ref }}
+        FORGE_DIFF: ${{ inputs.diff }}
+        FORGE_DIFF_INPUTS: ${{ inputs.diff-inputs }}
+        FORGE_DIFF_BUDGET: ${{ inputs.diff-budget-seconds }}
+        FORGE_DIFF_SEED: ${{ inputs.diff-seed }}
       run: |
-        base="$FORGE_BASE"
-        if [ "$base" = "none" ]; then
-          base=""
-        elif [ -z "$base" ] && [ -n "$PR_BASE" ]; then
-          git fetch --no-tags --depth=1 origin "$PR_BASE"
-          base="origin/$PR_BASE"
-        fi
-        if [ -n "$base" ]; then
-          python3 "$GITHUB_ACTION_PATH/cli/forge_check.py" check --root "$FORGE_ROOT" --no-write --base "$base"
-        else
-          python3 "$GITHUB_ACTION_PATH/cli/forge_check.py" check --root "$FORGE_ROOT" --no-write
-        fi
-        if [ "$FORGE_BUILD" = "true" ]; then
-          python3 "$GITHUB_ACTION_PATH/cli/forge_check.py" build --check --root "$FORGE_ROOT" --no-write
-        fi
-        if [ "$FORGE_INVARIANTS" = "true" ]; then
-          python3 "$GITHUB_ACTION_PATH/cli/forge_check.py" invariants --check --root "$FORGE_ROOT"
-        fi
+        build="$FORGE_BUILD"; [ "$build" = "true" ] && build=auto
+        diff="$FORGE_DIFF"; [ "$diff" = "true" ] && diff=auto
+        python3 "$GITHUB_ACTION_PATH/cli/forge_ci.py" run --root "$FORGE_ROOT" --base "$FORGE_BASE" \
+          --build "$build" --invariants "$FORGE_INVARIANTS" --diff "$diff" \
+          --inputs "$FORGE_DIFF_INPUTS" --budget-s "$FORGE_DIFF_BUDGET" --seed "$FORGE_DIFF_SEED"

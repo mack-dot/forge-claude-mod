@@ -3,7 +3,7 @@
 # Both networks are internal (no route out). The agent sees only the airlock.
 x-image: &img
   build: {context: .., target: airlock}
-  image: forge-airlock-proof:local
+  image: forge-airlock-proof:${FORGEAIR_RUN:-local}
   logging: &logging   # F2: bounded container logs
     driver: json-file
     options: {max-size: "10m", max-file: "3"}

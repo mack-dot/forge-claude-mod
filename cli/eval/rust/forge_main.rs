@@ -7,7 +7,14 @@
 // Helpers here: forge::int(v) parses an exact integer into a Dafny integer; forge::i64(v) and forge::u64(v) for
 // code that takes machine integers (they panic when the value does not fit, as a real caller would fail);
 // forge::out(&dafny_int) writes a Dafny integer with all its digits. A panic is reported as
-// {"__throws__": "panic: <message>"}. Test code: NOT proved.
+// {"__throws__": "panic: <message>"}.
+//
+// Messy inputs (the unproved wrapper that turns raw JSON into Dafny values): the adapter may also define
+//   pub fn wrappers() -> Vec<(&'static str, fn(&Value) -> Value)>   (or pub fn wrapper(raw: &Value) -> Value)
+//   pub fn fail_closed(raw: &Value) -> Option<Value>  // the spec's fail-closed answer; None when the proved rule takes it
+// Each wrapper gets the RAW serde_json::Value and calls the app's real wrapper with it. serde_json rejects a lone
+// surrogate (\ud800) while it parses, before any wrapper runs, so that messy kind is not sent here ("skip").
+// Test code: NOT proved.
 #![allow(warnings)]
 #[path = "proved.rs"]
 pub mod proved;
@@ -42,8 +49,20 @@ pub mod forge {
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
+// Forge points these at the adapter's names when it defines them (eval_build.rust_messy_bindings).
+fn messy_wrappers() -> Vec<(&'static str, fn(&Value) -> Value)> {
+    /*FORGE_WRAPPERS*/Vec::new()
+}
+fn messy_fail_closed(v: &Value) -> Option<Value> {
+    /*FORGE_FAIL_CLOSED*/None
+}
+
 fn call(f: fn(&Value) -> Value, input: &Value) -> Value {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(input))) {
+    call_any(|| f(input))
+}
+
+fn call_any(f: impl FnOnce() -> Value) -> Value {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(v) => v,
         Err(e) => {
             let msg = e
@@ -60,19 +79,44 @@ fn main() {
     std::panic::set_hook(Box::new(|_| {})); // panics are reported in the protocol, not printed
     let mut cands = adapter::candidates();
     cands.sort_by(|a, b| a.0.cmp(b.0));
+    let mut wraps = messy_wrappers();
+    wraps.sort_by(|a, b| a.0.cmp(b.0));
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    writeln!(out, "{}", json!({ "candidates": cands.iter().map(|c| c.0).collect::<Vec<_>>() })).unwrap();
+    let mut all: Vec<&str> = cands.iter().map(|c| c.0).collect();
+    all.extend(wraps.iter().map(|c| c.0));
+    let wnames: Vec<&str> = wraps.iter().map(|c| c.0).collect();
+    writeln!(out, "{}", json!({ "candidates": all, "messy": wnames, "skip": ["lone-surrogate"] })).unwrap();
     out.flush().unwrap();
     for line in std::io::stdin().lock().lines() {
         let line = line.unwrap();
         if line.trim().is_empty() {
             continue;
         }
-        let msg: Value = serde_json::from_str(&line).expect("protocol line");
+        let msg: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                // Not judged: no Rust value can hold this input (the core counts it as not judged).
+                writeln!(out, "{}", json!({ "reference": { "__throws__": format!("serde_json: {}", e) }, "candidates": {} })).unwrap();
+                out.flush().unwrap();
+                continue;
+            }
+        };
         let input = &msg["input"];
         let mut answers = serde_json::Map::new();
-        for (name, f) in &cands {
+        if msg["messy"] == Value::Bool(true) {
+            let mut reference = call_any(|| messy_fail_closed(input).unwrap_or(Value::Null));
+            if reference.is_null() {
+                reference = call(adapter::reference, input);
+            }
+            for (name, f) in &wraps {
+                answers.insert(name.to_string(), call(*f, input));
+            }
+            writeln!(out, "{}", json!({ "reference": reference, "candidates": answers })).unwrap();
+            out.flush().unwrap();
+            continue;
+        }
+        for (name, f) in cands.iter().chain(wraps.iter()) {
             answers.insert(name.to_string(), call(*f, input));
         }
         writeln!(out, "{}", json!({ "reference": call(adapter::reference, input), "candidates": answers })).unwrap();

@@ -2,14 +2,15 @@
 """forge check: the one checker used by the Claude Code mod and by CI.
 
 Usage:
-  forge_check.py check   [--root DIR] [--json] [--base GIT_REF]
-  forge_check.py approve [--root DIR]            (interactive; a person's act)
-  forge_check.py approve [--root DIR] --hashes JSON  (approves exactly what `spec --json` showed)
+  forge_check.py check   [--root DIR] [--json] [--base GIT_REF] [--allowed-signers FILE]
+  forge_check.py approve [--root DIR] [--hardware [--key KEY]]   (interactive; a person's act)
+  forge_check.py approve [--root DIR] --hashes JSON [--hardware [--key KEY]]  (approves exactly what `spec --json` showed)
   forge_check.py spec    [--root DIR] [--json]
   forge_check.py build   [--root DIR] [--json] [--check]
   forge_check.py setup   [--root DIR] [--json]     (find Dafny, or download the pinned release)
   forge_check.py mutate  [--root DIR] [--json] [--max N]
-  forge_check.py diff    [--root DIR] [--json] [--inputs N] [--budget-ms MS] [--seed S]
+  forge_check.py mutate  --app [--root DIR] [--json] [--max N] [--inputs N] [--seed S] [--langs py,js,...]
+  forge_check.py diff    [--root DIR] [--json] [--inputs N] [--budget-ms MS] [--seed S] [--coverage]
   forge_check.py invariants [--root DIR] [--check]   (INVARIANTS.md: every approved rule in plain words)
   forge_check.py bypass  [--root DIR] [--json]       (code outside the rule that reads its "watchedFields")
   forge_check.py bypass  --rule NAME --set-terms TERM...  |  --rule NAME --record FILE:LINE --note TEXT
@@ -26,6 +27,9 @@ language. It reads only hashes to see whether the compiled code matches the Dafn
 proof on each. A mutant is "caught" when the check is no longer VERIFIED. A mutant that survives means the
 spec does not forbid that change: either the change is harmless (an equivalent mutant) or the spec is too
 weak there. Read each survivor. Nothing in the project is changed.
+`mutate --app` plants the same kind of bugs in the SHIPPED code (the diff entries' "watch" files, in a temporary
+copy) and runs the diff on each: it measures the fuzz, not the proof (see forge_mutate_app.py).
+`diff --coverage` also reports which lines and branches of the watched files the run reached (forge_coverage.py).
 
 `build` first runs `check`. For each check with a "build" entry it then:
   1. verifies the fuzz harness with Dafny, compiles it to every listed target, runs it,
@@ -36,7 +40,16 @@ With --check nothing is written: the emitted code on disk must equal a fresh bui
 Targets: py, js, go, java, cs, rs. Exit 0 only if every check is VERIFIED and BUILT.
 
 Exit codes of `check`: 0 every check VERIFIED; 1 at least one check is not
-VERIFIED; 2 usage or configuration error.
+VERIFIED; 2 usage or configuration error, or APPROVAL_UNSIGNED (signed approvals are
+required and the approval is not signed by a trusted key; see "Signed approvals" below).
+
+Signed approvals (optional): with "require_signed_approval": true in forge.json, `approve --hardware [--key KEY]`
+signs the canonical content of approved.json with `ssh-keygen -Y sign -n forge-approval` (a FIDO2 key such as a
+YubiKey: touch it; or a Secure Enclave key in an ssh-agent) into approved.json.sig. approved.json then also covers
+.forge/allowed_signers and every file in "signed_files" (for example forge.yaml and INVARIANTS.md), byte for byte.
+`check` verifies the signature against a trust anchor that does NOT come from the working tree: --allowed-signers
+FILE or FORGE_ALLOWED_SIGNERS (a file outside the project), else .forge/allowed_signers at the --base git ref.
+A missing, broken or unknown-signer signature, or any covered file that differs, is APPROVAL_UNSIGNED (exit 2).
 
 Files in the project:
   .forge/forge.json      which code is checked against which spec
@@ -70,6 +83,8 @@ import zipfile
 DIR = '.forge'
 CONFIG = DIR + '/forge.json'
 APPROVED = DIR + '/approved.json'
+SIG = APPROVED + '.sig'
+SIGNERS = DIR + '/allowed_signers'
 LAST = DIR + '/last-check.json'
 LAST_DIFF = DIR + '/last-diff.json'
 DIFF_STATS = DIR + '/diff-stats.json'
@@ -164,6 +179,18 @@ def load_config(root):
     checks = cfg.get('checks')
     if not isinstance(checks, list) or not checks:
         raise ConfigError('%s has no checks' % CONFIG)
+    if not isinstance(cfg.get('require_signed_approval', False), bool):
+        raise ConfigError('"require_signed_approval" in %s must be true or false' % CONFIG)
+    sf = cfg.get('signed_files', [])
+    if not isinstance(sf, list) or not all(isinstance(x, str) and x for x in sf):
+        raise ConfigError('"signed_files" in %s must be a list of paths' % CONFIG)
+    for rel in sf:
+        inside(root, rel)
+        if os.path.normpath(rel) in (os.path.normpath(APPROVED), os.path.normpath(SIG), os.path.normpath(CONFIG)):
+            raise ConfigError('"signed_files" may not list %s (it is covered already or is the signature)' % rel)
+    kt = cfg.get('signer_key_types')
+    if kt is not None and (not isinstance(kt, list) or not kt or not all(isinstance(x, str) for x in kt)):
+        raise ConfigError('"signer_key_types" in %s must be a non-empty list of SSH key types' % CONFIG)
     names = set()
     for c in checks:
         for key in ('name', 'spec', 'files'):
@@ -363,7 +390,8 @@ def changed_since(root, base, paths):
     out = []
     for rel in paths:
         if rel.endswith('.md') and os.path.isfile(inside(root, rel)):
-            old = subprocess.run(['git', '-C', root, 'show', '%s:%s' % (base, rel)], stdout=subprocess.PIPE,
+            # './': the path is relative to root (git -C), not to the top of the repository.
+            old = subprocess.run(['git', '-C', root, 'show', '%s:./%s' % (base, rel)], stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, universal_newlines=True)
             if old.returncode == 0:
                 if normative_text(old.stdout) != normative_text(read_text(inside(root, rel))):
@@ -378,16 +406,170 @@ def changed_since(root, base, paths):
     return out
 
 
-def run_checks(root, base=None):
+# ---------------------------------------------------------------------------- signed approvals
+# The signature makes an approval something only the holder of a listed key can make. The list of keys (the trust
+# anchor) must come from OUTSIDE the working tree: an agent that can write the project can also write
+# .forge/allowed_signers, so that copy is only part of what is signed, never what the signature is checked against.
+def _forge_sign():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import forge_sign
+    return forge_sign
+
+
+def signed_extras(cfg):
+    """Files a signed approval covers besides forge.json and the contract files, in a fixed order."""
+    out = [SIGNERS]
+    for rel in cfg.get('signed_files', []):
+        rel = os.path.normpath(rel)
+        if rel not in out:
+            out.append(rel)
+    return out
+
+
+def _git_show(root, ref, rel):
+    r = subprocess.run(['git', '-C', root, 'show', '%s:%s' % (ref, rel)], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+    return r.stdout.decode('utf-8', 'replace') if r.returncode == 0 else None
+
+
+def _outside_file(root, path, what):
+    path = os.path.realpath(os.path.expanduser(path))
+    rr = os.path.realpath(root)
+    if os.path.commonpath([path, rr]) == rr:
+        raise ConfigError('%s %s is inside the project: an agent that writes the project could change it. Keep the '
+                          'trusted list outside (for example ~/.config/forge/allowed_signers).' % (what, path))
+    if not os.path.isfile(path):
+        raise ConfigError('%s %s does not exist' % (what, path))
+    return read_text(path)
+
+
+def signing_required(root, cfg, base, signers_arg):
+    """Required if the working forge.json says so, or the --base ref's forge.json says so (a pull request cannot
+    switch it off), or a trust anchor is given on the command line or in FORGE_ALLOWED_SIGNERS."""
+    if cfg.get('require_signed_approval') or signers_arg or os.environ.get('FORGE_ALLOWED_SIGNERS'):
+        return True
+    if base:
+        old = _git_show(root, base, CONFIG)
+        try:
+            return bool(old and json.loads(old).get('require_signed_approval'))
+        except ValueError:
+            return False
+    return False
+
+
+def trust_anchor(root, base, signers_arg):
+    """(text of the allowed-signers list, where it came from), or (None, why)."""
+    if signers_arg:
+        return _outside_file(root, signers_arg, '--allowed-signers'), '--allowed-signers ' + os.path.basename(signers_arg)
+    env = os.environ.get('FORGE_ALLOWED_SIGNERS')
+    if env:
+        return _outside_file(root, env, 'FORGE_ALLOWED_SIGNERS'), 'FORGE_ALLOWED_SIGNERS'
+    if base:
+        text = _git_show(root, base, SIGNERS)
+        if text is None:
+            return None, '%s does not exist at the git ref %s' % (SIGNERS, base)
+        return text, '%s at %s' % (SIGNERS, base)
+    return None, ('no trusted list of signing keys outside the working tree: pass --allowed-signers FILE, set '
+                  'FORGE_ALLOWED_SIGNERS, or run with --base GIT_REF (CI)')
+
+
+def covered_files(cfg, root=None):
+    keys = [CONFIG] + sorted({f for c in cfg['checks'] for f in contract_files(c, root)})
+    return keys + [r for r in signed_extras(cfg) if r not in keys]
+
+
+def signature_problem(root, cfg, base, signers_arg):
+    """None if approved.json is signed by a trusted key and covers every protected file as it is now; else why."""
+    forge_sign = _forge_sign()
+    anchor, source = trust_anchor(root, base, signers_arg)
+    if anchor is None:
+        return source
+    apath, spath = os.path.join(root, APPROVED), os.path.join(root, SIG)
+    if not os.path.isfile(apath):
+        return '%s is missing' % APPROVED
+    if not os.path.isfile(spath):
+        return '%s is missing: approve with a hardware key (approve --hardware)' % SIG
+    approved = read_json(apath, {})
+    if not isinstance(approved, dict):
+        return '%s is not an object' % APPROVED
+    ok, why = forge_sign.verify(anchor, forge_sign.canonical(approved), read_text(spath), forge_sign.APPROVAL_NAMESPACE)
+    if not ok:
+        return '%s does not verify against %s: %s' % (SIG, source, why)
+    ktype = forge_sign.key_type_of(read_text(spath))
+    allowed = cfg.get('signer_key_types')
+    if allowed and ktype not in allowed:
+        return 'the approval is signed with a %s key; forge.json allows only %s' % (ktype, ', '.join(allowed))
+    bad = []
+    for rel in covered_files(cfg, root):
+        p = inside(root, rel)
+        if not os.path.isfile(p):
+            bad.append(rel + ' (missing)')
+        elif rel not in approved:
+            bad.append(rel + ' (not in the signed approval)')
+        elif not (approved[rel] == sha256(p) or (rel != CONFIG and rel not in signed_extras(cfg)
+                                                 and approved_matches(approved, rel, p))):
+            bad.append(rel + ' (changed after the signed approval)')
+    if bad:
+        return 'not covered by the signed approval: ' + ', '.join(bad)
+    return None
+
+
+def sign_approval(root, key):
+    """Writes approved.json.sig: a signature of the canonical approved.json content."""
+    forge_sign = _forge_sign()
+    approved = read_json(os.path.join(root, APPROVED), {})
+    sig = forge_sign.sign(key or os.environ.get('FORGE_APPROVAL_KEY'), forge_sign.canonical(approved),
+                          forge_sign.APPROVAL_NAMESPACE)
+    with open(os.path.join(root, SIG), 'w', encoding='ascii') as f:
+        f.write(sig)
+    return forge_sign.key_type_of(sig)
+
+
+def finish_approval(root, hashes, hardware, key):
+    """Writes approved.json for these hashes; in signed mode also the generated INVARIANTS.md (if it is a signed
+    file) and the signature. Returns lines to print."""
+    cfg = load_config(root)
+    write_json(root, APPROVED, hashes)
+    record_described(root)
+    lines = []
+    if cfg.get('require_signed_approval'):
+        inv = os.path.relpath(invariants_path(root, cfg), root)
+        if inv in signed_extras(cfg):
+            with open(invariants_path(root, cfg), 'w', encoding='utf-8') as f:
+                f.write(invariants_text(root))
+            hashes = dict(hashes)
+            hashes[inv] = sha256(invariants_path(root, cfg))
+            write_json(root, APPROVED, hashes)
+            lines.append('wrote %s and covered it (sha256 %s…)' % (inv, hashes[inv][:12]))
+    if hardware:
+        try:
+            ktype = sign_approval(root, key)
+        except _forge_sign().SignError as e:
+            if os.path.exists(os.path.join(root, SIG)):
+                os.remove(os.path.join(root, SIG))
+            raise ConfigError('%s was written but NOT signed: %s' % (APPROVED, e)) from None
+        lines.append('signed %s with a %s key: %s' % (APPROVED, ktype, SIG))
+    elif cfg.get('require_signed_approval'):
+        if os.path.exists(os.path.join(root, SIG)):
+            os.remove(os.path.join(root, SIG))
+        lines.append('NOT signed: check gives APPROVAL_UNSIGNED until you approve with --hardware.')
+    return lines
+
+
+def run_checks(root, base=None, signers_arg=None, signed=True):
     cfg = load_config(root)
     approved = read_json(os.path.join(root, APPROVED), {}) or {}
     dafny = find_dafny(root, cfg)
     verdicts, detail = {}, {}
+    unsigned = signature_problem(root, cfg, base, signers_arg) \
+        if signed and signing_required(root, cfg, base, signers_arg) else None
 
     config_ok = approved.get(CONFIG) == sha256(os.path.join(root, CONFIG))
     approval_changed = []
     if base:
         protected = [CONFIG, APPROVED] + sorted({f for c in cfg['checks'] for f in contract_files(c, root)})
+        if signed and signing_required(root, cfg, base, signers_arg):
+            protected += [SIG] + [r for r in signed_extras(cfg) if r not in protected]
         approval_changed = changed_since(root, base, protected)
         if approval_changed is None:
             raise ConfigError('cannot compare with git ref %s (fetch it first)' % base)
@@ -399,6 +581,10 @@ def run_checks(root, base=None):
             verdicts[name] = verdict
             detail[name] = text
 
+        if unsigned:
+            put('APPROVAL_UNSIGNED', unsigned + '. Only a person with a trusted key can approve: '
+                'forge_check.py approve --hardware.')
+            continue
         if approval_changed:
             put('APPROVAL_CHANGED', 'changed against %s: %s. A person with the right to approve '
                 'specs must review this change.' % (base, ', '.join(approval_changed)))
@@ -866,7 +1052,7 @@ def service_test(root, c, res, fail):
 
 
 def run_build(root, check_only):
-    result = run_checks(root)
+    result = run_checks(root, signed=False)  # the signature is the job of `check` (it runs first in CI)
     result['build'] = {}
     if any(v != 'VERIFIED' for v in result['verdicts'].values()):
         return result
@@ -946,7 +1132,7 @@ def mutation_sites(text, skip_until):
 
 
 def run_mutate(root, limit):
-    base = run_checks(root)
+    base = run_checks(root, signed=False)
     if any(v != 'VERIFIED' for v in base['verdicts'].values()):
         raise ConfigError('every check must be VERIFIED before mutation testing: ' + json.dumps(base['verdicts']))
     cfg = load_config(root)
@@ -970,7 +1156,7 @@ def run_mutate(root, limit):
             shutil.copytree(root, copy, ignore=shutil.ignore_patterns('.git', 'node_modules', 'verified'))
             with open(os.path.join(copy, f), 'w', encoding='utf-8') as fh:
                 fh.write(mutated)
-            verdict = run_checks(copy)['verdicts'].get(name, 'ERROR')
+            verdict = run_checks(copy, signed=False)['verdicts'].get(name, 'ERROR')
         status = 'survived' if verdict == 'VERIFIED' else 'caught'
         out[status] += 1
         out['mutants'].append({'check': name, 'file': f, 'line': line, 'mutation': mname,
@@ -1003,8 +1189,9 @@ def build_is_fresh(root, c):
     return sorted(sources) == sorted(want) and all(sources[f] == sha256(inside(root, f)) for f in want)
 
 
-def run_diff(root, inputs=None, budget_ms=None, seed=None):
-    """Runs every diff entry through the language-neutral core (forge_diff.py)."""
+def run_diff(root, inputs=None, budget_ms=None, seed=None, coverage=False, only=None):
+    """Runs every diff entry through the language-neutral core (forge_diff.py). coverage: also measure which lines
+    and branches of the watched files the run reached (forge_coverage.py). only: run just these diff keys."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import forge_diff
     cfg = load_config(root)
@@ -1016,6 +1203,8 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None):
         for df in entries:
             jobs.append((c, df, c['name'] if len(entries) == 1 else '%s:%s' % (c['name'], df.get('name') or df['lang'])))
     for c, df, key in jobs:
+        if only is not None and key not in only:
+            continue
         res = out['checks'][key] = {}
         if not c.get('build'):
             res['verdict'] = 'NO_BUILD'
@@ -1069,10 +1258,17 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None):
                 continue
         else:
             cmd = list(df['run'])
+        cov = None
+        if coverage:
+            import forge_coverage
+            cov = forge_coverage.Session(df['lang'], root, df.get('watch'))
+            cmd, env = cov.wrap(cmd, env)
         data = forge_diff.run_entry(cmd, root, env, inside(root, df['inputs']), s, n, ms,
                                     os.path.join(root, REGRESSIONS, key.replace(':', '-')),
                                     messy=df.get('messy', True) is not False)
         res.update(data)
+        if cov:
+            res['coverage'] = cov.collect()
         if data.get('error') and 'Unknown file extension ".ts"' in data['error']:
             res['verdict'] = 'TOOLCHAIN_MISSING'
             res['detail'] = ('this Node cannot import TypeScript directly (%s); it needs Node 22.18 or newer'
@@ -1122,7 +1318,9 @@ def messy_line(d):
 
 def messy_summary(m):
     return ('  messy inputs: %d sent to %s (%d field/kind pairs tried; %d not judged: no fail-closed answer and the '
-            'proved rule cannot take them)' % (m['inputs'], ', '.join(m['candidates']), m['pairs_tried'], m['not_judged']))
+            'proved rule cannot take them)%s' % (m['inputs'], ', '.join(m['candidates']), m['pairs_tried'], m['not_judged'],
+                                                 '; not sent (this language cannot carry them): ' + ', '.join(m['skipped_kinds'])
+                                                 if m.get('skipped_kinds') else ''))
 
 
 def diff_report(out):
@@ -1177,6 +1375,9 @@ def diff_report(out):
                          'what you meant. Saved cases under %s/%s/ run first next time.' % (REGRESSIONS, name.replace(':', '-')))
         else:
             lines.append('✗ %s: %s: %s' % (name, v, (r.get('detail') or r.get('error') or '')[:600]))
+        if r.get('coverage'):
+            import forge_coverage
+            lines.extend(forge_coverage.report_lines(r['coverage']))
     return '\n'.join(lines)
 
 
@@ -1382,6 +1583,20 @@ def show_specs(root, full=False):
             kind = contract_kind(c, rel)
             parts.append('=== %s %s: %s (%s, sha256 %s…) ===\n%s'
                          % (c['name'], kind, rel, state(rel), hashes[rel][:12], body))
+    if cfg.get('require_signed_approval'):
+        inv = os.path.relpath(invariants_path(root, cfg), root)
+        for rel in signed_extras(cfg):
+            if rel == inv:
+                continue  # generated at approval from the files above, then covered (see approve)
+            p = inside(root, rel)
+            if not os.path.isfile(p):
+                raise ConfigError('%s is missing: signed approvals need it (%s)' % (rel, 'the keys that may sign'
+                                  if rel == SIGNERS else '"signed_files" in forge.json'))
+            hashes[rel] = sha256(p)
+            body = read_text(p).rstrip()
+            parts.append('=== signed with the approval: %s (%s, sha256 %s…) ===\n%s'
+                         % (rel, state(rel), hashes[rel][:12], body if full or state(rel) != 'approved'
+                            else '(approved, unchanged)'))
     if not full:
         parts.append('This is a digest. The approval covers the complete files above by their sha256 (shown). '
                      'Read every line: /forge approve --full')
@@ -1411,7 +1626,7 @@ def project_files(root):
 
 
 def described_files(root, c):
-    """Code a decision record talks about: file paths it names (`gate.ts`, `src/x.py:47`) and functions it names in
+    """Code a decision record talks about: file paths it names (`policy.ts`, `src/x.py:47`) and functions it names in
     backticks, found by a definition (function / def / func / fn / class / const …). The check's own contract and
     proved files are left out. A heuristic: it finds what the record names, not what it means."""
     rel = c.get('decisions')
@@ -1524,8 +1739,10 @@ def write_json(root, rel, value):
 # A proof covers the proved function only. Code elsewhere that decides the same question itself (reads the same
 # field, repeats the same comparison) goes AROUND the rule. `bypass` searches the project for the check's
 # "watchedFields" outside the rule's own files and reports every place the person has not reviewed yet.
-# LIMIT: a text search per line, not a data-flow analysis. It misses aliases (`const f = body.for`), dynamic
-# access (`body[key]`), terms split over lines, and code that decides the same question under other names.
+# In TS/JS and Python files a hit counts only where the field is READ in a decision (cli/forge_ast.py: an AST
+# search); other languages, and files that do not parse, keep the text search per line (fail closed).
+# LIMIT: not a data-flow analysis. It misses values passed to another function or returned, dynamic access
+# (`body[key]`), terms split over lines, and code that decides the same question under other names.
 
 LAST_BYPASS = DIR + '/last-bypass.json'
 BYPASS_SKIP_DIRS = {'.git', 'node_modules', 'dist', 'build', 'verified', DIR, 'vendor', 'third_party',
@@ -1699,39 +1916,72 @@ def run_bypass(root, override=None):
     out['no_terms'] = [c['name'] for c in cfg['checks'] if not c.get('watchedFields')]
     files = project_files(root) if with_terms else []
     cache = {}
+    decisions = _decisions_for(root, cfg, with_terms, files, cache)
     for c in with_terms:
         matchers = scope_matchers(c)
         own = rule_own_files(root, cfg, c)
         watched = {w for d in diff_entries(c) for w in d.get('watch') or []}
         reviewed = c.get('allowedBypasses') or []
         res = out['checks'][c['name']] = {'terms': [t for t, _ in matchers], 'hits': [], 'reviewed': 0,
-                                          'outdated_reviews': [], 'files_searched': 0}
+                                          'outdated_reviews': [], 'files_searched': 0, 'not_decisions': []}
+        searched = []
         used = set()
         for rel in files:
             if rel in own or any(o.endswith('/') and rel.startswith(o) for o in own):
                 continue
             res['files_searched'] += 1
-            if rel not in cache:
-                cache[rel] = read_text(os.path.join(root, rel)).replace('\r\n', '\n').split('\n')
-            lines = cache[rel]
+            searched.append(rel)
+            lines = _lines(root, rel, cache)
+            start = 0
             for i, text in enumerate(lines):
+                line_start, start = start, start + len(text) + 1
                 terms = [t for t, rx in matchers if rx.search(text)]
                 if not terms:
                     continue
                 h = line_sha(text)
                 match = [k for k, e in enumerate(reviewed) if e['file'] == rel and e['line_text_sha256'] == h]
-                if match:
+                if match:  # an approved line stays allowed, whether or not it is a decision read
                     used.update(match)
                     res['reviewed'] += 1
                     continue
-                res['hits'].append({'file': rel, 'line': i + 1, 'terms': terms, 'text': text.strip()[:200],
-                                    'function': enclosing_function(lines, i, rel), 'line_text_sha256': h,
-                                    'fuzzed_file': rel in watched})
+                hit, kind, method, reason = decisions.classify(rel, line_start, text,
+                                                               [rx for t, rx in matchers if t in terms])
+                entry = {'file': rel, 'line': i + 1, 'terms': terms, 'text': text.strip()[:200]}
+                if not hit:  # in a TS/JS/Python file that parsed, the field is not read in a decision here
+                    res['not_decisions'].append(entry)
+                    continue
+                entry.update({'function': enclosing_function(lines, i, rel), 'line_text_sha256': h,
+                              'fuzzed_file': rel in watched, 'decision': kind, 'method': method})
+                if reason:
+                    entry['fallback'] = reason
+                res['hits'].append(entry)
         res['outdated_reviews'] = [e for k, e in enumerate(reviewed) if k not in used]
+        res['search'] = decisions.summary(searched)
     k = sum(len(r['hits']) for r in out['checks'].values())
     out['unreviewed'] = k
     out['verdict'] = 'NO_SCOPE_TERMS' if not with_terms else 'BYPASS_FOUND' if k else 'BYPASS_CLEAR'
     return out
+
+
+def _lines(root, rel, cache):
+    if rel not in cache:
+        cache[rel] = read_text(os.path.join(root, rel)).replace('\r\n', '\n').split('\n')
+    return cache[rel]
+
+
+def _decisions_for(root, cfg, checks, files, cache):
+    """Parses (cli/forge_ast.py) every TS/JS/Python file with a text hit of any watched field, once per run."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import forge_ast
+    rxs = [rx for c in checks for _, rx in scope_matchers(c)]
+    texts = {}
+    for rel in files:
+        lines = _lines(root, rel, cache)
+        if any(rx.search(t) for t in lines for rx in rxs):
+            texts[rel] = '\n'.join(lines)
+    d = forge_ast.Decisions()
+    d.prime(texts)
+    return d
 
 
 def outside_of(root):
@@ -1741,7 +1991,8 @@ def outside_of(root):
     except Exception as e:  # the search must never crash `check`; checks with watchedFields fail closed (main)
         return {}, '%s: %s' % (type(e).__name__, e)
     return ({name: [{'file': h['file'], 'line': h['line'], 'function': h['function'], 'term': h['terms'][0],
-                     'text': h['text']} for h in r['hits']] for name, r in out['checks'].items()}, None)
+                     'text': h['text'], 'decision': h['decision'] or 'text search, not AST'} for h in r['hits']]
+             for name, r in out['checks'].items()}, None)
 
 
 def outside_lines(outside):
@@ -1782,9 +2033,10 @@ def gate_bypass(result, outside, error):
             result['detail'][name] = ('the proof passed, but %d place(s) outside the rule use its watchedFields and are '
                                       'not in its approved allowedBypasses:\n%s\nRoute each through the proved rule, '
                                       'or allow it (/forge:bypass) and approve forge.json again.' % (
-                                          len(hits), '\n'.join('  %s:%d%s  [%s]  %s' % (
+                                          len(hits), '\n'.join('  %s:%d%s  [%s]  (%s)  %s' % (
                                               h['file'], h['line'], '  in ' + h['function'] if h['function'] else '',
-                                              h['term'], h['text']) for h in hits[:40])
+                                              h['term'], h.get('decision') or 'text search, not AST', h['text'])
+                                              for h in hits[:40])
                                           + ('\n  … and %d more (forge_check.py bypass)' % (len(hits) - 40) if len(hits) > 40 else '')))
 
 
@@ -1798,10 +2050,16 @@ def bypass_report(out):
     for name, r in out['checks'].items():
         lines.append('  %s: %d file(s) searched for %s; %d hit(s), %d allowed (allowedBypasses)' % (
             name, r['files_searched'], ', '.join(r['terms']), len(r['hits']) + r['reviewed'], r['reviewed']))
+        se = r.get('search') or {}
+        lines.append('    with a term: %d file(s) parsed (AST: TS/JS, Python), %d file(s) by text search, not AST '
+                     '(other languages, or a fallback below); %d text hit(s) are not decision reads (bypass --json '
+                     'lists them under "not_decisions")' % (se.get('ast', 0), se.get('text', 0), len(r['not_decisions'])))
+        for f in se.get('fallback') or []:
+            lines.append('    FALLBACK to text search, not AST: %s: %s' % (f['file'], f['reason']))
         for h in r['hits']:
-            lines.append('    %s:%d  %s[%s]%s  %s' % (h['file'], h['line'], 'in %s  ' % h['function'] if h['function'] else '',
-                                                    ', '.join(h['terms']), '  (a fuzzed file)' if h['fuzzed_file'] else '',
-                                                    h['text']))
+            lines.append('    %s:%d  %s[%s]  (%s)%s  %s' % (
+                h['file'], h['line'], 'in %s  ' % h['function'] if h['function'] else '', ', '.join(h['terms']),
+                h['decision'] or 'text search, not AST', '  (a fuzzed file)' if h['fuzzed_file'] else '', h['text']))
         for e in r['outdated_reviews']:
             lines.append('    outdated allowed bypass (the line changed or is gone): %s: %s' % (e['file'], e.get('note', '')))
     if out['no_terms']:
@@ -1812,8 +2070,10 @@ def bypass_report(out):
     if k:
         lines.append('Each place may decide the same question as the proved rule without going through it. '
                      '/forge:bypass explains each one and records your answer.')
-    lines.append('A text search (FINITE TEST of the listed terms): it misses aliases, dynamic field access and '
-                 'other names for the same question.')
+    lines.append('A syntactic search (FINITE TEST of the listed terms): in TS/JS and Python only decision reads count '
+                 '(conditions, comparisons, includes/in, ternary, switch/case, &&/|| guards, predicates, aliases); other '
+                 'files are a text search, not AST. It misses values passed to another function or returned, dynamic '
+                 'field access and other names for the same question.')
     return '\n'.join(lines)
 
 
@@ -1864,7 +2124,18 @@ def main(argv=None):
     p.add_argument('--inputs', type=int, help='diff: at most this many random inputs (default from forge.json, 1500)')
     p.add_argument('--budget-ms', type=int, help='diff: time budget per check in ms (default 1500)')
     p.add_argument('--seed', type=int, help='diff: random seed (default: a fresh one each run)')
+    p.add_argument('--coverage', action='store_true', help='diff: also report the lines and branches of the watched '
+                                                           'files that the run reached (slower)')
+    p.add_argument('--app', action='store_true', help='mutate: plant bugs in the shipped code (diff "watch" files) '
+                                                      'and run the diff on each, instead of in the Dafny files')
+    p.add_argument('--langs', help='mutate --app: diff entry languages to mutate (default py,js; "all" adds the '
+                                   'compiled ones, which rebuild per mutant)')
     p.add_argument('--full', action='store_true', help='spec/approve: print every approved file in full')
+    p.add_argument('--hardware', action='store_true', help='approve: also sign approved.json with an SSH key '
+                                                           '(FIDO2 security key or Secure Enclave)')
+    p.add_argument('--key', help='approve --hardware: the key file for ssh-keygen -Y sign (else FORGE_APPROVAL_KEY)')
+    p.add_argument('--allowed-signers', help='check: trusted allowed-signers file OUTSIDE the project (else '
+                                             'FORGE_ALLOWED_SIGNERS, else .forge/allowed_signers at --base)')
     p.add_argument('--check', action='store_true', help='build: write nothing; the emitted code on '
                                                         'disk must equal a fresh build')
     p.add_argument('--rule', help='bypass: the check whose watchedFields or allowedBypasses to write')
@@ -1912,12 +2183,18 @@ def main(argv=None):
         if a.command == 'diff':
             if hasattr(sys.stdout, 'reconfigure'):
                 sys.stdout.reconfigure(errors='backslashreplace')  # messy inputs may hold a lone surrogate
-            out = run_diff(root, a.inputs, a.budget_ms, a.seed)
+            out = run_diff(root, a.inputs, a.budget_ms, a.seed, coverage=a.coverage)
             if not a.no_write:
                 update_diff_stats(root, out)
                 write_json(root, LAST_DIFF, out)
             print(json.dumps(out, indent=2, ensure_ascii=False) if a.json else diff_report(out))
             return 0 if all(r['verdict'] == 'DIFF_OK' for r in out['checks'].values()) else 1
+        if a.command == 'mutate' and a.app:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import forge_mutate_app
+            out = forge_mutate_app.run(root, a.max, a.inputs, a.seed, a.langs)
+            print(json.dumps(out, indent=2, ensure_ascii=False) if a.json else forge_mutate_app.report(out))
+            return 0
         if a.command == 'mutate':
             out = run_mutate(root, a.max)
             print(json.dumps(out, indent=2) if a.json else mutate_report(out))
@@ -1948,9 +2225,8 @@ def main(argv=None):
                 differ = sorted(k for k in set(shown) | set(current) if shown.get(k) != current.get(k))
                 print('changed since it was shown: %s. Read it again.' % ', '.join(differ))
                 return 1
-            write_json(root, APPROVED, current)
-            record_described(root)
-            print('\n'.join('approved %s  sha256 %s…' % (k, h[:12]) for k, h in current.items()))
+            lines = finish_approval(root, current, a.hardware, a.key)
+            print('\n'.join(['approved %s  sha256 %s…' % (k, h[:12]) for k, h in current.items()] + lines))
             return 0
         if a.command == 'approve':
             if not (sys.stdin.isatty() and sys.stdout.isatty()):
@@ -1965,9 +2241,8 @@ def main(argv=None):
                 if (sha256 if key == CONFIG else contract_hash)(os.path.join(root, key)) != h:
                     print('%s changed while you read it. Run approve again.' % key)
                     return 1
-            write_json(root, APPROVED, hashes)
-            record_described(root)
-            print('approved: ' + ', '.join(hashes))
+            lines = finish_approval(root, hashes, a.hardware, a.key)
+            print('\n'.join(['approved: ' + ', '.join(hashes)] + lines))
             return 0
         if a.command == 'build':
             result = run_build(root, a.check)
@@ -1975,7 +2250,7 @@ def main(argv=None):
             ok = all(v == 'VERIFIED' for v in result['verdicts'].values()) and \
                 all(b['verdict'] == 'BUILT' for b in result['build'].values())
             return 0 if ok else 1
-        result = run_checks(root, a.base)
+        result = run_checks(root, a.base, a.allowed_signers)
         result['outside'], outside_error = outside_of(root)
         if outside_error:
             result['outside_error'] = outside_error
@@ -1988,6 +2263,8 @@ def main(argv=None):
             write_json(root, LAST, result)
         text = report(result) + ''.join('\n' + l for l in outside_lines(result['outside']))
         print(json.dumps(result, indent=2, ensure_ascii=False) if a.json else text)
+        if any(v == 'APPROVAL_UNSIGNED' for v in result['verdicts'].values()):
+            return 2
         return 0 if all(v == 'VERIFIED' for v in result['verdicts'].values()) else 1
     except ConfigError as e:
         if a.json:

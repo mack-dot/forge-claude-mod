@@ -415,7 +415,8 @@ def bypass_cases():
         cases.append(('gate: a new unapproved reader gives UNAPPROVED_BYPASS (exit 1), listed under "outside"',
                       cexit == 1 and verdicts == ['UNAPPROVED_BYPASS'] and 'gift_card.py:5' in chk['detail'].get('wallet-cap', '')
                       and [(h['file'], h['function'], h['line']) for h in outside] == [('gift_card.py', 'can_send_gift', found[0]['line'] if found else -1)]
-                      and (set(outside[0]) == {'file', 'line', 'function', 'term', 'text'} if outside else False)))
+                      and (set(outside[0]) == {'file', 'line', 'function', 'term', 'text', 'decision'} if outside else False)
+                      and outside[0]['decision'] == 'comparison' if outside else False))
         # the person says "it is fine": recorded with the line's hash; forge.json changed, so approval is needed again
         line = found[0]['line'] if found else 0
         r = subprocess.run([sys.executable, CLI, 'bypass', '--root', root, '--rule', 'wallet-cap', '--record',
@@ -491,49 +492,190 @@ def bypass_cases():
         cases.append(('bypass: git list: an untracked new file is found; ignored and node_modules files are not',
                       code == 1 and [h['file'] for h in hits(out)] == ['new_spender.py']))
 
-    # chronicle-shaped: a decision says body.for counts only on Companion's rows; a second gate function trusts it
+    # app-shaped: a decision says body.owner counts only on agent rows; a second policy function trusts it
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, 'c')
         for rel, text in {
             'spec/GateSpec.dfy': 'abstract module GateSpec { }\n', 'impl/Gate.dfy': 'module Gate { }\n',
-            'src/gate.ts': ('import { mayReadProved } from "./gate-mayread.ts"\n\n'
-                            'export function mayRead(actor: string, row: Row): boolean {\n'
-                            '  return mayReadProved(actor, row)\n}\n\n'
-                            'export const mayRetract = (actorId: string, target: Row): boolean =>\n'
-                            '  target.authorId === actorId || target.body.for === actorId\n\n'
-                            'class Store {\n  forget(input: Input) {\n    for (const e of this.rows) {\n'
-                            '      if (e.authorId !== input.parentId && e.body.for !== input.parentId) continue\n'
+            'src/policy.ts': ('import { canViewProved } from "./policy-proved.ts"\n\n'
+                            'export function canView(actor: string, row: Row): boolean {\n'
+                            '  return canViewProved(actor, row)\n}\n\n'
+                            'export const canCancel = (actorId: string, target: Row): boolean =>\n'
+                            '  target.authorId === actorId || target.body.owner === actorId\n\n'
+                            'class Store {\n  archive(input: Input) {\n    for (const e of this.rows) {\n'
+                            '      if (e.authorId !== input.ownerId && e.body.owner !== input.ownerId) continue\n'
                             '    }\n  }\n}\n'),
-            'src/Svc.java': ('class Svc {\n    public static boolean retract(Row target, String by)\n    {\n'
-                             '        return target.body.for.equals(by);\n    }\n}\n'),
-            'src/svc.go': 'package svc\n\nfunc (s *S) Retract(t Row, by string) bool {\n\treturn t.body.for == by\n}\n',
-            'src/svc.rs': 'pub fn retract(t: &Row, by: &str) -> bool {\n    t.body.for == by\n}\n',
-            'docs/decisions.md': 'D9: body.for counts only on Companion rows.\n',
+            'src/Svc.java': ('class Svc {\n    public static boolean cancel(Row target, String by)\n    {\n'
+                             '        return target.body.owner.equals(by);\n    }\n}\n'),
+            'src/svc.go': 'package svc\n\nfunc (s *S) Cancel(t Row, by string) bool {\n\treturn t.body.owner == by\n}\n',
+            'src/svc.rs': 'pub fn cancel(t: &Row, by: &str) -> bool {\n    t.body.owner == by\n}\n',
+            'docs/decisions.md': 'D4: body.owner counts only on agent rows.\n',
         }.items():
             os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
             open(os.path.join(root, rel), 'w').write(text)
         os.makedirs(os.path.join(root, '.forge'))
-        json.dump({'version': 1, 'checks': [{'name': 'gate-mayread', 'spec': 'spec/GateSpec.dfy', 'files': ['impl/Gate.dfy'],
-                                             'watchedFields': ['body.for']}]}, open(os.path.join(root, CONFIG), 'w'))
+        json.dump({'version': 1, 'checks': [{'name': 'policy-view', 'spec': 'spec/GateSpec.dfy', 'files': ['impl/Gate.dfy'],
+                                             'watchedFields': ['body.owner']}]}, open(os.path.join(root, CONFIG), 'w'))
         code, out = run(root, '--json')
         got = sorted((h['file'], h['function']) for h in hits(out))
-        cases.append(('bypass: chronicle-shaped: mayRetract and forget (TS), retract in Java/Go/Rust named; docs skipped',
-                      code == 1 and got == [('src/Svc.java', 'retract'), ('src/gate.ts', 'forget'), ('src/gate.ts', 'mayRetract'),
-                                            ('src/svc.go', 'Retract'), ('src/svc.rs', 'retract')]))
+        cases.append(('bypass: app-shaped: canCancel and archive (TS), cancel in Java/Go/Rust named; docs skipped',
+                      code == 1 and got == [('src/Svc.java', 'cancel'), ('src/policy.ts', 'archive'), ('src/policy.ts', 'canCancel'),
+                                            ('src/svc.go', 'Cancel'), ('src/svc.rs', 'cancel')]))
         before = open(os.path.join(root, CONFIG)).read()
-        rc = subprocess.run([sys.executable, CLI, 'bypass', '--root', root, '--count', '--json', '--rule', 'gate-mayread',
-                             '--set-terms', '.body.for', 'not_in_this_project'], stdout=subprocess.PIPE, universal_newlines=True)
+        rc = subprocess.run([sys.executable, CLI, 'bypass', '--root', root, '--count', '--json', '--rule', 'policy-view',
+                             '--set-terms', '.body.owner', 'not_in_this_project'], stdout=subprocess.PIPE, universal_newlines=True)
         try:
-            pv = json.loads(rc.stdout).get('gate-mayread', {})
+            pv = json.loads(rc.stdout).get('policy-view', {})
         except ValueError:
             pv = {}
         cases.append(('bypass: --count previews other terms (lines per term) and writes nothing',
-                      rc.returncode == 0 and pv.get('per_term') == {'.body.for': 5, 'not_in_this_project': 0}
+                      rc.returncode == 0 and pv.get('per_term') == {'.body.owner': 5, 'not_in_this_project': 0}
                       and open(os.path.join(root, CONFIG)).read() == before))
         txt = subprocess.run([sys.executable, CLI, 'check', '--root', root, '--no-write'], stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, universal_newlines=True).stdout
-        cases.append(('bypass: check text names the places ("N places decide with body.for outside gate-mayread")',
-                      '5 places decide with body.for outside gate-mayread: ' in txt and 'src/gate.ts:8 mayRetract' in txt))
+        cases.append(('bypass: check text names the places ("N places decide with body.owner outside policy-view")',
+                      '5 places decide with body.owner outside policy-view: ' in txt and 'src/policy.ts:8 canCancel' in txt))
+    return cases
+
+
+# Planted decision reads of a watched field, one per file (the AST bypass search must find each one).
+AST_PLANTS = {
+    'ts_ternary.ts': ('export const label = (u: User, r: Row): string =>\n  r.tenantId ? "mine" : "other"\n', 2, 'ternary'),
+    'ts_switch.ts': ('export function route(r: Row): number {\n  switch (r.tenantId) {\n    case "a": return 1\n  }\n'
+                     '  return 0\n}\n', 2, 'switch'),
+    'ts_includes.ts': ('export const allowed = (list: string[], r: Row) =>\n  list.includes(r.tenantId)\n', 2, 'includes'),
+    'ts_filter.js': ('export const mine = (rows, u) =>\n  rows.filter((r) => r.tenantId)\n', 2, 'filter-predicate'),
+    'py_ternary.py': ('def label(u, r):\n    return "mine" if r.tenantId else "other"\n', 2, 'ternary'),
+    'py_match.py': ('def route(r):\n    match r.tenantId:\n        case "a":\n            return 1\n    return 0\n',
+                    2, 'switch'),
+    'py_in.py': ('def allowed(xs, r):\n    return r.tenantId in xs\n', 2, 'in'),
+    'py_filter.py': ('def mine(rows, u):\n    return [r for r in rows if r.tenantId]\n', 2, 'filter-predicate'),
+}
+# Only declarations, annotations, imports, comments, strings, construction and logging of the field: no decision.
+AST_QUIET = {
+    'types.ts': ('// tenantId: the owner\'s tenant\nimport type { tenantId } from "./ids"\n'
+                 'export interface Row { tenantId: string }\nexport type T = { tenantId?: string }\n'
+                 '/* tenantId in a block comment */\nexport function make(id: string): Row {\n'
+                 '  const row = { tenantId: id }\n  console.log("tenantId", row.tenantId)\n  return row\n}\n'),
+    'types.py': ('# tenantId comment\nfrom ids import tenantId\n\n\nclass Row:\n    tenantId: str\n\n\n'
+                 'def make(i):\n    row = Row(tenantId=i)\n    print("tenantId", row.tenantId)\n    return {"tenantId": i}\n'),
+}
+
+
+def ast_bypass_cases():
+    """The AST bypass search (cli/forge_ast.py): decision reads count in TS/JS and Python; declarations do not;
+    a file that does not parse, and any other language, is searched as text and says so (fail closed)."""
+    cases = []
+
+    def project(tmp, files, terms=('tenantId',)):
+        root = os.path.join(tmp, 'a')
+        if os.path.isdir(root):
+            shutil.rmtree(root)
+        for rel, text in dict({'spec/S.dfy': 'abstract module S { }\n', 'impl/I.dfy': 'module I { }\n'}, **files).items():
+            os.makedirs(os.path.dirname(os.path.join(root, rel)) or root, exist_ok=True)
+            open(os.path.join(root, rel), 'w').write(text)
+        os.makedirs(os.path.join(root, '.forge'), exist_ok=True)
+        json.dump({'version': 1, 'checks': [{'name': 'tenant-gate', 'spec': 'spec/S.dfy', 'files': ['impl/I.dfy'],
+                                             'watchedFields': list(terms)}]}, open(os.path.join(root, CONFIG), 'w'))
+        return root
+
+    def run(root, env=None, text=False):
+        r = subprocess.run([sys.executable, CLI, 'bypass', '--root', root] + ([] if text else ['--json']),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                           env=dict(os.environ, **(env or {})))
+        if text:
+            return r.returncode, r.stdout
+        try:
+            return r.returncode, json.loads(r.stdout)['checks']['tenant-gate']
+        except (ValueError, KeyError):
+            return r.returncode, {'hits': [], 'not_decisions': [], 'error': (r.stderr or r.stdout)[-300:]}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for rel, (text, line, kind) in sorted(AST_PLANTS.items()):
+            code, res = run(project(tmp, {'src/' + rel: text}))
+            got = [(h['file'], h['line'], h['decision'], h['method']) for h in res['hits']]
+            cases.append(('bypass: AST: a planted decision read (%s, %s) is BYPASS_FOUND' % (rel, kind),
+                          code == 1 and got == [('src/' + rel, line, kind, 'ast')]))
+        code, res = run(project(tmp, {'src/' + k: v for k, v in AST_QUIET.items()}))
+        cases.append(('bypass: AST: a file with only types, comments, imports, strings, construction and logging of the '
+                      'field gives 0 hits (BYPASS_CLEAR)',
+                      code == 0 and res['hits'] == [] and len(res['not_decisions']) == 13
+                      and res['search']['ast'] == 2 and res['search']['fallback'] == []))
+        # fail closed: a file that does not parse is searched as text, and the report says so
+        broken = {'src/broken.ts': 'export function f(r: Row {\n  return r.tenantId\n}\n',
+                  'src/broken.py': 'def f(r:\n    return r.tenantId\n'}
+        root = project(tmp, broken)
+        code, res = run(root)
+        _, txt = run(root, text=True)
+        cases.append(('bypass: AST: a parse error falls back to text search for that file, says so, and still finds it',
+                      code == 1 and sorted((h['file'], h['method'], h['decision']) for h in res['hits'])
+                      == [('src/broken.py', 'text', None), ('src/broken.ts', 'text', None)]
+                      and all('parse error' in h.get('fallback', '') for h in res['hits'])
+                      and 'FALLBACK to text search, not AST: src/broken.ts: TS/JS parse error' in txt
+                      and 'FALLBACK to text search, not AST: src/broken.py: Python parse error' in txt))
+        # other languages keep the text search, labelled as such
+        root = project(tmp, {'src/x.go': 'package x\n\nfunc F(r Row) string { return r.tenantId }\n',
+                             'src/types.ts': AST_QUIET['types.ts']})
+        code, res = run(root)
+        _, txt = run(root, text=True)
+        cases.append(('bypass: AST: Go keeps the text search ("text search, not AST"); the TS declarations do not count',
+                      code == 1 and [(h['file'], h['method']) for h in res['hits']] == [('src/x.go', 'text')]
+                      and '(text search, not AST)' in txt))
+        # no TypeScript parser available (empty cache, downloads off): TS/JS files are searched as text (fail closed)
+        root = project(tmp, dict({'src/' + k: AST_PLANTS[k][0] for k in ('ts_ternary.ts', 'ts_switch.ts')},
+                                 **{'src/types.ts': AST_QUIET['types.ts']}))
+        code, res = run(root, env={'XDG_CACHE_HOME': os.path.join(tmp, 'empty-cache'), 'FORGE_NO_DOWNLOAD': '1'})
+        cases.append(('bypass: AST: without the TypeScript parser every TS file falls back to text search, with the reason',
+                      code == 1 and {h['file'] for h in res['hits']} == {'src/ts_ternary.ts', 'src/ts_switch.ts', 'src/types.ts'}
+                      and all(h['method'] == 'text' and 'downloads are off' in h.get('fallback', '') for h in res['hits'])))
+        # an alias read in a decision: const t = r.tenantId; if (t === u.id) ...
+        root = project(tmp, {'src/alias.ts': 'export function g(r: Row, u: User) {\n  const t = r.tenantId\n'
+                                             '  if (t !== u.id) return false\n  return true\n}\n',
+                             'src/alias.py': 'def g(r, u):\n    t = r.tenantId\n    if t != u.id:\n        return False\n'
+                                             '    return True\n',
+                             'src/sql.ts': 'export const rows = (db: Db, s: Scope) =>\n'
+                                           '  db.query("SELECT * FROM t WHERE tenant_id = $1",\n    [s.tenantId])\n'})
+        code, res = run(root)
+        cases.append(('bypass: AST: an alias later read in a decision, and a SQL WHERE parameter, are found',
+                      code == 1 and sorted((h['file'], h['line'], h['decision']) for h in res['hits'])
+                      == [('src/alias.py', 2, 'alias'), ('src/alias.ts', 2, 'alias'), ('src/sql.ts', 3, 'sql-where')]))
+
+    # migration: an allowed line stays allowed (and is not "outdated") whether or not it is a decision read
+    with tempfile.TemporaryDirectory() as tmp:
+        import hashlib
+        root = project(tmp, {'src/types.ts': AST_QUIET['types.ts'], 'src/ts_ternary.ts': AST_PLANTS['ts_ternary.ts'][0]})
+        cfg = json.load(open(os.path.join(root, CONFIG)))
+        line = lambda rel, n: open(os.path.join(root, rel)).read().split('\n')[n - 1]
+        cfg['checks'][0]['allowedBypasses'] = [
+            {'file': 'src/types.ts', 'line_text_sha256': hashlib.sha256(line('src/types.ts', 3).encode()).hexdigest(), 'note': 'old text hit'},
+            {'file': 'src/ts_ternary.ts', 'line_text_sha256': hashlib.sha256(line('src/ts_ternary.ts', 2).encode()).hexdigest(), 'note': 'reviewed'}]
+        json.dump(cfg, open(os.path.join(root, CONFIG), 'w'))
+        code, res = run(root)
+        cases.append(('bypass: AST: approved allowedBypasses entries (by line hash) stay allowed, none outdated',
+                      code == 0 and res['hits'] == [] and res['reviewed'] == 2 and res['outdated_reviews'] == []))
+
+    # the hard gate on a real proof: a planted TS ternary and a Python match outside the rule are UNAPPROVED_BYPASS
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, 'p')
+        shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
+        cfg = json.load(open(os.path.join(root, CONFIG)))
+        cfg['checks'][0]['watchedFields'].append('tenantId')
+        json.dump(cfg, open(os.path.join(root, CONFIG), 'w'), indent=2)
+        reapprove(root)
+        for rel in ('ts_ternary.ts', 'py_match.py'):
+            open(os.path.join(root, rel), 'w').write(AST_PLANTS[rel][0])
+        for rel, text in AST_QUIET.items():
+            open(os.path.join(root, rel), 'w').write(text)
+        r = subprocess.run([sys.executable, CLI, 'check', '--root', root, '--json', '--no-write'],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        try:
+            out = json.loads(r.stdout)
+        except ValueError:
+            out = {'verdicts': {}, 'outside': {}}
+        got = sorted((h['file'], h['decision']) for h in (out.get('outside') or {}).get('wallet-cap', []))
+        cases.append(('gate: AST: planted TS ternary and Python match give UNAPPROVED_BYPASS; the declarations file does not',
+                      r.returncode == 1 and list(out['verdicts'].values()) == ['UNAPPROVED_BYPASS']
+                      and got == [('py_match.py', 'switch'), ('ts_ternary.ts', 'ternary')]))
     return cases
 
 
@@ -879,7 +1021,9 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, 'p')
         shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
-        code, res = diff(root)
+        # a fixed input count, not the 1.5 s budget: under load the JVM got through too few inputs to
+        # reach the long wraparound (failed twice on a loaded machine, passed on rerun)
+        code, res = diff(root, '--budget-ms', '60000')
         py, js = res.get('wallet-cap:py', {}), res.get('wallet-cap:js', {})
         kinds_py = sorted({json.dumps(d['reference']['ok']) + '>' + json.dumps(d['got']['ok']) for d in py.get('disagreements', [])})
         failing_py = sorted(f['id'][:2] for f in (py.get('decisions') or {}).get('failing', []))
@@ -888,8 +1032,8 @@ def main():
             ('diff: shipped Python bugs found (exact cap, zero, negative)', code == 1 and py.get('verdict') == 'DISAGREE'
              and failing_py == ['D1', 'D3', 'D4']),
             ('diff: the wrapper agrees with the proved rule', (py.get('per_candidate') or {}).get('app-wrapper') == 0),
-            ('diff: shipped TypeScript bugs found (zero, negative)', js.get('verdict') == 'DISAGREE'
-             and failing_js == ['D3', 'D4']),
+            ('diff: shipped TypeScript bugs found (exact cap, zero, negative)', js.get('verdict') == 'DISAGREE'
+             and failing_js == ['D1', 'D3', 'D4']),
             ('diff: each run under 2 seconds', py.get('ms', 9999) < 2000 and js.get('ms', 9999) < 2000),
             ('diff: at most 3 differently shaped examples per kind of wrong answer, never a decision input again',
              all(n <= 3 for n in __import__('collections').Counter((d['candidate'], d.get('group')) for d in py.get('disagreements', [])).values())
@@ -919,13 +1063,13 @@ def main():
         go_res, rs_res = res.get('wallet-cap:go', {}), res.get('wallet-cap:rs', {})
         cases.append(('diff: Go evaluator finds the shipped Go bugs (exact cap, zero, negative)',
                       sorted(f['id'][:2] for f in (go_res.get('decisions') or {}).get('failing', [])) == ['D1', 'D3', 'D4']))
-        cases.append(('diff: Rust evaluator finds zero accepted and the overflow panic',
-                      [f['id'][:2] for f in (rs_res.get('decisions') or {}).get('failing', [])] == ['D3']
+        cases.append(('diff: Rust evaluator finds exact cap, zero accepted and the overflow panic',
+                      sorted(f['id'][:2] for f in (rs_res.get('decisions') or {}).get('failing', [])) == ['D1', 'D3']
                       and any('overflow' in json.dumps(d['got']) for d in rs_res.get('disagreements', []))))
         cases.append(('diff: Go and Rust runs under 2 seconds once built', go_res.get('ms', 9999) < 2000 and rs_res.get('ms', 9999) < 2000))
         java_res = res.get('wallet-cap:java', {})
-        cases.append(('diff: Java evaluator finds the exact-cap bug and the long wraparound',
-                      [f['id'][:2] for f in (java_res.get('decisions') or {}).get('failing', [])] == ['D1']
+        cases.append(('diff: Java evaluator finds exact cap, zero accepted and the long wraparound',
+                      sorted(f['id'][:2] for f in (java_res.get('decisions') or {}).get('failing', [])) == ['D1', 'D3']
                       and any(isinstance(d.get('got'), dict) and d['got'].get('ok') is True
                               and isinstance(d['got'].get('spent'), int) and d['got']['spent'] < 0
                               for d in java_res.get('disagreements', []))))
@@ -997,7 +1141,7 @@ def main():
         extra += 1
         print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
     # Messy inputs: the unproved wrapper that turns raw app/JSON values into Dafny values must fail closed, never throw
-    # (owner feedback: a real app's wrapper threw on `householdId: undefined`, and the plain fuzz never sent one).
+    # (owner feedback: a real app's wrapper threw on an `undefined` id field, and the plain fuzz never sent one).
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, 'p')
         shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
@@ -1056,6 +1200,63 @@ def main():
                 print('      ' + json.dumps({k: {kk: v.get(kk) for kk in ('verdict', 'per_candidate', 'messy', 'error')}
                                              for k, v in on.items()}, ensure_ascii=True)[:700])
 
+    # Messy inputs in the compiled languages (Go, Rust, Java; C# in tests/run_cs_diff.py): each adapter names wrappers
+    # that take the RAW JSON value (json.RawMessage, serde_json::Value, the evaluator's parsed value) and a fail-closed
+    # answer. Planted per language: one wrapper that panics/throws on a null or wrong-typed amount, one that coerces "5".
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, 'p')
+        shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
+        cfg = json.load(open(os.path.join(root, CONFIG)))
+        crash = {'go': 'wrapper-panics', 'rs': 'wrapper-panics', 'java': 'wrapper-throws'}
+
+        def compiled_cfg(flag):
+            cfg['checks'][0]['diff'] = [
+                dict({'name': 'messy-go', 'lang': 'go', 'inputs': 'diff/wallet_inputs.py', 'adapter': 'diff/wallet_messy.go'}, **flag),
+                dict({'name': 'messy-rs', 'lang': 'rs', 'inputs': 'diff/wallet_inputs.py', 'adapter': 'diff/wallet_messy.rs'}, **flag),
+                dict({'name': 'messy-java', 'lang': 'java', 'inputs': 'diff/wallet_inputs.py', 'adapter': 'diff/wallet_messy.java',
+                      'java_sources': ['messyjava']}, **flag)]
+            json.dump(cfg, open(os.path.join(root, CONFIG), 'w'))
+
+        compiled_cfg({'messy': False})  # negative control first: without the messy step, nothing is found
+        code_off, off = diff(root)
+        compiled_cfg({})
+        code_on, on = diff(root)
+        code_again, again = diff(root)
+        no_undef = [k for k in forge_diff.MESSY_KINDS if k != 'undefined']
+        cases_cm = [('messy (Go, Rust, Java): negative control, messy off: the planted wrappers agree on well-typed inputs',
+                     code_off == 0 and len(off) == 3 and all(r.get('verdict') == 'DIFF_OK' and 'messy' not in r for r in off.values()))]
+        for lang, label in (('go', 'Go'), ('rs', 'Rust'), ('java', 'Java')):
+            r = on.get('wallet-cap:messy-' + lang, {})
+            m = r.get('messy') or {}
+            t = got(r, crash[lang], 'THROWS_ON_MESSY_INPUT')
+            c = got(r, 'wrapper-coerces', 'MESSY_ANSWER')
+            kinds = [k for k in no_undef if k != 'lone-surrogate'] if lang == 'rs' else no_undef
+            cases_cm += [
+                ('messy %s: the wrapper that crashes on a null, missing or wrong-typed amount is THROWS_ON_MESSY_INPUT, '
+                 'only on amount, shrunk to cap 0, spent 0' % label,
+                 code_on == 1 and len(t) > 0 and {d['messy']['as'] for d in t} & {'null', 'removed'}
+                 and all(d['messy']['field'] == 'amount' for d in got(r, crash[lang]))
+                 and any({k: v for k, v in d['input'].items() if k != 'amount'} == {'cap': 0, 'spent': 0} for d in t)),
+                ('messy %s: the wrapper that coerces "5" to 5 is a MESSY_ANSWER disagreement' % label,
+                 any(d['messy']['as'] == 'number-as-text' and isinstance(d['input']['amount'], str) for d in c)),
+                ('messy %s: negative control, the fail-closed wrapper has 0 messy disagreements (%d messy inputs)'
+                 % (label, m.get('inputs', 0)),
+                 r.get('per_candidate', {}).get('wrapper-safe') == 0 and m.get('inputs', 0) > 100),
+                ('messy %s: every kind but undefined%s is tried and judged' % (label, ' and lone-surrogate (serde_json rejects it)'
+                                                                              if lang == 'rs' else ''),
+                 m.get('kinds') == kinds and m.get('not_judged') == 0 and m.get('pairs_tried', 0) >= 3 * len(kinds)
+                 and m.get('skipped_kinds', []) == (['lone-surrogate'] if lang == 'rs' else [])),
+                ('messy %s: saved messy cases replay first next run' % label,
+                 again.get('wallet-cap:messy-' + lang, {}).get('replayed', 0) >= len(got(r, crash[lang])) > 0 and code_again == 1),
+            ]
+        for name, ok in cases_cm:
+            failed += not ok
+            extra += 1
+            print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
+            if not ok:
+                print('      ' + json.dumps({k: {kk: v.get(kk) for kk in ('verdict', 'per_candidate', 'messy', 'error')}
+                                             for k, v in on.items()}, ensure_ascii=True)[:1500])
+
     # INVARIANTS.md: generated from the approved rules; CI catches a stale copy
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, 'p')
@@ -1082,7 +1283,7 @@ def main():
             failed += not ok
             extra += 1
             print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
-    for name, ok in bypass_cases():
+    for name, ok in bypass_cases() + ast_bypass_cases():
         failed += not ok
         extra += 1
         print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
@@ -1090,6 +1291,24 @@ def main():
         failed += not ok
         extra += 1
         print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
+    sys.path.insert(0, HERE)
+    import coverage_mutate_cases  # diff --coverage and mutate --app (M1.2)
+    for name, ok in coverage_mutate_cases.cases():
+        failed += not ok
+        extra += 1
+        print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
+    # signed approvals (S1): the rogue-agent exit gate, software ed25519 keys made at test time
+    sig = subprocess.run([sys.executable, os.path.join(HERE, 'run_signed_approval.py')], stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, universal_newlines=True)
+    for line in sig.stdout.splitlines():
+        if line.startswith(('ok  ', 'FAIL')):
+            failed += line.startswith('FAIL')
+            extra += 1
+            print(line)
+    if sig.returncode and 'FAIL' not in sig.stdout:
+        failed += 1
+        extra += 1
+        print('FAIL  signed approvals: run_signed_approval.py exit %d: %s' % (sig.returncode, sig.stdout[-400:]))
     print('%d cases, %d failed' % (len(CASES) + len(BUILD_CASES) + extra, failed))
     return 1 if failed else 0
 
