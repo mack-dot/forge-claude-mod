@@ -62,7 +62,7 @@ conversation with Claude; commands with a **space** (`/forge approve`) run a fix
 | State a rule | `/forge:add <the rule in your own words>` | A conversation: Claude says whether the rule can be proved, confirms safe defaults, asks edge-case questions with concrete numbers (as many rounds as needed), probes the spec with Dafny for cases nobody asked about, then writes the spec, **your answers as Dafny checks**, a decision record and the implementation. |
 | Read it | `/forge:explain` | Claude explains every clause in plain words, checks that each of your answers is covered, and lists what is not guaranteed. |
 | Approve it | `/forge approve`, then `/forge approve yes` | Shows exactly what you approve (spec, your answers, decision record, `forge.json`); "yes" approves exactly that, even after a restart. Typing "yes" first only shows it. If a file changed in between, it shows the new version instead. Only you can do this. |
-| Prove it | `/forge check` | Your answers are checked against the spec (`EXAMPLES_FAILED` if the spec says otherwise or leaves one open), then the code against the spec. The status line says what a green check covers, for example `forge ✓ wallet-cap: model PROVED · fuzzed 1,500 cases, wrapper NOT proved · records current`, or what failed. |
+| Prove it | `/forge check` | Your answers are checked against the spec (`EXAMPLES_FAILED` if the spec says otherwise or leaves one open), then the code against the spec. The status line says what a green check covers, for example `forge ✓ model PROVED · 0 bypasses · fuzz 1,500 ok · callers 3 ok · records current`, turns yellow (`forge ⚠ DRIFT: …`) when something the proof rests on moved, or says what failed (`forge ✗ …`). See **Callers** below. |
 | Find bugs in your real code | automatic (set up by `/forge add` when the rule already exists in your code), or `/forge fuzz` | Runs your shipped code and the proved rule on fresh random inputs at the end of each turn that changed them (about a second), saves each disagreement as a small repeatable case. `/forge fuzz` on its own is a deep run. See **Fuzz** below. |
 | Find code around the rule | `/forge:bypass` | Claude proposes the fields the rule decides on, searches for code outside the rule that uses them, and asks you about each place. See **Bypass** below. |
 | Measure it | `/forge mutate` | Plants up to 30 small bugs in the proved code, one at a time in a temporary copy, and counts how many the proof catches. A survivor is a change your spec allows: harmless, or a gap in the spec. Changes nothing. |
@@ -312,6 +312,100 @@ diff run per mutant: on the example 150–220 ms (Python), 210–430 ms (TypeScr
 warm cargo cache) and 1.4 s (Java) per mutant. Labels: both measures are test tooling (not proved); a mutation
 score is a FINITE TEST of the fuzz, not of the code.
 
+### Fuzz tiers and coverage-guided steering
+
+The end-of-turn fuzz must stay fast; big volume belongs in CI. Three tiers, set in `.forge/forge.json` (all optional;
+these are the defaults):
+
+```json
+"fuzz": {"tiers": {"local":   {"inputs": 1500,    "budget_ms": 1500,    "steer": false},
+                   "ci":      {"inputs": 100000,  "budget_ms": 600000,  "steer": true},
+                   "nightly": {"inputs": 1000000, "budget_ms": 3600000, "steer": true}}}
+```
+
+`diff` runs the local tier (a diff entry's own `inputs_per_run` / `budget_ms` still win there); `diff --tier ci` and
+`diff --tier nightly` run the others; `--inputs` / `--budget-ms` win over every tier; `--steer` / `--no-steer` win
+over the tier's steering. In the Action: `diff-tier: ci` (or `nightly` in a scheduled workflow).
+
+**Steering** (`--steer`; py and js entries). Blind random inputs reach a narrow branch only by luck. A steered run
+gets per-input coverage from the evaluator itself (Python: a tracer around the candidate calls only; JS/TS: V8
+block coverage through `node:inspector`, read once per 16 inputs and per input only when the batch found something
+new), keeps every input that reaches a new step of the shipped code as a seed and mostly tries small changes of the
+seeds (an AFL-style corpus loop), and puts in constants read from the watched files' comparisons (`amount == 7777`
+gives `amount` the values 7776, 7777, 7778: a dictionary). Steering changes which inputs are tried, never how they
+are judged. It also names every line no input reached, plainly: `legacy_wallet.py:3 was never reached`. Go, Rust,
+Java, C# and cmd entries are not steered (no per-input coverage) and say so.
+
+Measured (`tests/bench_steer.py --seeds 20`, macOS arm64, Python 3.10, Node 24.3): the example with the shipped
+code fixed and ONE bug planted behind `amount == 7777`, 1,500 inputs per run, seeds 1 to 20, the same input count
+for every mode:
+
+| Mode | Python: bug found | Python: `legacy_wallet.py` branches reached (median) | TS: bug found | TS: `legacy_wallet.ts` code lines reached (median) |
+| --- | --- | --- | --- | --- |
+| blind random (`--no-steer`) | 0 of 20 | 3 of 4 | 0 of 20 | 4 of 5 |
+| corpus only (kept seeds, no constants) | 1 of 20 | 3 of 4 | 1 of 20 | 4 of 5 |
+| dictionary only (constants, no seeds) | 20 of 20 | 4 of 4 | 20 of 20 | 5 of 5 |
+| steered (`--steer`: both) | 20 of 20 | 4 of 4 | 20 of 20 | 5 of 5 |
+
+On this bug the constants from the code do the work; the corpus alone adds little (1 of 20). A narrow branch
+whose value is computed, not written in the code, is not reached this way.
+
+Labels: tiers and steering are test tooling (not proved); every run is a FINITE TEST.
+
+## CRASH-CHECK: `/forge crash-fuzz` (no spec)
+
+`/forge crash-fuzz` (or `python3 cli/forge_crash.py --root .`) needs no spec and no `forge.json`. It finds the
+functions where outside data enters your code, calls each with messy JSON, and lists every error that escapes one,
+with the smallest input that still gives it:
+
+```
+CRASH-CHECK: 3 handlers crash with unhandled errors: SyntaxError on a missing value (undefined), empty text; TypeError on a missing value (undefined), null
+  4 boundary function(s), 199 calls, seed 1, 973 ms. CRASH-CHECK only: it shows crashes; it proves nothing, and 0 crashes is not a proof of no crash.
+  ✗ js/handlers.ts:8 createOrder (express): 1 crash(es) in 34 calls
+      CRASH TypeError at js/handlers.ts:9 on item = undefined: Cannot read properties of undefined (reading 'quantity')
+        same crash also on: item = null, item = removed, whole input = undefined, whole input = null, whole input = empty-text, whole input = not-json-text
+        repro: {"item": {"__undefined__": true}}
+  ✗ js/handlers.ts:14 POST (fetch): 4 crash(es) in 33 calls
+      CRASH TypeError at js/handlers.ts:17 on user = null: Cannot read properties of null (reading 'name')
+        same crash also on: user = number, user = boolean, user = empty-text, user = lone-surrogate, user = long-text, user = array
+        repro: {"user": null}
+      CRASH SyntaxError at js/handlers.ts:15 on whole input = undefined: Unexpected end of JSON input
+        repro: {"__undefined__": true}
+  ...
+  ✓ js/handlers.ts:27 updateLimit (express): 0 crashes in 120 calls
+  skipped 1 function(s):
+    js/handlers.ts:35 normalizeName: private helper: not exported, so no caller outside its module can pass it data; a crash there shows up through the boundary function that calls it
+```
+
+- **Which functions.** JS/TS: exported functions that look like a boundary: request/response or event parameters
+  (Express/Fastify `(req, res)`, fetch-style `(request)` and `GET`/`POST` route handlers, Lambda `(event, context)`),
+  handler/webhook/parse-like names, package entry points (`main`/`exports`/`bin`), files under `routes/`, `api/`,
+  `handlers/`, `webhooks/`. Python: route/view decorators (`@app.route`, `@router.post`, `@api_view`,
+  `@csrf_exempt`, ...), `__all__`, handler/webhook/parse-like names, a first parameter `request` or `event`.
+  **Skipped, with the reason said:** private helpers (not exported, or `_name`: only a boundary function can pass
+  them data, and the boundary function is what is called), other exports (internal module code), and functions that
+  cannot be called directly: route handlers that are not exported, factories (`createHandler(deps)`), Flask views
+  with no parameters, FastAPI handlers with typed parameters (the framework validates first).
+  `--target FILE:FUNCTION` (or `.forge/crash-fuzz.json` `{"targets": [...]}`) checks exactly the functions you name;
+  `--include-private` adds private Python helpers.
+- **Which inputs.** The input shape is inferred from the fields the function reads (`req.body.item.quantity`,
+  `payload["user"]`, destructuring, `JSON.parse(raw)`); then every field, and the whole input, gets each messy
+  kind: undefined (JS), null, NaN, a number, a boolean, `""`, very long text, a lone surrogate, `[]`, `{}`, the
+  number as text, text that is not JSON, removed; then random pairs. 120 calls per function by default
+  (`--inputs`).
+- **What counts.** A runtime error that escapes (TypeError, SyntaxError, KeyError, AttributeError, ...; a rejected
+  promise or an unhandled rejection too) is a CRASH; a call with no answer in 1 s is a HANG. An error the code throws
+  on purpose (`throw`/`raise` on that line, or a non-built-in error class) is listed apart: check that your
+  framework answers 4xx for it. If the inferred input itself crashes, the shape guess is probably wrong: the
+  function is NOT judged and none of its results count.
+- Exit 1 when something crashed, 0 when not. **CRASH-CHECK, never PROVED:** 0 crashes is a finite test, not a proof.
+
+Measured on `tests/crash_fixture/` (seed 1): per language, the three planted crashes (a missing field, a null
+deref, `JSON.parse` / `json.loads` of a value that is not text) are found and shrunk (`{"item": undefined}`,
+`{"user": null}`, `{"payload": {"user": null}}`); the fail-closed handlers have 0 crashes in 120 calls each; the
+private helpers that throw on undefined / None are not reported (with `--include-private` the Python one is, so
+the skip is a choice, not a blind spot). About 1 s for 8 functions.
+
 ## Bypass: code that goes around a proved rule
 
 A proof is only as strong as the guarantee that nothing goes around it. On a real app, a proved read rule decided that
@@ -361,9 +455,82 @@ files (275 of them for the id field): too many for a gate. The specific terms (t
 a comparison on the id field from each side, the forms shown above) match 19 lines in 10 files, and still name the
 three places found by hand.
 
-Limits: a text search per line, not a data-flow analysis (a FINITE TEST of the listed terms). It misses aliases
-(`const f = body.owner`), dynamic access (`body[key]`), destructuring (`const { owner: f } = body`), a term split over
-lines, and code that decides the same question under other names. The function name is a heuristic on indentation.
+**Decision reads only (AST), in TypeScript / JavaScript and Python.** In these files a line counts only where the
+watched field is READ in a decision. Each hit names its kind: `if-condition`, `early-return-guard`, `loop-condition`,
+`comparison` (`===`, `!==`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `instanceof`), `in`, `includes` (also `.has`,
+`.indexOf`, `.startsWith`, ...), `ternary`, `switch`, `case`, `logical-guard` (the left side of `&&` / `||`, not an
+`x || ''` default), `filter-predicate` / `find-predicate` / `predicate` (`filter`, `find`, `some`, `every`; Python
+comprehension `if`, `filter`, `any`, `all`), `assert`, `sql-where` (a parameter of a query whose SQL text has a
+`WHERE`), and `alias` (`const v = row.f` where `v` is read in a decision in the same function). Type and interface
+declarations, type annotations, imports, comments, string literals, plain assignment, object construction and
+logging are not hits. TS / JS files are parsed with the TypeScript compiler API (TypeScript 5.6.3, downloaded once
+into the cache and checked against its pinned SHA-256, as Dafny is; it only parses, it never runs the app); Python
+files with `ast`. Every other file (Go, Rust, Java, C#, data files) keeps the text search per line, labelled
+`text search, not AST`. A TS / JS / Python file that does not parse, or a machine without Node or without the
+TypeScript package (offline, `FORGE_NO_DOWNLOAD=1`), falls back to the text search for that file and the report
+says `FALLBACK to text search, not AST` with the reason: fail closed, never skipped. An approved `allowedBypasses`
+entry stays allowed by its line hash. `bypass --json` lists the text hits that are not decision reads under
+`"not_decisions"`.
+
+Measured on a copy of the same app with the bare terms (290 text lines): 76 hits remain, 46 decision reads found by
+the AST (all 46 checked by hand: each is a decision site) and 30 lines in data files (text search, not AST); the
+three places found by hand are still found. Of the 214 dropped lines, 85 were checked by hand: 81 are not decisions;
+4 feed a decision that the search cannot see (2 checks through a computed key, 2 inputs to a policy engine).
+
+Limits: a syntactic search, not a data-flow analysis (a FINITE TEST of the listed terms). It misses a value passed
+to another function or returned to a caller that decides, dynamic access (`body[key]`), and code that decides the
+same question under other names. The alias rule is name-based. The function name is a heuristic on indentation.
+
+## Callers: does every caller go through the proved code?
+
+A check may name its governed decision (the function the app calls for this question), the wrapper that calls the
+proved code, and the old logic the rule replaced:
+
+```json
+"callers": {"decision": "src/pricing.ts:canDiscount", "wrapper": "src/pricing-proved.ts:provedCanDiscount",
+            "replaced": ["src/legacy/discount.ts:oldCanDiscount"]}
+```
+
+(`"wrapper"` is optional: without it the decision itself is the wrapper. `"callers"` may be a list, for example one
+TypeScript and one Python decision.) For JavaScript/TypeScript and Python, `forge_check.py callers` builds a static
+call graph (`cli/forge_callgraph.py`: a JS/TS tokenizer and parser in Python, Python's `ast`; no Node, no
+dependencies). It follows named, default and namespace imports, import aliases (`import { a as b }`, `from m import a
+as b`, `import m as n`), re-exports (`export { a as b } from`, `export *`), `require`, and `const f = g` aliases. It
+lists as **UNVERIFIED**, with file:line and the enclosing function:
+
+- a call of (or a reference to) a `"replaced"` function, under any name;
+- a call by the decision's name (or a replaced function's name) that resolves to another function that does not
+  reach the wrapper, to a member it cannot resolve, or to nothing in the project (a re-implementation path);
+- the decision itself, when it no longer reaches the wrapper in the call graph.
+
+`check` gives `UNVERIFIED_CALLER` (exit 1) when the proof passes but an unverified caller is not in the check's
+`"allowedCallers"` (`{file, line_text_sha256, note}`, written by `callers --rule NAME --record FILE:LINE --note WHY`,
+approved with `forge.json` like `allowedBypasses`). A failed proof still wins. Test files are counted, not gated. A
+decision in another language says `callers not checked` (`NOT_CHECKED`, never a pass).
+
+**Feeders: the next rule to prove.** The same graph traces the unproved code that feeds the decision's parameters:
+each direct caller that computes an argument itself (not a plain pass-through of its own parameter), and each project
+function whose return value flows into an argument inside that caller (through local variables). They are ranked by
+leverage: 4 per parameter fed, 3 per decision fed, the number of callers (up to 10), 3 if a branch line names a
+`watchedFields` term, 1 if the function branches at all. `check` puts the top one in `next_rule` (and `/forge
+status` shows it): `prove checkout() (shop/checkout.ts:5, direct caller): feeds 3 of 3 parameters (amount, cap,
+spent), 3 callers, branches on watched fields (2 lines)`.
+
+**The status line.** `forge_check.py status` gives the one line the mod shows. Green: `forge ✓ model PROVED · 0
+bypasses · fuzz 1,500 ok · callers 3 ok · records current`. Yellow, naming the exact reason, when the proof still
+passes but something it rests on moved: a decision record describes code that changed (`decision note stale: …`), a
+wrapper file (the `"callers"` wrapper or a diff adapter) changed since the last approval or the last diff run with no
+disagreement (`wrapper changed since last approval/fuzz: …`), or a new unverified caller (`unverified caller
+file:line (check exits 1)`). Red `forge ✗` for any other failed verdict or a fuzz disagreement. It never says
+"end-to-end": the compilers, the runtime and the wrapper are not proved.
+
+Limits: a static analysis of the source, not a proof and not a type checker. It does not see dynamic dispatch
+(`obj[name]()`), `eval`, a function passed through a data structure and called later, tsconfig path aliases, package
+imports, or callers in other languages. A method call `x.decision()` on an object it cannot resolve is listed as
+unverified (fail closed), so an unrelated object method with the same name needs an `allowedCallers` entry. Data flow
+is traced one function deep (the direct caller and the functions it calls for the arguments), not through control
+flow. Measured on a copy of a private TypeScript app (135 tracked JS/TS and Python files, about 2.6 s): every caller found by
+hand was found, with no false hit; see the pull request for the numbers.
 
 ## INVARIANTS.md: every approved rule in one place
 
@@ -471,9 +638,11 @@ for `js` or JS/TS app files, Go for `go`; Java, Rust and .NET come from the runn
 
 | Gate | Runs | Fails with |
 | --- | --- | --- |
-| `check` | always | the proof (`FAILED`), `NOT_APPROVED`, `SPEC_CHANGED`, `CONFIG_CHANGED`, `BINDING_BROKEN`, `UNSOUND_CONSTRUCT` (included files too), `EXAMPLES_FAILED`, `UNAPPROVED_BYPASS` |
+| `check` | always | the proof (`FAILED`), `NOT_APPROVED`, `SPEC_CHANGED`, `CONFIG_CHANGED`, `BINDING_BROKEN`, `UNSOUND_CONSTRUCT` (included files too), `EXAMPLES_FAILED`, `UNAPPROVED_BYPASS`, `UNVERIFIED_CALLER` |
+| callers | when a check has `"callers"` (its own row in the summary) | `UNVERIFIED_CALLER`, the analysis did not run |
 | approvals against the base | when the event has a base: the pull request's base branch, the merge group's base commit, or the commit before a push | `APPROVAL_CHANGED` |
 | `build --check` | when a check has a `build` entry | `STALE_BUILD`, `APP_SYNTAX_ERROR`, `NOT_CALLED`, a target's fuzz |
+| serviceTest | when a check has a `build` `serviceTest` (run by `build --check`; its own row in the summary) | `NOT_CALLED`, `SERVICE_TEST_FAILED` |
 | `invariants --check` | always | `INVARIANTS_STALE` |
 | diff sweep | when a check has `diff` entries: 50,000 inputs per entry, a 600 s budget per entry, seed = the workflow run ID | `DISAGREE`, `THROWS_ON_MESSY_INPUT`, `TOOLCHAIN_MISSING` |
 
@@ -486,7 +655,8 @@ workflow run uses the same seed. On an event without a base (for example `workfl
 
 Inputs, all optional: `root`, `base` (a git ref, or `none` only for repositories whose approvals are test
 fixtures), `build`/`diff` (`auto` or `false`), `invariants` (`true` or `false`), `diff-inputs`,
-`diff-budget-seconds`, `diff-seed`, `dafny-version`, `node-version`, `go-version`. Outputs: `result` (`pass` or
+`diff-budget-seconds`, `diff-seed`, `diff-tier` (`ci` or `nightly`: input count, budget and steering from the
+tier in `forge.json`), `dafny-version`, `node-version`, `go-version`. Outputs: `result` (`pass` or
 `fail`) and `report` (a JSON file with every verdict). More in [docs/ci.md](docs/ci.md).
 
 `APPROVAL_CHANGED` means a person with the right to approve specs must review the change. To make this a lock,
@@ -560,6 +730,54 @@ messy inputs share the budget, so fewer plain inputs run (584 instead of 1,500 f
 
 Labels: the messy values are a fixed list, not every possible value; the fail-closed answer is the adapter's (the
 person's) choice, not proved; a run is a FINITE TEST.
+
+### State machines: trace fuzz (many events per case)
+
+Some bugs need two or more events: a retry applied twice, a field lost when the state is saved and loaded again, an
+expiry check that moves after a pause. One call per input cannot find them. For a model of the form
+`Step(State, Event, now) -> Ok(State) | Err(Reject)`, add a `"trace"` block to a `js` or `py` diff entry:
+
+```json
+{ "name": "js", "lang": "js", "inputs": "diff/subscription_events.py", "adapter": "diff/subscription_trace.mjs",
+  "trace": { "count": 2000, "budget_ms": 10000, "max_len": 10,
+             "retry": 0.15, "replay": 0.08, "reorder": 0.08, "restart": 0.06 } }
+```
+
+- The events module (Python, shared by every language) defines `event(rng, ctx)` and optionally `advance(rng)`
+  (clock ticks before an event), `start_time(rng)`, `event_in_domain(e)` and `trace_in_domain(steps)`.
+- The adapter exports `trace = { reference, candidates: { name: machine } }`; a machine has `init()`,
+  `step(state, event, now)` returning `{ ok: state }` or `{ reject: reason }`, `view(state)` (the JSON compared after
+  each step) and optionally `save(state)` / `load(saved)` (what a restart goes through). A rejected step keeps the
+  state object it got, so code that changes the state before it rejects is found.
+- The core (`cli/forge_trace.py`) generates seeded traces with the clock moving forward and injects faults: `retry`
+  (the same event again), `replay` (an older event again), `reorder` (two events swapped) and `restart` (save, then
+  load). It runs the model and every candidate over the same trace, compares verdict and state after every step,
+  and shrinks a failing trace by delta debugging: it drops chunks of events, then makes times and event fields
+  simpler, then drops again. Each failure prints its minimal trace, the step where it differs and an `again:`
+  command (same seed, `--inputs` = trace index + 1) that finds it again. Failing traces are saved and replay first.
+- `--inputs` sets the number of traces and `--budget-ms` the time budget for a run.
+
+Example: `examples/subscription-machine` (a subscription with Start, Renew, Pause, Resume and Cancel, and expiry by
+time). Its Dafny model is proved against `spec/SubscriptionSpec.dfy` (clauses M1–M7). The correct shipped code is
+`app/subscription.ts` and `.py`. Four planted copies (`app/subscription_planted.*`) each have one bug that needs two or
+more events. Measured on one machine (seed 7, 2,000 traces), each bug is caught in JS and Python, and each shrinks to
+its minimal trace:
+
+| Planted bug | Shrunk trace (steps) |
+| --- | --- |
+| `replay-off-by-one`: duplicate check `<` instead of `<=` (an immediate retry applies again) | 2 |
+| `pause-expiry`: after a Resume the expiry check is `>` instead of `>=` | 4 (Start, Pause, Resume, Pause at the expiry tick) |
+| `restart-drops-id`: `save()` leaves out `lastId` | 2 (Start, restart) |
+| `reject-leaks`: Renew changes the state before it checks expiry; the rejected step keeps the change | 2 |
+
+The correct code had 0 disagreements over 50,000 traces (about 275,000 steps) in each language. Wall time for
+50,000 traces, correct code only, one machine: JS 11.6–21.4 s, Python 11.2–17.0 s (five runs, one in a clean clone; the highest JS time
+was measured while other heavy work ran on the machine). Negative controls in `tests/run_tests.py`: with `max_len: 1`, no
+planted bug is found; with `restart: 0`, the restart bug is not found.
+
+Covered: JavaScript/TypeScript and Python evaluators, and any `"cmd"` program that speaks the trace protocol (see
+the top of `cli/forge_trace.py`). Not covered yet: the built Go, Rust, Java and C# evaluators. Labels: the traces
+are random and bounded (`max_len`), so a run is a FINITE TEST, not a proof about every sequence.
 
 See `PLAN.md` for what is built and what is not.
 

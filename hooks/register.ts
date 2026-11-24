@@ -6,6 +6,7 @@ import type { Register } from 'claude-code'
 //   /forge approve  you (not the agent) approve the current spec files
 //                   (/forge approve yes --hardware [--key KEY]: also sign the approval with a security key)
 //   /forge status   prints the last verdicts
+//   /forge crash-fuzz [file:function ...]   CRASH-CHECK (no spec): boundary functions called with messy JSON
 // Files in the project: .forge/forge.json (checks), .forge/approved.json (your approvals),
 // .forge/last-check.json (last verdicts).
 // LIMIT: this is a feedback loop, not a security boundary. The guard blocks Claude's
@@ -39,7 +40,12 @@ type LastCheck = {
   warnings?: string[]
   // places outside a rule that decide on its watched fields (written by `check` when a check has watchedFields)
   outside?: Record<string, unknown[]>
+  // the suggested next rule: an out-of-scope item of the decision record, and the top unproved feeder (call graph)
+  next_rule?: Record<string, { item?: string; code?: string[]; feeder?: { text: string; score: number } }>
 }
+// `forge_check.py status --json`: the one-line status. level: green ✓, yellow ⚠ (drift: a stale decision note, a
+// wrapper changed since the last approval or clean fuzz, a new unverified caller), red ✗, none (not set up / checked).
+type Status = { level: 'green' | 'yellow' | 'red' | 'none'; line: string; reasons: Array<{ kind: string; text: string }> }
 
 const DIR = '.forge'
 const CONFIG = `${DIR}/forge.json`
@@ -117,15 +123,35 @@ function scopeText(last: LastCheck | undefined, diff: LastDiff | undefined, cfg:
   return t
 }
 
+async function readStatus($: Api, root: string): Promise<Status | undefined> {
+  const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'status', '--root', root, '--json'], {
+    cwd: root,
+    timeoutMs: 20_000,
+  })
+  try {
+    const st = JSON.parse(r.stdout) as Status
+    return typeof st.line === 'string' ? st : undefined
+  } catch {
+    return undefined
+  }
+}
+
 async function refreshStatus($: Api) {
   const root: string = await $.session.root()
   const cfg = await readJson<Config>($, join(root, CONFIG))
   const last = await readJson<LastCheck>($, join(root, LAST))
-  let text = summary(last, cfg?.checks.length ?? 0)
+  // The checker computes the line (the same parts CI prints); the code below is the fallback if python3 fails.
+  const st = isChecking || isDiffing ? undefined : await readStatus($, root).catch(() => undefined)
+  if (st && !isStale) {
+    $.ui.status(cfg || last ? st.line : undefined)
+    return
+  }
+  let text = st ? st.line : summary(last, cfg?.checks.length ?? 0)
   if (cfg && isStale) text = `forge: code changed · ${text.replace(/^forge:? ?/, '')} · /forge check`
   if (isChecking) text = 'forge: checking…'
   const diff = await readJson<LastDiff>($, join(root, '.forge/last-diff.json'))
   if (isDiffing) text += ' · fuzzing…'
+  else if (st) { /* the checker's line already holds the fuzz and scope parts */ }
   else if (diff && Object.keys(diff.checks).length) {
     const rs = Object.values(diff.checks)
     const bad = rs.reduce((n, r) => n + (r.disagreements?.length ?? 0), 0)
@@ -137,7 +163,7 @@ async function refreshStatus($: Api) {
         ? ` · fuzz ✗ ${bad} disagreement(s), /forge diff`
         : ` · fuzzed ${inputs.toLocaleString('en-US')} cases, wrapper NOT proved`
   }
-  if (!isChecking && !isDiffing) text += scopeText(last, diff, cfg)
+  if (!isChecking && !isDiffing && !st) text += scopeText(last, diff, cfg)
   $.ui.status(cfg || last ? text : undefined)
 }
 
@@ -323,6 +349,21 @@ async function fuzzedFilesChanged($: Api): Promise<boolean> {
   return Object.keys(now).some(f => before[f] !== now[f])
 }
 
+// CRASH-CHECK (cli/forge_crash.py): no spec, no forge.json. The exported / route / webhook / parser functions are
+// called with messy JSON; every error that escapes one is listed with a shrunk repro. A finite test, never PROVED.
+async function runCrashFuzz($: Api, args: string[]): Promise<string> {
+  const root: string = await $.session.root()
+  const targets = args.filter(a => /^[^-].*:[A-Za-z_$][\w$]*$/.test(a)).flatMap(t => ['--target', t])
+  const extra = args.includes('--include-private') ? ['--include-private'] : []
+  const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_crash.py`, '--root', root, ...targets, ...extra], {
+    cwd: root,
+    timeoutMs: 600_000,
+  })
+  const text = (r.stdout || r.stderr).trim().slice(0, 8000)
+  if (!text) return `The crash check did not run (exit ${r.exitCode}). It needs python3 (and node for JavaScript/TypeScript).`
+  return r.exitCode === 1 ? `${text}\nFor an explanation and a proposed fix per crash: /forge:crash-fuzz` : text
+}
+
 // The differential fuzz: the code under test against the compiled proved rule (cli/forge_check.py diff).
 async function runDiff($: Api): Promise<string> {
   const root: string = await $.session.root()
@@ -371,7 +412,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'forge',
       description: 'Forge proof gate: next step, or check / approve / build / spec / status (conversations: /forge:scan, /forge:add, /forge:bypass)',
-      argumentHint: '[check|approve|approve yes [--hardware]|build|diff|invariants|mutate|mutate app|spec|status]',
+      argumentHint: '[check|approve|approve yes [--hardware]|build|diff|crash-fuzz [file:fn]|invariants|mutate|mutate app|spec|status]',
     })
     const r = await next(e)
     void refreshStatus($).catch(() => undefined)
@@ -395,6 +436,7 @@ export const register: Register = on => {
       return { text: await runBuild($, /^build\s+check\b/.test(e.args.trim())) }
     }
     if (arg === 'diff') return { text: await runDiff($) }
+    if (arg === 'crash-fuzz') return { text: await runCrashFuzz($, e.args.trim().split(/\s+/).slice(1)) }
     if (arg === 'invariants') {
       const root: string = await $.session.root()
       const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'invariants', '--root', root], { cwd: root, timeoutMs: 60_000 })
@@ -425,8 +467,15 @@ export const register: Register = on => {
       const cfg = await readJson<Config>($, join(root, CONFIG))
       const diff = await readJson<LastDiff>($, join(root, '.forge/last-diff.json'))
       if (!last) return { text: 'No check has run yet. Try /forge.' }
+      const st = await readStatus($, root).catch(() => undefined)
       const extra = [...(last.warnings ?? []).map(w => `! ${w}`)]
-      return { text: `${summary(last, 0)}${scopeText(last, diff, cfg)}\nlast run ${last.at}\n${JSON.stringify(last.verdicts, null, 2)}${extra.length ? '\n' + extra.join('\n') : ''}` }
+      // The suggested next rule: what the decision record assumes, and the unproved code that feeds the decision.
+      for (const [name, n] of Object.entries(last.next_rule ?? {})) {
+        if (n.feeder) extra.push(`next rule for ${name} (call graph): prove ${n.feeder.text}`)
+        else if (n.item) extra.push(`next rule for ${name}: "${n.item}" (${(n.code ?? []).join(', ')})`)
+      }
+      const head = st ? st.line : `${summary(last, 0)}${scopeText(last, diff, cfg)}`
+      return { text: `${head}\nlast run ${last.at}\n${JSON.stringify(last.verdicts, null, 2)}${extra.length ? '\n' + extra.join('\n') : ''}` }
     }
     // Steps where Claude talks with the person are Markdown commands (/forge:scan …). A command.run hook
     // cannot start a Claude turn, so put the right command in the prompt box: the person presses Enter.

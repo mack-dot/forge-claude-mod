@@ -543,6 +543,56 @@ def test_llm():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_m22():
+    """M2.2: Streamable HTTP, namespaced multi-upstream composition, roles (tests/m22_regress.py)."""
+    sys.path.insert(0, HERE)
+    import contextlib
+    import io
+    import m22_regress
+    log = io.StringIO()
+    with contextlib.redirect_stdout(log):  # the gateway's refusal lines; the cases print below
+        got = []
+        m22_regress.run(lambda name, ok, detail="": got.append((name, bool(ok), detail)))
+    for name, ok, detail in got:
+        case("m22: " + name, ok, detail)
+
+
+# Negative controls: the same M2.2 cases against an engine with ONE check removed must fail.
+M22_MUTANTS = [
+    ("arg rules removed (gates on HTTP)", "policy.py", "        for r in tp.rules:\n            r.check(args)\n", "",
+     "gates: deny / arg rule"),
+    ("role cap widening check removed", "policy.py", "                if c > tp.cap:\n", "                if False:\n",
+     "widening fails load: a cap above the base cap"),
+    ("namespacing collision check removed", "policy.py",
+     '            if self.namespace and (SEP in u["name"] or u["name"].endswith("_")):\n',
+     "            if False:\n", "namespacing collision fails load (upstream 'a__b')"),
+    ("listen-side session check removed", "gateway.py", "elif sid is not None and not A.touch_session(sid):",
+     "elif False:", "wrong Mcp-Session-Id is refused 404"),
+    ("upstream body size check removed (oversized body)", "mcp_client.py",
+     "                raw = r.read(MAX_RESPONSE + 1)\n                if len(raw) > MAX_RESPONSE:\n",
+     "                raw = r.read()\n                if False:\n", "planted fault oversize"),
+    ("upstream session id check removed (wrong session id)", "mcp_client.py",
+     "            elif sid is not None and sid != sent_session:\n", "            elif False:\n",
+     "planted fault wrong_session"),
+]
+
+
+def test_m22_controls():
+    for what, fname, old, new, needle in M22_MUTANTS:
+        tmp = tempfile.mkdtemp(prefix="m22-mutant-")
+        eng = os.path.join(tmp, "engine")
+        shutil.copytree(os.path.join(PKG, "engine"), eng, ignore=shutil.ignore_patterns("__pycache__"))
+        src = open(os.path.join(eng, fname)).read()
+        planted = src.count(old) == 1
+        open(os.path.join(eng, fname), "w").write(src.replace(old, new))
+        r = subprocess.run([sys.executable, os.path.join(HERE, "m22_regress.py"), "--only", needle],
+                           env=dict(os.environ, FORGE_ENGINE_DIR=eng), capture_output=True, text=True, timeout=300)
+        failed = [x for x in r.stdout.splitlines() if x.startswith("FAIL") and needle in x]
+        case(f"m22 negative control: {what} -> the case '{needle}' FAILS (exit {r.returncode})",
+             planted and r.returncode != 0 and failed, (planted, r.returncode, r.stdout[-300:]))
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_human_approval():
     """require_human_approval: hardware (tests/human_approval_test.py; software keys made at test time)."""
     sys.path.insert(0, HERE)
@@ -611,8 +661,8 @@ def test_names():
 
 
 def main():
-    for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static, test_redteam, test_human_approval, test_isolation, test_names,
-              test_inbox):
+    for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static,
+              test_redteam, test_human_approval, test_isolation, test_names, test_m22, test_m22_controls, test_inbox):
         try:
             t()
         except Exception as e:  # noqa: BLE001
