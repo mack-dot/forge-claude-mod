@@ -1717,8 +1717,10 @@ def write_json(root, rel, value):
 # A proof covers the proved function only. Code elsewhere that decides the same question itself (reads the same
 # field, repeats the same comparison) goes AROUND the rule. `bypass` searches the project for the check's
 # "watchedFields" outside the rule's own files and reports every place the person has not reviewed yet.
-# LIMIT: a text search per line, not a data-flow analysis. It misses aliases (`const f = body.owner`), dynamic
-# access (`body[key]`), terms split over lines, and code that decides the same question under other names.
+# In TS/JS and Python files a hit counts only where the field is READ in a decision (cli/forge_ast.py: an AST
+# search); other languages, and files that do not parse, keep the text search per line (fail closed).
+# LIMIT: not a data-flow analysis. It misses values passed to another function or returned, dynamic access
+# (`body[key]`), terms split over lines, and code that decides the same question under other names.
 
 LAST_BYPASS = DIR + '/last-bypass.json'
 BYPASS_SKIP_DIRS = {'.git', 'node_modules', 'dist', 'build', 'verified', DIR, 'vendor', 'third_party',
@@ -1892,39 +1894,72 @@ def run_bypass(root, override=None):
     out['no_terms'] = [c['name'] for c in cfg['checks'] if not c.get('watchedFields')]
     files = project_files(root) if with_terms else []
     cache = {}
+    decisions = _decisions_for(root, cfg, with_terms, files, cache)
     for c in with_terms:
         matchers = scope_matchers(c)
         own = rule_own_files(root, cfg, c)
         watched = {w for d in diff_entries(c) for w in d.get('watch') or []}
         reviewed = c.get('allowedBypasses') or []
         res = out['checks'][c['name']] = {'terms': [t for t, _ in matchers], 'hits': [], 'reviewed': 0,
-                                          'outdated_reviews': [], 'files_searched': 0}
+                                          'outdated_reviews': [], 'files_searched': 0, 'not_decisions': []}
+        searched = []
         used = set()
         for rel in files:
             if rel in own or any(o.endswith('/') and rel.startswith(o) for o in own):
                 continue
             res['files_searched'] += 1
-            if rel not in cache:
-                cache[rel] = read_text(os.path.join(root, rel)).replace('\r\n', '\n').split('\n')
-            lines = cache[rel]
+            searched.append(rel)
+            lines = _lines(root, rel, cache)
+            start = 0
             for i, text in enumerate(lines):
+                line_start, start = start, start + len(text) + 1
                 terms = [t for t, rx in matchers if rx.search(text)]
                 if not terms:
                     continue
                 h = line_sha(text)
                 match = [k for k, e in enumerate(reviewed) if e['file'] == rel and e['line_text_sha256'] == h]
-                if match:
+                if match:  # an approved line stays allowed, whether or not it is a decision read
                     used.update(match)
                     res['reviewed'] += 1
                     continue
-                res['hits'].append({'file': rel, 'line': i + 1, 'terms': terms, 'text': text.strip()[:200],
-                                    'function': enclosing_function(lines, i, rel), 'line_text_sha256': h,
-                                    'fuzzed_file': rel in watched})
+                hit, kind, method, reason = decisions.classify(rel, line_start, text,
+                                                               [rx for t, rx in matchers if t in terms])
+                entry = {'file': rel, 'line': i + 1, 'terms': terms, 'text': text.strip()[:200]}
+                if not hit:  # in a TS/JS/Python file that parsed, the field is not read in a decision here
+                    res['not_decisions'].append(entry)
+                    continue
+                entry.update({'function': enclosing_function(lines, i, rel), 'line_text_sha256': h,
+                              'fuzzed_file': rel in watched, 'decision': kind, 'method': method})
+                if reason:
+                    entry['fallback'] = reason
+                res['hits'].append(entry)
         res['outdated_reviews'] = [e for k, e in enumerate(reviewed) if k not in used]
+        res['search'] = decisions.summary(searched)
     k = sum(len(r['hits']) for r in out['checks'].values())
     out['unreviewed'] = k
     out['verdict'] = 'NO_SCOPE_TERMS' if not with_terms else 'BYPASS_FOUND' if k else 'BYPASS_CLEAR'
     return out
+
+
+def _lines(root, rel, cache):
+    if rel not in cache:
+        cache[rel] = read_text(os.path.join(root, rel)).replace('\r\n', '\n').split('\n')
+    return cache[rel]
+
+
+def _decisions_for(root, cfg, checks, files, cache):
+    """Parses (cli/forge_ast.py) every TS/JS/Python file with a text hit of any watched field, once per run."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import forge_ast
+    rxs = [rx for c in checks for _, rx in scope_matchers(c)]
+    texts = {}
+    for rel in files:
+        lines = _lines(root, rel, cache)
+        if any(rx.search(t) for t in lines for rx in rxs):
+            texts[rel] = '\n'.join(lines)
+    d = forge_ast.Decisions()
+    d.prime(texts)
+    return d
 
 
 def outside_of(root):
@@ -1934,7 +1969,8 @@ def outside_of(root):
     except Exception as e:  # the search must never crash `check`; checks with watchedFields fail closed (main)
         return {}, '%s: %s' % (type(e).__name__, e)
     return ({name: [{'file': h['file'], 'line': h['line'], 'function': h['function'], 'term': h['terms'][0],
-                     'text': h['text']} for h in r['hits']] for name, r in out['checks'].items()}, None)
+                     'text': h['text'], 'decision': h['decision'] or 'text search, not AST'} for h in r['hits']]
+             for name, r in out['checks'].items()}, None)
 
 
 def outside_lines(outside):
@@ -1975,9 +2011,10 @@ def gate_bypass(result, outside, error):
             result['detail'][name] = ('the proof passed, but %d place(s) outside the rule use its watchedFields and are '
                                       'not in its approved allowedBypasses:\n%s\nRoute each through the proved rule, '
                                       'or allow it (/forge:bypass) and approve forge.json again.' % (
-                                          len(hits), '\n'.join('  %s:%d%s  [%s]  %s' % (
+                                          len(hits), '\n'.join('  %s:%d%s  [%s]  (%s)  %s' % (
                                               h['file'], h['line'], '  in ' + h['function'] if h['function'] else '',
-                                              h['term'], h['text']) for h in hits[:40])
+                                              h['term'], h.get('decision') or 'text search, not AST', h['text'])
+                                              for h in hits[:40])
                                           + ('\n  … and %d more (forge_check.py bypass)' % (len(hits) - 40) if len(hits) > 40 else '')))
 
 
@@ -1991,10 +2028,16 @@ def bypass_report(out):
     for name, r in out['checks'].items():
         lines.append('  %s: %d file(s) searched for %s; %d hit(s), %d allowed (allowedBypasses)' % (
             name, r['files_searched'], ', '.join(r['terms']), len(r['hits']) + r['reviewed'], r['reviewed']))
+        se = r.get('search') or {}
+        lines.append('    with a term: %d file(s) parsed (AST: TS/JS, Python), %d file(s) by text search, not AST '
+                     '(other languages, or a fallback below); %d text hit(s) are not decision reads (bypass --json '
+                     'lists them under "not_decisions")' % (se.get('ast', 0), se.get('text', 0), len(r['not_decisions'])))
+        for f in se.get('fallback') or []:
+            lines.append('    FALLBACK to text search, not AST: %s: %s' % (f['file'], f['reason']))
         for h in r['hits']:
-            lines.append('    %s:%d  %s[%s]%s  %s' % (h['file'], h['line'], 'in %s  ' % h['function'] if h['function'] else '',
-                                                    ', '.join(h['terms']), '  (a fuzzed file)' if h['fuzzed_file'] else '',
-                                                    h['text']))
+            lines.append('    %s:%d  %s[%s]  (%s)%s  %s' % (
+                h['file'], h['line'], 'in %s  ' % h['function'] if h['function'] else '', ', '.join(h['terms']),
+                h['decision'] or 'text search, not AST', '  (a fuzzed file)' if h['fuzzed_file'] else '', h['text']))
         for e in r['outdated_reviews']:
             lines.append('    outdated allowed bypass (the line changed or is gone): %s: %s' % (e['file'], e.get('note', '')))
     if out['no_terms']:
@@ -2005,8 +2048,10 @@ def bypass_report(out):
     if k:
         lines.append('Each place may decide the same question as the proved rule without going through it. '
                      '/forge:bypass explains each one and records your answer.')
-    lines.append('A text search (FINITE TEST of the listed terms): it misses aliases, dynamic field access and '
-                 'other names for the same question.')
+    lines.append('A syntactic search (FINITE TEST of the listed terms): in TS/JS and Python only decision reads count '
+                 '(conditions, comparisons, includes/in, ternary, switch/case, &&/|| guards, predicates, aliases); other '
+                 'files are a text search, not AST. It misses values passed to another function or returned, dynamic '
+                 'field access and other names for the same question.')
     return '\n'.join(lines)
 
 
