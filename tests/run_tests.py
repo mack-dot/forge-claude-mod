@@ -1392,6 +1392,11 @@ def main():
         failed += not ok
         extra += 1
         print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
+    import crash_cases  # crash-fuzz (CRASH-CHECK), fuzz tiers and coverage-guided steering
+    for name, ok in crash_cases.cases():
+        failed += not ok
+        extra += 1
+        print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
     # signed approvals (S1): the rogue-agent exit gate, software ed25519 keys made at test time
     sig = subprocess.run([sys.executable, os.path.join(HERE, 'run_signed_approval.py')], stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, universal_newlines=True)

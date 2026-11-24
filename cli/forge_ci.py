@@ -319,9 +319,19 @@ def run(a):
         gate('diff', None, 'no check has a "diff" entry: app code NOT fuzzed', 'DISAGREE, THROWS_ON_MESSY_INPUT')
     else:
         seed = int(a.seed) if a.seed else int(os.environ.get('GITHUB_RUN_ID') or 0) % (2 ** 32) or 1
-        args = ['diff', '--no-write', '--inputs', str(a.inputs), '--budget-ms', str(int(a.budget_s) * 1000),
-                '--seed', str(seed)]
-        print('::group::forge diff (%s inputs, budget %s s per entry, seed %d)' % (fmt(a.inputs), a.budget_s, seed))
+        if a.tier:  # forge.json "fuzz.tiers" (cli/forge_steer.py) instead of diff-inputs / diff-budget-seconds
+            import forge_steer
+            try:
+                t = forge_steer.tier(cfg, a.tier)
+            except forge_steer.TierError as e:
+                raise fc.ConfigError(str(e))
+            a.inputs, a.budget_s = t['inputs'], max(1, t['budget_ms'] // 1000)
+            args = ['diff', '--no-write', '--tier', a.tier, '--seed', str(seed)]
+        else:
+            args = ['diff', '--no-write', '--inputs', str(a.inputs), '--budget-ms', str(int(a.budget_s) * 1000),
+                    '--seed', str(seed)]
+        print('::group::forge diff (%s%s inputs, budget %s s per entry, seed %d)' % (
+            'tier %s: ' % a.tier if a.tier else '', fmt(a.inputs), a.budget_s, seed))
         code, res_d, raw = call(args, root)
         print(fc.diff_report(res_d) if res_d and 'checks' in res_d else raw)
         print('::endgroup::')
@@ -367,7 +377,9 @@ def run(a):
         cmd.append('python3 %s build --check --no-write --root %s' % (fcp, rel))
     if inv_ok is not None:
         cmd.append('python3 %s invariants --check --root %s' % (fcp, rel))
-    if seed is not None:
+    if seed is not None and a.tier:
+        cmd.append('python3 %s diff --no-write --root %s --tier %s --seed %d' % (fcp, rel, a.tier, seed))
+    elif seed is not None:
         cmd.append('python3 %s diff --no-write --root %s --inputs %d --budget-ms %d --seed %d'
                    % (fcp, rel, a.inputs, int(a.budget_s) * 1000, seed))
     lines += ['', 'Reproduce locally, in this repository:', '', '```sh', '\n'.join(cmd), '```', '',
@@ -400,6 +412,8 @@ def main(argv=None):
     ap.add_argument('--inputs', type=int, default=50000)
     ap.add_argument('--budget-s', type=int, default=600)
     ap.add_argument('--seed', default='')
+    ap.add_argument('--tier', default='', choices=['', 'ci', 'nightly'],
+                    help="diff sweep from forge.json fuzz.tiers (ci, nightly) instead of --inputs/--budget-s")
     ap.add_argument('--report', default='')
     a = ap.parse_args(argv)
     if a.command == 'base':

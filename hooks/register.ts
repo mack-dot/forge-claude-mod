@@ -6,6 +6,7 @@ import type { Register } from 'claude-code'
 //   /forge approve  you (not the agent) approve the current spec files
 //                   (/forge approve yes --hardware [--key KEY]: also sign the approval with a security key)
 //   /forge status   prints the last verdicts
+//   /forge crash-fuzz [file:function ...]   CRASH-CHECK (no spec): boundary functions called with messy JSON
 // Files in the project: .forge/forge.json (checks), .forge/approved.json (your approvals),
 // .forge/last-check.json (last verdicts).
 // LIMIT: this is a feedback loop, not a security boundary. The guard blocks Claude's
@@ -348,6 +349,21 @@ async function fuzzedFilesChanged($: Api): Promise<boolean> {
   return Object.keys(now).some(f => before[f] !== now[f])
 }
 
+// CRASH-CHECK (cli/forge_crash.py): no spec, no forge.json. The exported / route / webhook / parser functions are
+// called with messy JSON; every error that escapes one is listed with a shrunk repro. A finite test, never PROVED.
+async function runCrashFuzz($: Api, args: string[]): Promise<string> {
+  const root: string = await $.session.root()
+  const targets = args.filter(a => /^[^-].*:[A-Za-z_$][\w$]*$/.test(a)).flatMap(t => ['--target', t])
+  const extra = args.includes('--include-private') ? ['--include-private'] : []
+  const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_crash.py`, '--root', root, ...targets, ...extra], {
+    cwd: root,
+    timeoutMs: 600_000,
+  })
+  const text = (r.stdout || r.stderr).trim().slice(0, 8000)
+  if (!text) return `The crash check did not run (exit ${r.exitCode}). It needs python3 (and node for JavaScript/TypeScript).`
+  return r.exitCode === 1 ? `${text}\nFor an explanation and a proposed fix per crash: /forge:crash-fuzz` : text
+}
+
 // The differential fuzz: the code under test against the compiled proved rule (cli/forge_check.py diff).
 async function runDiff($: Api): Promise<string> {
   const root: string = await $.session.root()
@@ -396,7 +412,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'forge',
       description: 'Forge proof gate: next step, or check / approve / build / spec / status (conversations: /forge:scan, /forge:add, /forge:bypass)',
-      argumentHint: '[check|approve|approve yes [--hardware]|build|diff|invariants|mutate|mutate app|spec|status]',
+      argumentHint: '[check|approve|approve yes [--hardware]|build|diff|crash-fuzz [file:fn]|invariants|mutate|mutate app|spec|status]',
     })
     const r = await next(e)
     void refreshStatus($).catch(() => undefined)
@@ -420,6 +436,7 @@ export const register: Register = on => {
       return { text: await runBuild($, /^build\s+check\b/.test(e.args.trim())) }
     }
     if (arg === 'diff') return { text: await runDiff($) }
+    if (arg === 'crash-fuzz') return { text: await runCrashFuzz($, e.args.trim().split(/\s+/).slice(1)) }
     if (arg === 'invariants') {
       const root: string = await $.session.root()
       const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'invariants', '--root', root], { cwd: root, timeoutMs: 60_000 })

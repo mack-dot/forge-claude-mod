@@ -13,6 +13,9 @@
 // wrapper(input) or wrappers { name: input => output }, which call the app's REAL wrapper with the raw values, and
 // failClosed(input), the spec's fail-closed answer for a value the proved rule does not take (return undefined when
 // the proved rule takes it). Messy inputs go only to the wrappers; {"__undefined__": true} in them becomes undefined.
+//
+// Steered runs (cli/forge_steer.py, node_steer.mjs): with FORGE_STEER_FILES set, a plain answer may carry
+// "novel": [n, ...], the numbers of plain inputs (0, 1, ...) that reached a block of a watched file first.
 import { createRequire, Module } from 'node:module'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
@@ -47,6 +50,12 @@ const plain = x => {
 }
 const write = obj => JSON.stringify(plain(obj), (k, x) => (typeof x === 'bigint' ? JSON.rawJSON(x.toString()) : x))
 
+// Before the adapter loads, so the watched files' blocks are counted from their first run.
+const steer = process.env.FORGE_STEER_FILES
+  ? (await import('./node_steer.mjs')).start(JSON.parse(process.env.FORGE_STEER_FILES), process.env.FORGE_STEER_OUT,
+    Number(process.env.FORGE_STEER_BATCH || 16))
+  : null
+let seq = 0
 const adapter = await import(pathToFileURL(adapterPath).href)
 
 // Trace mode (cli/forge_trace.py): the adapter exports trace = { reference: machine, candidates: { name: machine } },
@@ -160,5 +169,10 @@ for await (const line of lines(process.stdin)) {
   }
   const out = { reference: call(adapter.reference, input), candidates: {} }
   for (const n of names) out.candidates[n] = call(all[n], input)
+  if (steer) {
+    const novel = steer.plain(seq++, () => { for (const n of names) call(all[n], input) })
+    if (novel.length) out.novel = novel
+  }
   process.stdout.write(write(out) + '\n')
 }
+if (steer) steer.finish()

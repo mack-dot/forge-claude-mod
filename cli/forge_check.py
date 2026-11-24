@@ -11,6 +11,7 @@ Usage:
   forge_check.py mutate  [--root DIR] [--json] [--max N]
   forge_check.py mutate  --app [--root DIR] [--json] [--max N] [--inputs N] [--seed S] [--langs py,js,...]
   forge_check.py diff    [--root DIR] [--json] [--inputs N] [--budget-ms MS] [--seed S] [--coverage]
+                         [--tier local|ci|nightly] [--steer|--no-steer]   (cli/forge_steer.py)
   forge_check.py invariants [--root DIR] [--check]   (INVARIANTS.md: every approved rule in plain words)
   forge_check.py bypass  [--root DIR] [--json]       (code outside the rule that reads its "watchedFields")
   forge_check.py bypass  --rule NAME --set-terms TERM...  |  --rule NAME --record FILE:LINE --note TEXT
@@ -1230,14 +1231,23 @@ def build_is_fresh(root, c):
     return sorted(sources) == sorted(want) and all(sources[f] == sha256(inside(root, f)) for f in want)
 
 
-def run_diff(root, inputs=None, budget_ms=None, seed=None, coverage=False, only=None):
+def run_diff(root, inputs=None, budget_ms=None, seed=None, coverage=False, only=None, tier=None, steer=None):
     """Runs every diff entry through the language-neutral core (forge_diff.py). coverage: also measure which lines
-    and branches of the watched files the run reached (forge_coverage.py). only: run just these diff keys."""
+    and branches of the watched files the run reached (forge_coverage.py). only: run just these diff keys.
+    tier: local (default), ci or nightly (forge_steer.py: input count, time budget, steering). steer: True/False
+    overrides the tier's steering."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import forge_diff
+    import forge_steer
     cfg = load_config(root)
+    try:
+        tset = forge_steer.tier(cfg, tier)
+    except forge_steer.TierError as e:
+        raise ConfigError(str(e))
+    steer = tset['steer'] if steer is None else steer
     here = os.path.dirname(os.path.abspath(__file__))
-    out = {'at': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'), 'checks': {}}
+    out = {'at': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'), 'checks': {},
+           'tier': tset['name']}
     jobs = []
     for c in cfg['checks']:
         entries = diff_entries(c)
@@ -1255,8 +1265,9 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None, coverage=False, only=
             res['verdict'] = 'BUILD_STALE'
             res['detail'] = 'the compiled proved code does not match the current Dafny files: run build'
             continue
-        n = inputs if inputs is not None else df.get('inputs_per_run', 1500)
-        ms = budget_ms if budget_ms is not None else df.get('budget_ms', 1500)
+        local = tset['name'] == 'local'  # an entry's own numbers apply to the local tier only
+        n = inputs if inputs is not None else df.get('inputs_per_run', tset['inputs']) if local else tset['inputs']
+        ms = budget_ms if budget_ms is not None else df.get('budget_ms', tset['budget_ms']) if local else tset['budget_ms']
         s = seed if seed is not None else int.from_bytes(os.urandom(4), 'little')
         env = dict(os.environ)
         if df['lang'] == 'js':
@@ -1300,7 +1311,14 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None, coverage=False, only=
         else:
             cmd = list(df['run'])
         cov = None
-        if coverage:
+        st = forge_steer.make(df, root, steer)
+        if st:
+            cmd, env = st.wrap(cmd, env)
+        elif steer:
+            res['steer_note'] = 'not steered (%s): blind random inputs' % (
+                'no per-input coverage for %s' % df['lang'] if df['lang'] not in forge_steer.STEERED_LANGS
+                else 'no "watch" files')
+        if coverage and not st:  # a steered run measures coverage itself
             import forge_coverage
             cov = forge_coverage.Session(df['lang'], root, df.get('watch'))
             cmd, env = cov.wrap(cmd, env)
@@ -1312,11 +1330,13 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None, coverage=False, only=
         else:
             data = forge_diff.run_entry(cmd, root, env, inside(root, df['inputs']), s, n, ms,
                                         os.path.join(root, REGRESSIONS, key.replace(':', '-')),
-                                        messy=df.get('messy', True) is not False)
+                                        messy=df.get('messy', True) is not False, steer=st)
         data['repro'] = [sys.executable, os.path.abspath(__file__), 'diff', '--root', root, '--seed', str(s)]
         res.update(data)
         if cov:
             res['coverage'] = cov.collect()
+        if st:
+            res['coverage'] = st.collect()
         if data.get('error') and 'Unknown file extension ".ts"' in data['error']:
             res['verdict'] = 'TOOLCHAIN_MISSING'
             res['detail'] = ('this Node cannot import TypeScript directly (%s); it needs Node 22.18 or newer'
@@ -1431,6 +1451,8 @@ def diff_report(out):
         if r.get('coverage'):
             import forge_coverage
             lines.extend(forge_coverage.report_lines(r['coverage']))
+        import forge_steer
+        lines.extend(forge_steer.report_lines(r))
     return '\n'.join(lines)
 
 
@@ -2408,6 +2430,11 @@ def main(argv=None):
     p.add_argument('--seed', type=int, help='diff: random seed (default: a fresh one each run)')
     p.add_argument('--coverage', action='store_true', help='diff: also report the lines and branches of the watched '
                                                            'files that the run reached (slower)')
+    p.add_argument('--tier', choices=['local', 'ci', 'nightly'], help='diff: input count, time budget and steering '
+                                                                    'from forge.json "fuzz.tiers" (default local)')
+    p.add_argument('--steer', action='store_true', default=None, help='diff: steer the inputs by per-input coverage '
+                                                                     '(py and js entries; default: the tier says)')
+    p.add_argument('--no-steer', dest='steer', action='store_false', default=None, help='diff: blind random inputs')
     p.add_argument('--app', action='store_true', help='mutate: plant bugs in the shipped code (diff "watch" files) '
                                                       'and run the diff on each, instead of in the Dafny files')
     p.add_argument('--langs', help='mutate --app: diff entry languages to mutate (default py,js; "all" adds the '
@@ -2481,7 +2508,7 @@ def main(argv=None):
         if a.command == 'diff':
             if hasattr(sys.stdout, 'reconfigure'):
                 sys.stdout.reconfigure(errors='backslashreplace')  # messy inputs may hold a lone surrogate
-            out = run_diff(root, a.inputs, a.budget_ms, a.seed, coverage=a.coverage)
+            out = run_diff(root, a.inputs, a.budget_ms, a.seed, coverage=a.coverage, tier=a.tier, steer=a.steer)
             if not a.no_write:
                 update_diff_stats(root, out)
                 write_json(root, LAST_DIFF, out)
