@@ -10,6 +10,7 @@
 #     image): this tunnel is its only way out;
 #  5. runs the job's command as job.uid in a new session on /dev/hvc0 (the host's stdio);
 #  6. writes "FORGE-VM-RC <nonce> <exit code>" to /dev/hvc1 and powers the VM off.
+#     The command starts only after the tunnel's host end answered (HELLO, vsockmux.open_tunnel).
 # Label: NATIVE CHECK (hand-written, not proved).
 import json
 import os
@@ -57,8 +58,8 @@ def relays(forwards):
     127.0.0.1:<port> per forward; each accepted connection becomes a stream of the tunnel."""
     if not forwards:
         return
-    link = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
-    link.connect((socket.VMADDR_CID_HOST, vsockmux.MUX_PORT))
+    vsockmux._dbg("guest: connecting the tunnel")
+    link = vsockmux.open_tunnel(vsockmux.vsock_connector(socket.VMADDR_CID_HOST, vsockmux.MUX_PORT))  # waits for HELLO
     mux = vsockmux.Mux(link)
     for f in forwards:
         port = int(f["port"])
@@ -70,6 +71,7 @@ def relays(forwards):
         def serve(srv=srv, port=port):
             while True:
                 c, _ = srv.accept()
+                vsockmux._dbg(f"guest: accepted a client on :{port}")
                 mux.connect(port, c)
         threading.Thread(target=serve, daemon=True).start()
 
@@ -109,6 +111,8 @@ def main():
         job = json.load(open("/forge-ctl/job.json"))
         sh("umount", "/forge-ctl")
         nonce = job["nonce"]
+        if job.get("debug"):
+            vsockmux.DEBUG = log
         for m in sorted(job.get("mounts", []), key=lambda m: m["target"].count("/")):  # parents first
             os.makedirs(m["target"], exist_ok=True)
             sh("mount", "-t", "virtiofs", "-o", ("ro," if m.get("ro") else "") + "nosuid,nodev", m["tag"], m["target"])

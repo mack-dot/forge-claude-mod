@@ -132,6 +132,7 @@ class HostRelay:
         os.chmod(path, 0o600)
         self.srv.listen(4)
         self.count, self.refused = 0, 0
+        self.drop_first = bool(os.environ.get("FORGE_VFKIT_TEST_DROP_FIRST_TUNNEL"))
         threading.Thread(target=self.serve, daemon=True).start()
 
     def open(self, _sid, port):
@@ -139,8 +140,10 @@ class HostRelay:
         if target is None:
             self.refused += 1
             return None
+        vsockmux._dbg(f"host open sid={_sid} port={port} -> {target}")
         s = socket.create_connection(target, timeout=10)
         s.settimeout(None)
+        vsockmux._dbg(f"host connected sid={_sid}")
         self.count += 1
         return s
 
@@ -150,6 +153,12 @@ class HostRelay:
                 c, _ = self.srv.accept()
             except OSError:
                 return
+            vsockmux._dbg("host: vfkit connected the tunnel")
+            if self.drop_first:  # test knob: the failure seen at boot (host end dropped, no error in the guest)
+                self.drop_first = False
+                vsockmux._dbg("host: TEST: dropping this tunnel without HELLO")
+                c.close()
+                continue
             vsockmux.Mux(c, on_open=self.open)
 
     def close(self):
@@ -165,6 +174,18 @@ def run(argv, shares=(), forwards=(), env=None, uid=1000, gid=1000, cwd="/", tty
     shares: [(tag, host_dir, guest_dir, read_only)]; forwards: [(port, (host, hostport), [names])].
     Raises Unavailable before anything starts if vfkit / the image / virtualization is missing."""
     vf, img = preflight(cache)
+    dbg = os.environ.get("FORGE_VFKIT_DEBUG")  # a folder: host trace and the guest console log go there
+    if dbg:
+        os.makedirs(dbg, exist_ok=True)
+        _lock = threading.Lock()
+        hostlog = os.path.join(dbg, f"host-{os.getpid()}-{int(time.time() * 1000)}.log")
+
+        def _w(m, _p=hostlog):
+            with _lock, open(_p, "a") as f:
+                f.write(m + "\n")
+        vsockmux.DEBUG = _w
+        if log_path is None:
+            log_path = hostlog.replace("host-", "console-")
     work = tempfile.mkdtemp(prefix="fvm-", dir="/tmp")  # short: unix socket paths are limited to 104 bytes
     os.chmod(work, 0o700)
     ctl = os.path.join(work, "ctl")
@@ -173,7 +194,7 @@ def run(argv, shares=(), forwards=(), env=None, uid=1000, gid=1000, cwd="/", tty
     job = {"nonce": nonce, "argv": list(argv), "env": dict(env or {}), "uid": uid, "gid": gid, "cwd": cwd,
            "tty": bool(tty), "mounts": [{"tag": t, "target": g, "ro": bool(ro)} for t, _h, g, ro in shares],
            "forwards": [{"port": int(p), "names": list(n)} for p, _t, n in forwards],
-           "ro_paths": list(ro_paths), "nat": bool(nat_control)}
+           "ro_paths": list(ro_paths), "nat": bool(nat_control), "debug": bool(os.environ.get("FORGE_VFKIT_DEBUG"))}
     with open(os.path.join(ctl, "job.json"), "w") as f:
         json.dump(job, f)
     log_path = log_path or os.path.join(work, "console.log")

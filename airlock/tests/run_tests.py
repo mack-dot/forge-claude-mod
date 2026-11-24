@@ -688,6 +688,40 @@ def test_vfkit():
     finally:
         os.environ.clear()
         os.environ.update(old)
+    # tunnel readiness (guest/vsockmux.open_tunnel): the boot race seen in validate.sh, where the guest's
+    # vsock connect succeeds but vfkit drops the host end and the guest's frames vanish
+    import socket as so
+    sys.path.insert(0, os.path.join(PKG, "backends", "guest"))
+    import vsockmux as MX
+    tries, keep = [], []
+
+    def flaky(timeout):  # 1st connection: the host end is dropped at once; 2nd: the host says HELLO
+        a, b = so.socketpair()
+        tries.append(1)
+        keep.append(a)
+        if len(tries) == 1:
+            b.close()
+        else:
+            b.sendall(MX.HDR.pack(MX.HELLO, 0, 0))
+            keep.append(b)
+        return a
+    try:
+        got = MX.open_tunnel(flaky, deadline_s=5, hello_s=0.5)
+        ok = got is not None and len(tries) == 2
+    except OSError:
+        ok = False
+    case("vfkit: tunnel: a dropped host end is detected (no HELLO) and the guest connects again", ok, len(tries))
+
+    def silent(timeout):  # the host end never answers
+        a, b = so.socketpair()
+        keep.extend([a, b])
+        return a
+    t0 = time.monotonic()
+    case("vfkit: tunnel: negative control: no HELLO at all -> OSError within the deadline (the VM fails closed)",
+         raises(lambda: MX.open_tunnel(silent, deadline_s=1.0, hello_s=0.3), OSError, "no HELLO")
+         and time.monotonic() - t0 < 3)
+    for x in keep:
+        x.close()
     t = VI.Tree()
     t.file("b", b"2")
     t.file("a/x", b"1", 0o755)
