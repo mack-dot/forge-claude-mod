@@ -16,7 +16,9 @@ proved rule, in any language, through a small line protocol:
 
   messy inputs (the wrapper that turns app/JSON values into Dafny values, which is not proved):
       the hello line may also name {"messy": ["wrapper", ...]}: candidates that take RAW host values; and
-      {"undefined": true} if the language has `undefined` (JavaScript).
+      {"undefined": true} if the language has `undefined` (JavaScript); {"skip": ["lone-surrogate", ...]}: messy kinds
+      the language's JSON parser cannot carry (Rust: serde_json rejects a lone surrogate); these are not sent and
+      are listed under "skipped_kinds" in the result.
       Then the core also sends {"input": <json>, "messy": true}: a generated input with ONE field replaced by an
       odd value (undefined, null, a number, a boolean, "", a lone surrogate, a very long text, an array, an object,
       the number as text) or removed. `undefined` travels as {"__undefined__": true}; the evaluator turns it into
@@ -24,7 +26,8 @@ proved rule, in any language, through a small line protocol:
       adapter's fail-closed answer (failClosed / fail_closed), or, where that returns undefined/None (the value
       is one the proved rule takes), the proved rule's answer. A throw from a messy candidate is always a
       disagreement of kind THROWS_ON_MESSY_INPUT.
-  Forge ships evaluators for JavaScript/TypeScript (cli/eval/node_eval.mjs) and Python (cli/eval/py_eval.py).
+  Forge ships evaluators for JavaScript/TypeScript (cli/eval/node_eval.mjs), Python (cli/eval/py_eval.py), and Go,
+  Rust, Java and C# (cli/eval/<lang>/, built by eval_build.py); all of them take messy inputs.
   Any other language (Go, Rust, Java, C#, ...) plugs in as a "cmd" entry: a program that speaks the protocol.
   State machines (many events per case, with retries, replays, reordering and restarts) use the trace mode of the
   same evaluators: see cli/forge_trace.py.
@@ -194,16 +197,21 @@ def _get(v, path):
     return v
 
 
+LONG_TEXT = 'x' * 20000
+
+
 def messy_value(kind, orig):
     """The odd value of this kind for a field whose generated value is `orig`; None if it does not apply."""
     num = isinstance(orig, (int, float)) and not isinstance(orig, bool)
-    vals = {'undefined': UNDEFINED, 'null': None, 'number': 1.5 if num else 7, 'boolean': not orig if isinstance(orig, bool) else True,
-            'empty-text': '', 'lone-surrogate': '\ud800', 'long-text': 'x' * 20000, 'array': [], 'object': {},
-            'number-as-text': str(orig) if num else None}
-    v = vals.get(kind)
     if kind == 'number-as-text' and not num:
         return None
-    if v is not None and canon(v) == canon(orig) or kind == 'null' and orig is None:
+    vals = {'undefined': UNDEFINED, 'null': None, 'number': 1.5 if num else 7, 'boolean': not orig if isinstance(orig, bool) else True,
+            'empty-text': '', 'lone-surrogate': '\ud800', 'long-text': LONG_TEXT, 'array': [], 'object': {},
+            'number-as-text': str(orig) if num else None}
+    v = vals.get(kind)
+    # The same JSON value as before (same type and equal; 1 and True differ): not messy. Cheaper than canon(), which
+    # wrote the 20,000-character text once per field and kind (about 40% of a messy run's time).
+    if v is not None and type(v) is type(orig) and v == orig or kind == 'null' and orig is None:
         return None
     return ('set', v)
 
@@ -260,6 +268,7 @@ class Evaluator:
         self.messy = [n for n in hello.get('messy') or [] if n in self.candidates]
         self.has_undefined = hello.get('undefined') is True
         self.trace_mode = hello.get('trace') is True  # the adapter exports machines (cli/forge_trace.py)
+        self.skip_kinds = [k for k in hello.get('skip') or [] if k in MESSY_KINDS]
 
     def _stderr(self):
         try:
@@ -337,10 +346,12 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
 
         # ---- messy inputs: one field of a generated input made odd; judged against the fail-closed answer.
         mnames = ev.messy if messy else []
-        kinds = [k for k in MESSY_KINDS if k != 'undefined' or ev.has_undefined]
+        kinds = [k for k in MESSY_KINDS if (k != 'undefined' or ev.has_undefined) and k not in ev.skip_kinds]
         skip = set(getattr(gen, 'messy_skip', []) or [])
         mcache = {}
         mstats = {'inputs': 0, 'pairs_tried': 0, 'not_judged': 0, 'candidates': mnames, 'kinds': kinds}
+        if ev.skip_kinds:
+            mstats['skipped_kinds'] = ev.skip_kinds  # the evaluator's language cannot carry these (said in the report)
 
         def m_outputs(inp):
             key = canon(inp)
