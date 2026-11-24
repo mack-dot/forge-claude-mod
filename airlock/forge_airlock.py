@@ -3,8 +3,8 @@
 
   forge init  [--repo R] [--tools tools.json] [--force] [--json]   draft forge.yaml (secrets by NAME only)
   forge tools [--repo R] [--policy P]                              list the real tools of each upstream
-  forge check [--repo R] [--policy P]                              validate forge.yaml (exit 2 if invalid)
-  forge up    [--repo R] [--policy P] [--pass-env NAME]... [--isolation docker|gvisor|microvm] -- <command> [args...]
+  forge check [--repo R] [--policy P] [--role NAME]                validate forge.yaml (exit 2 if invalid)
+  forge up    [--repo R] [--policy P] [--role NAME] [--pass-env NAME]... [--isolation docker|gvisor|microvm] -- <command> [args...]
   forge reset-logs [--repo R]                                      delete this repository's gate logs
   forge wrapper [--repo R] [--force]                               write ./forge-airlock (init does it too)
 
@@ -114,11 +114,12 @@ def build_images(claude):
             raise SystemExit("forge-airlock: agent image build failed")
 
 
-def load_policy(policy_path):
+def load_policy(policy_path, role=None):
     """Validate forge.yaml in the airlock image (PyYAML lives there) and return the host-side
-    Policy with ${NAMES} kept (no secret is read on the host)."""
+    Policy with ${NAMES} kept (no secret is read on the host). role: one entry of `roles:`
+    (narrowed policy); an unknown role is invalid (fail closed)."""
     r = out(["docker", "run", "--rm", "--network", "none", "-v", f"{os.path.abspath(policy_path)}:/p/forge.yaml:ro",
-             IMAGE, "python3", "-I", "/forge/airlock/policy.py", "check", "/p/forge.yaml"])
+             IMAGE, "python3", "-I", "/forge/airlock/policy.py", "check", "/p/forge.yaml"] + ([role] if role else []))
     try:
         res = json.loads(r.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):
@@ -126,7 +127,12 @@ def load_policy(policy_path):
     if not res.get("ok"):
         say(f"forge.yaml is invalid: {res.get('error')}")
         raise SystemExit(EXIT_POLICY)
-    return Policy(res["doc"], resolve=False), res["doc"]
+    return Policy(res["doc"], resolve=False, role=role), res["doc"]
+
+
+def role_of(a):
+    """--role NAME, else $FORGE_ROLE, else None (the base policy)."""
+    return getattr(a, "role", None) or os.environ.get("FORGE_ROLE") or None
 
 
 # ---------------------------------------------------------------- staging
@@ -167,7 +173,12 @@ def stage_repo(repo, dest):
 
 # ---------------------------------------------------------------- compose generation
 def compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, pass_env, readonly_dirs,
-                own_agent_image=False, llm_session="default", egress_token=None, agent_runtime=None, vm_ws=None):
+                own_agent_image=False, llm_session="default", egress_token=None, agent_runtime=None, vm_ws=None,
+                host_binds=True):
+    """host_binds=False (forge up): the agent container gets NO bind mount of a host folder. Its
+    /forge-run (and /forge/agent for --agent-image) come from the project volume `agentrun`, filled
+    by seed_agent_volume() before the start. M2.3: a bind mount shows its HOST path in the agent's
+    /proc/self/mountinfo (the run folder, the plugin folder under your home directory)."""
     agent_env = {"FORGE_AIRLOCK": f"http://airlock:{PORT}", "HOME": "/tmp"}
     if pol.egress_allow:
         agent_env.update(HTTPS_PROXY="http://egress:3128", HTTP_PROXY="http://egress:3128",
@@ -191,7 +202,7 @@ def compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, pass
             "image": IMAGE, "command": ["python3", "-I", "/forge/airlock/gateway.py"],
             "environment": ["FORGE_SOURCE=/source", "FORGE_POLICY=/forge/forge.yaml", "FORGE_WS_RAW=/ws-raw",
                             "FORGE_CANARY_TOKEN"]  # F7: value from this process only (see cmd_up)
-            + list(pol.env_names) + airlock_env,
+            + ([f"FORGE_ROLE={pol.role}"] if pol.role else []) + list(pol.env_names) + airlock_env,
             "volumes": [f"{os.path.abspath(policy_path)}:/forge/forge.yaml:ro", f"{stage}:/source:ro",
                         "logs:/data", "state:/state", "ws:/ws-raw"],
             # CAP_SYS_ADMIN only for the nosymfollow bind mount of the workspace (gap 1); AppArmor's
@@ -205,8 +216,11 @@ def compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, pass
         "agent": dict(harden, **{
             "image": agent_image, "user": "1000:1000", "tmpfs": ["/tmp:exec,mode=1777"],
             "environment": agent_env_list, "working_dir": pol.agent_root,
-            "volumes": [f"ws:{pol.agent_root}"] + ro_mounts + [f"{run_dir}/agent:/forge-run:ro"]
-            + ([f"{HERE}/agent:/forge/agent:ro"] if own_agent_image else []),
+            "volumes": [f"ws:{pol.agent_root}"] + ro_mounts + (
+                [f"{run_dir}/agent:/forge-run:ro"] + ([f"{HERE}/agent:/forge/agent:ro"] if own_agent_image else [])
+                if host_binds else
+                [_sub("agentrun", "run", "/forge-run")] + ([_sub("agentrun", "agent", "/forge/agent")]
+                                                          if own_agent_image else [])),
             "networks": ["agentnet"], "stdin_open": True, "tty": True,
             "depends_on": {"airlock": {"condition": "service_healthy"}},
         }),
@@ -219,6 +233,9 @@ def compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, pass
                         "/state/filtered.git", "/out"],
         },
     }
+    if not host_binds:  # fills the agentrun volume from a tar stream on stdin (no host folder mounted)
+        svc["seeder"] = {"image": IMAGE, "profiles": ["seed"], "network_mode": "none", "stdin_open": True,
+                         "volumes": ["agentrun:/dst"], "command": ["sh", "-c", "umask 022 && tar -x -o -C /dst"]}
     if pol.egress_allow or pol.llm:
         private = ["--private", f"{pol.llm['host']}:{pol.llm['port']}"] if pol.llm else []
         svc["egress"] = dict(harden, **{
@@ -242,7 +259,36 @@ def compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, pass
             svc["egress"]["ports"] = ["127.0.0.1::3128"]
     return {"services": svc,
             "networks": {"agentnet": {"internal": True}, "outnet": {}},
-            "volumes": {"ws": {}, "state": {}, "logs": {"external": True, "name": logs_volume}}}
+            "volumes": dict({"ws": {}, "state": {}, "logs": {"external": True, "name": logs_volume}},
+                            **({} if host_binds else {"agentrun": {}}))}
+
+
+def _sub(volume, subpath, target):
+    return {"type": "volume", "source": volume, "target": target, "read_only": True, "volume": {"subpath": subpath}}
+
+
+def seed_agent_volume(dc, run_dir, own_agent_image):
+    """Fill the agentrun volume: run/ = <run_dir>/agent (mcp.json), agent/ = this plugin's agent
+    scripts (only with --agent-image). Owner root, modes 0644/0755; the agent mounts it read-only."""
+    import io
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for top, src in [("run", os.path.join(run_dir, "agent"))] + (
+                [("agent", os.path.join(HERE, "agent"))] if own_agent_image else []):
+            def clean(ti):
+                if "__pycache__" in ti.name.split("/"):
+                    return None
+                ti.uid = ti.gid = 0
+                ti.uname = ti.gname = ""
+                ti.mode = 0o755 if ti.isdir() else 0o644
+                return ti
+            tar.add(src, arcname=top, filter=clean)
+    r = subprocess.run(dc + ["--profile", "seed", "run", "--rm", "-T", "seeder"], input=buf.getvalue(),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if r.returncode:
+        raise SystemExit("forge-airlock: could not fill the agent's run volume: "
+                         + r.stderr.decode(errors="replace")[-300:])
 
 
 def readonly_dirs(pol, stage=None):
@@ -323,7 +369,9 @@ def cmd_up(a):
         raise SystemExit(f"forge-airlock: no {policy_path}; run `forge init` (or /forge-airlock:airlock) first")
     wants_claude = os.path.basename(a.command[0]) == "claude" and not a.agent_image
     build_images(wants_claude)
-    pol, _doc = load_policy(policy_path)
+    pol, _doc = load_policy(policy_path, role_of(a))
+    if pol.role:
+        say(f"role {pol.role}: the base policy narrowed to {len(pol.tools)} tools")
     vm = False
     try:  # fail closed: the chosen backend must be available; never fall back to docker
         isolation = B.resolve(a.isolation, getattr(pol, "isolation", None))
@@ -386,7 +434,10 @@ def cmd_up(a):
             json.dump({"mcpServers": {"forge-airlock": {"type": "http", "url": f"http://airlock:{PORT}/mcp"}}}, f)
         doc = compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, a.pass_env,
                           readonly_dirs(pol, stage), own_agent_image=bool(a.agent_image), llm_session=project,
-                          agent_runtime=agent_runtime, vm_ws=wsvol)
+                          agent_runtime=agent_runtime, vm_ws=wsvol,
+                          # a container agent gets no host bind (M2.3: mountinfo shows host paths); the vfkit VM
+                          # shares host folders over virtio-fs by design (vfkit_compose maps no named volumes)
+                          host_binds=vm)
         if pol.llm:
             c = pol.llm
             say(f"model access through the airlock: {c['scheme']}://{c['host']}:{c['port']} with the key from "
@@ -395,6 +446,8 @@ def cmd_up(a):
         with open(os.path.join(run_dir, "compose.json"), "w") as f:
             json.dump(doc, f, indent=1)
         run(["docker", "volume", "create", logs_volume], stdout=subprocess.DEVNULL)
+        if not vm:
+            seed_agent_volume(dc, run_dir, bool(a.agent_image))
         say("starting the airlock (filtered workspace, upstream servers) ...")
         services = ["airlock"] + (["egress"] if pol.egress_allow or pol.llm else [])
         r = out(dc + ["up", "-d", "--wait"] + services)
@@ -597,9 +650,11 @@ def cmd_check(a):
     need_docker()
     repo = git_root(a.repo)
     build_images(False)
-    pol, _ = load_policy(a.policy or os.path.join(repo, "forge.yaml"))
+    pol, _ = load_policy(a.policy or os.path.join(repo, "forge.yaml"), role_of(a))
     say(f"forge.yaml is valid: {len(pol.upstreams)} upstreams, {len(pol.tools)} tools listed, {len(pol.deny)} denied, "
-        f"{len(pol.logs)} gate logs; secrets named: {', '.join(pol.env_names) or 'none'}")
+        f"{len(pol.logs)} gate logs; secrets named: {', '.join(pol.env_names) or 'none'}"
+        + (f"; role {pol.role}" if pol.role else "") + (f"; roles defined: {', '.join(pol.role_names)}"
+                                                         if pol.role_names else ""))
     return 0
 
 
@@ -624,6 +679,8 @@ def main(argv=None):
         s.add_argument("--repo", default=os.getcwd())
         if name in ("tools", "check", "up"):
             s.add_argument("--policy")
+        if name in ("check", "up"):
+            s.add_argument("--role", help="a profile of forge.yaml `roles:` (or $FORGE_ROLE); narrows the policy")
         if name == "wrapper":
             s.add_argument("--force", action="store_true")
         if name == "init":

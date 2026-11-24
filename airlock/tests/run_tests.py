@@ -478,6 +478,13 @@ def test_redteam():
     redteam_regress.run(lambda name, ok, detail="": case("redteam: " + name, bool(ok), detail))
 
 
+def test_inbox():
+    """Red team M2.3 (in-box probes): the unit-testable fixes and helpers (tests/inbox_probes/unit.py)."""
+    sys.path.insert(0, os.path.join(HERE, "inbox_probes"))
+    import unit as inbox_unit
+    inbox_unit.run(lambda name, ok, detail="": case(name, bool(ok), detail))
+
+
 def test_llm():
     import llm_proxy as L
     env = {"PAY_KEY": "FAKE_pay_key_not_real_1234", "MODEL_KEY": "FAKE_model_key_not_real_5678"}
@@ -534,6 +541,56 @@ def test_llm():
              sse.complete() and sse.usage["input_tokens"] == 5 and sse.usage["output_tokens"] == 9)
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_m22():
+    """M2.2: Streamable HTTP, namespaced multi-upstream composition, roles (tests/m22_regress.py)."""
+    sys.path.insert(0, HERE)
+    import contextlib
+    import io
+    import m22_regress
+    log = io.StringIO()
+    with contextlib.redirect_stdout(log):  # the gateway's refusal lines; the cases print below
+        got = []
+        m22_regress.run(lambda name, ok, detail="": got.append((name, bool(ok), detail)))
+    for name, ok, detail in got:
+        case("m22: " + name, ok, detail)
+
+
+# Negative controls: the same M2.2 cases against an engine with ONE check removed must fail.
+M22_MUTANTS = [
+    ("arg rules removed (gates on HTTP)", "policy.py", "        for r in tp.rules:\n            r.check(args)\n", "",
+     "gates: deny / arg rule"),
+    ("role cap widening check removed", "policy.py", "                if c > tp.cap:\n", "                if False:\n",
+     "widening fails load: a cap above the base cap"),
+    ("namespacing collision check removed", "policy.py",
+     '            if self.namespace and (SEP in u["name"] or u["name"].endswith("_")):\n',
+     "            if False:\n", "namespacing collision fails load (upstream 'a__b')"),
+    ("listen-side session check removed", "gateway.py", "elif sid is not None and not A.touch_session(sid):",
+     "elif False:", "wrong Mcp-Session-Id is refused 404"),
+    ("upstream body size check removed (oversized body)", "mcp_client.py",
+     "                raw = r.read(MAX_RESPONSE + 1)\n                if len(raw) > MAX_RESPONSE:\n",
+     "                raw = r.read()\n                if False:\n", "planted fault oversize"),
+    ("upstream session id check removed (wrong session id)", "mcp_client.py",
+     "            elif sid is not None and sid != sent_session:\n", "            elif False:\n",
+     "planted fault wrong_session"),
+]
+
+
+def test_m22_controls():
+    for what, fname, old, new, needle in M22_MUTANTS:
+        tmp = tempfile.mkdtemp(prefix="m22-mutant-")
+        eng = os.path.join(tmp, "engine")
+        shutil.copytree(os.path.join(PKG, "engine"), eng, ignore=shutil.ignore_patterns("__pycache__"))
+        src = open(os.path.join(eng, fname)).read()
+        planted = src.count(old) == 1
+        open(os.path.join(eng, fname), "w").write(src.replace(old, new))
+        r = subprocess.run([sys.executable, os.path.join(HERE, "m22_regress.py"), "--only", needle],
+                           env=dict(os.environ, FORGE_ENGINE_DIR=eng), capture_output=True, text=True, timeout=300)
+        failed = [x for x in r.stdout.splitlines() if x.startswith("FAIL") and needle in x]
+        case(f"m22 negative control: {what} -> the case '{needle}' FAILS (exit {r.returncode})",
+             planted and r.returncode != 0 and failed, (planted, r.returncode, r.stdout[-300:]))
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_human_approval():
@@ -670,7 +727,9 @@ def test_names():
 
 
 def main():
-    for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static, test_redteam, test_human_approval, test_isolation, test_vfkit, test_names):
+    for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static,
+              test_redteam, test_human_approval, test_isolation, test_vfkit, test_names, test_m22, test_m22_controls,
+              test_inbox):
         try:
             t()
         except Exception as e:  # noqa: BLE001

@@ -29,6 +29,8 @@ proved rule, in any language, through a small line protocol:
   Forge ships evaluators for JavaScript/TypeScript (cli/eval/node_eval.mjs), Python (cli/eval/py_eval.py), and Go,
   Rust, Java and C# (cli/eval/<lang>/, built by eval_build.py); all of them take messy inputs.
   Any other language (Go, Rust, Java, C#, ...) plugs in as a "cmd" entry: a program that speaks the protocol.
+  State machines (many events per case, with retries, replays, reordering and restarts) use the trace mode of the
+  same evaluators: see cli/forge_trace.py.
 
 This core does the rest: fresh seeds, the decisions, replay of saved cases, shrinking (the failure signature
 stays fixed, so a disagreement cannot slide into a different bug), one saved case per kind of failure, and a
@@ -50,6 +52,10 @@ CALL_TIMEOUT_S = 2.0
 MAX_PER_CANDIDATE = 40  # examples kept per candidate per run
 MAX_PER_GROUP = 3  # differently shaped examples kept per kind of wrong answer
 MESSY_PER_INPUT = 1  # messy variants tried per generated input once every (field, kind) pair has been tried
+# All shrinking in one run (failing recorded decisions and new disagreements) may use at most this share of the
+# time budget. Shrinking only makes an example smaller; it must not stop the search (before 0.13.1 one known failing
+# decision with a slow evaluator took 300 calls, the whole 1.5 s end-of-turn budget, and no fresh input was tried).
+SHRINK_SHARE = 0.25
 MESSY_MAX_DEPTH = 4  # how deep into nested objects and lists the messy fields go
 MESSY_MAX_FIELDS = 64  # fields considered per input
 MESSY_LIST_ITEMS = 2  # list elements considered per list
@@ -265,6 +271,7 @@ class Evaluator:
         self.candidates = hello['candidates']
         self.messy = [n for n in hello.get('messy') or [] if n in self.candidates]
         self.has_undefined = hello.get('undefined') is True
+        self.trace_mode = hello.get('trace') is True  # the adapter exports machines (cli/forge_trace.py)
         self.skip_kinds = [k for k in hello.get('skip') or [] if k in MESSY_KINDS]
 
     def _stderr(self):
@@ -311,9 +318,10 @@ def load_inputs_module(path):
     return mod
 
 
-def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, messy=True):
+def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, messy=True, steer=None):
     """Run one diff entry. Returns the result dict (same shape for every language). `messy`: also send messy
-    variants of the inputs to the candidates the evaluator names as raw-value wrappers (see the top of this file)."""
+    variants of the inputs to the candidates the evaluator names as raw-value wrappers (see the top of this file).
+    `steer`: a forge_steer.Steer that picks the random inputs from coverage feedback (None: blind random)."""
     started = time.time()
     result = {'inputs': 0, 'out_of_domain': 0, 'replayed': 0, 'seed': seed, 'disagreements': [],
               'decisions': {'total': 0, 'agree': 0, 'failing': []}}
@@ -321,6 +329,8 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
     try:
         gen = load_inputs_module(inputs_path)
         in_domain = getattr(gen, 'in_domain', lambda _: True)
+        if steer:
+            steer.bind(gen)
         ev = Evaluator(cmd, cwd, env)
         names = ev.candidates
         result['candidates'] = names
@@ -332,6 +342,8 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
                 if len(cache) > 20000:
                     cache.clear()
                 cache[key] = ev.run(copy.deepcopy(inp))
+                if steer:
+                    steer.sent(inp, cache[key])
             return cache[key]
 
         def disagrees(name, inp):
@@ -441,14 +453,23 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
                         continue
                     m_record(name, apply_messy(small, path, kind), meta, True)
 
+        shrink_left = [budget_ms * SHRINK_SHARE / 1000.0]  # seconds of shrinking left in this run
+
         def shrink(name, inp):
+            t0 = time.time()
+            try:
+                return shrink_within(name, inp, t0 + max(shrink_left[0], 0.0))
+            finally:
+                shrink_left[0] -= time.time() - t0
+
+        def shrink_within(name, inp, deadline):
             sig = signature(*disagrees(name, inp))
             best, steps, improved = inp, 0, True
             while improved and steps < 300:
                 improved = False
                 for s in shrinks(best):
                     steps += 1
-                    if steps > 300:
+                    if steps > 300 or time.time() > deadline:
                         break
                     d = disagrees(name, s)
                     if d and signature(*d) == sig:
@@ -519,7 +540,7 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
         # 3. Fresh random inputs within the input and time budget.
         rng = Rng(seed)
         while result['inputs'] < max_inputs and (time.time() - started) * 1000 < budget_ms:
-            inp = gen.generate(rng)
+            inp = steer.next(rng) if steer else gen.generate(rng)
             result['inputs'] += 1
             if not in_domain(inp):
                 result['out_of_domain'] += 1
@@ -544,6 +565,8 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
             mstats['pairs_tried'] = len(tried)
             result['messy'] = mstats
         result['per_candidate'] = {n: sum(d['candidate'] == n for d in result['disagreements']) for n in names}
+        if steer:
+            result['steer'] = steer.stats()
     except EvaluatorError as e:
         result['error'] = str(e)
     except Exception as e:  # noqa: BLE001
