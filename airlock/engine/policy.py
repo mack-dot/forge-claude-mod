@@ -98,17 +98,33 @@ def glob_to_regex(pat):
 
 
 class PathSet:
-    def __init__(self, patterns, what):
+    """fold=True (hidden_paths, readonly_paths, the policy file): a path also matches when its FOLDED form
+    (sync.fold: case, Unicode normalization, ignorable code points, trailing dots and spaces) matches a folded
+    pattern. The sync-back rule folds for a case-insensitive host (macOS); without this, 'Secrets/key' was not
+    hidden by 'secrets/**' in the case-sensitive box although both are one file on that host (O6). Folding
+    only makes these sets match MORE paths; visible_paths is never folded (that would widen what is seen)."""
+
+    def __init__(self, patterns, what, fold=False):
         if not isinstance(patterns, list) or not all(isinstance(x, str) for x in patterns):
             raise PolicyError(f"paths.{what} must be a list of strings")
         self.patterns = list(patterns)
         self._re = [glob_to_regex(x) for x in patterns]
+        self._fold = None
+        if fold:
+            from sync import fold as _fold  # the same folding as the sync-back rule
+            self._fold = (_fold, [glob_to_regex(_fold(x)) for x in patterns])
 
     def match(self, rel):
         rel = rel.strip("/")
         if rel in ("", "."):
             return False
-        return any(r.match(rel) for r in self._re)
+        if any(r.match(rel) for r in self._re):
+            return True
+        if self._fold is not None:
+            f, res = self._fold
+            frel = f(rel)
+            return any(r.match(frel) for r in res)
+        return False
 
     def closes_dir(self, rel_dir):
         """True when every new child of rel_dir would match (e.g. 'tests' for 'tests/**')."""
@@ -558,7 +574,7 @@ class Policy:
         p = doc.get("paths") or {}
         _keys(p, "paths", optional=("hidden_paths", "visible_paths", "readonly_paths", "mcp_root", "agent_root",
                                     "keep_commit_messages"))
-        self.hidden = PathSet(p.get("hidden_paths") or [], "hidden_paths")
+        self.hidden = PathSet(p.get("hidden_paths") or [], "hidden_paths", fold=True)
         # visible_paths absent: everything except hidden_paths. Present: ONLY matches, minus hidden.
         self.visible = PathSet(p["visible_paths"], "visible_paths") if "visible_paths" in p else None
         if self.visible is not None and not self.visible.patterns:
@@ -566,7 +582,7 @@ class Policy:
         ro = p.get("readonly_paths") or []
         if isinstance(ro, list) and "forge.yaml" not in ro:
             ro = list(ro) + ["forge.yaml"]  # the policy file is always read-only in the box
-        self.readonly = PathSet(ro, "readonly_paths")
+        self.readonly = PathSet(ro, "readonly_paths", fold=True)
         # every role is checked at load (a widening role is an error even when not selected)
         for rn in self.role_names:
             self._role(rn, roles[rn], apply=False)
@@ -600,7 +616,7 @@ class Policy:
             if not self.llm_key:
                 raise PolicyError(f"llm.key_env: environment variable {self.llm['key_env']} is not set (fail closed)")
         # The policy file itself is never writable by the agent and never synced back.
-        self.protected = PathSet(["forge.yaml"], "protected")
+        self.protected = PathSet(["forge.yaml"], "protected", fold=True)
 
     # ------------------------------------------------------------ namespacing and roles
     def split_name(self, name, where):
@@ -675,7 +691,7 @@ class Policy:
             self.logs[tp.role_log] = (c, tp.expires_in_s, tp.expires_at)
         if hid:
             self.hidden = PathSet(self.hidden.patterns + [x for x in hid if x not in self.hidden.patterns],
-                                  "hidden_paths")
+                                  "hidden_paths", fold=True)
         if vis is not None:
             # every role pattern lies inside a base pattern (checked above), so the role set
             # alone is the intersection

@@ -89,7 +89,7 @@ def raw(port, body=b"", head=None, path="/mcp", method="POST", timeout=10, half_
     if head is None:
         head = f"content-length: {len(body)}\r\n"
     try:
-        s.sendall(f"{method} {path} HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n{head}\r\n".encode()
+        s.sendall(f"{method} {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\ncontent-type: application/json\r\n{head}\r\n".encode()
                   + body)
         if half_close:
             s.shutdown(socket.SHUT_WR)
@@ -139,7 +139,7 @@ def f1(case, A, port):
     held = []
     for _ in range(12):
         s = socket.create_connection(("127.0.0.1", port), timeout=5)
-        s.sendall(b"POST /mcp HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\n\r\n{")
+        s.sendall(f"POST /mcp HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\ncontent-length: 100\r\n\r\n{{".encode())
         held.append(s)
     got503 = 0
     for s in held[8:]:

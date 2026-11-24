@@ -21,6 +21,10 @@ sys.path.insert(0, os.path.join(HERE, "..", "engine"))
 import mcp_client as M  # noqa: E402
 
 
+class _Server(http.server.ThreadingHTTPServer):
+    request_queue_size = 128
+
+
 class Upstream:
     """An MCP upstream with sessions. end_sessions() makes every known session unknown (404).
     idle_close_s: the server closes a kept-alive connection that stays idle this long."""
@@ -93,7 +97,9 @@ class Upstream:
                         "content": [{"type": "text", "text": "ok %s" % key}]}})
                 return self._send(200, {"jsonrpc": "2.0", "id": mid, "result": {"tools": []}})
 
-        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        # The default listen backlog (5) overflows under load when 8 threads connect at once: macOS then resets
+        # connections (ECONNRESET, EPIPE, EINVAL) and the R1 case flaked. A real upstream has a larger backlog.
+        self.srv = _Server(("127.0.0.1", 0), H)
         self.srv.daemon_threads = True
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         self.url = "http://127.0.0.1:%d/mcp" % self.srv.server_address[1]

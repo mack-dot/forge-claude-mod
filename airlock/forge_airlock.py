@@ -127,6 +127,17 @@ def load_policy(policy_path, role=None):
     return Policy(res["doc"], resolve=False, role=role), res["doc"]
 
 
+def same_value_names(name, pol, environ=None):
+    """The airlock-side secrets of forge.yaml (upstream ${NAMES} and the llm key) whose value in this shell is
+    the same as the value of `name`. Compared as SHA-256 digests with compare_digest; no value is printed."""
+    import hmac
+    env = os.environ if environ is None else environ
+    mine = hashlib.sha256(env.get(name, "").encode("utf-8", "surrogateescape")).digest()
+    held = list(pol.env_names) + ([pol.llm["key_env"]] if pol.llm else [])
+    return [k for k in held if k != name and env.get(k) and hmac.compare_digest(
+        mine, hashlib.sha256(env[k].encode("utf-8", "surrogateescape")).digest())]
+
+
 def role_of(a):
     """--role NAME, else $FORGE_ROLE, else None (the base policy)."""
     return getattr(a, "role", None) or os.environ.get("FORGE_ROLE") or None
@@ -343,8 +354,12 @@ def sync_back(pol, run_dir, stage, repo):
     if not yes:
         say("nothing applied; your repository is unchanged")
         return 0
-    done = sync.apply_changes(apply, repo)
-    say(f"applied {len(done)} file(s); review them with git diff")
+    problems = []
+    done = sync.apply_changes(apply, repo, problems)  # all or nothing (sync.apply_changes)
+    for p in problems:
+        say(sync.display(p))
+    say(f"applied {len(done)} file(s); review them with git diff" if done else
+        "nothing applied; your repository is unchanged")
     return 0
 
 
@@ -383,6 +398,11 @@ def cmd_up(a):
         if n in pol.env_names:
             raise SystemExit(f"forge-airlock: --pass-env {n}: this is an upstream secret of forge.yaml; it stays "
                              "with the airlock (passing it to the agent would defeat the airlock)")
+        same = same_value_names(n, pol)
+        if same:  # O4: the same secret under another name; values are compared as digests and never printed
+            say(f"--pass-env {n}: its value is the same as the airlock-side secret ${same[0]} of forge.yaml; "
+                "it stays with the airlock (passing it to the agent would defeat the airlock)")
+            raise SystemExit(EXIT_POLICY)
         say(f"WARNING: --pass-env {n}: the program in the box (the agent) CAN READ this value and can send it to "
             f"any host it can reach. Use a separate, spend-capped key for it.")
     agent_image = a.agent_image or (CLAUDE_IMAGE if wants_claude else IMAGE)

@@ -685,10 +685,18 @@ def test_rest():
         case(name, bool(ok), detail[0] if detail else "")
 
 
+def test_observations():
+    """Review observations O1 to O6 fixed on the owner's request (tests/observations_regress.py)."""
+    sys.path.insert(0, HERE)
+    import observations_regress
+    for name, ok, *detail in observations_regress.cases():
+        case(name, bool(ok), detail[0] if detail else "")
+
+
 def main():
     for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static,
               test_redteam, test_human_approval, test_isolation, test_names, test_m22, test_m22_controls, test_inbox,
-              test_mcp_client, test_concurrency, test_rest):
+              test_mcp_client, test_concurrency, test_rest, test_observations):
         try:
             t()
         except Exception as e:  # noqa: BLE001

@@ -23,7 +23,9 @@ import difflib
 import hashlib
 import os
 import re
+import signal
 import stat
+import threading
 import unicodedata
 
 # Paths that change what tools on YOUR machine run or trust: flagged in the review, not refused.
@@ -276,8 +278,9 @@ def render(apply, max_lines=4000):
     return "\n".join(out)
 
 
-def _mkdirs(real_root, rel_dir):
-    """Create the parent directories one by one; never through a symlink."""
+def _mkdirs(real_root, rel_dir, created=None):
+    """Create the parent directories one by one; never through a symlink. Each directory made here is
+    appended to `created` (so a rollback can remove it again)."""
     cur = os.path.realpath(real_root)
     for seg in [x for x in rel_dir.split("/") if x]:
         cur = os.path.join(cur, seg)
@@ -286,54 +289,130 @@ def _mkdirs(real_root, rel_dir):
                 os.mkdir(cur, 0o755)
             except OSError:
                 return False
+            if created is not None:
+                created.append(cur)
         if os.path.islink(cur) or not os.path.isdir(cur):
             return False
     return True
 
 
-def apply_changes(apply, real_root):
-    """Write the approved changes. Every target is checked again right before its write (TOCTOU):
-    the alias, symlink and .git checks of target_problem, before and after creating parents.
-    A write or delete that fails (the target became a directory, a full disk) is skipped: the other changes
-    still go on, the failed one is not in the returned list, and no temp file is left behind."""
-    done = []
-    for c in apply:
-        rel = c["path"].strip("/")
-        real = os.path.join(real_root, rel)
-        if (rel == ".git" or ".git" in fold(rel).split("/") or not _inside(real_root, real)
-                or target_problem(real_root, rel)[0]):
-            continue
-        if c["status"] == "deleted":
-            if os.path.lexists(real) and not os.path.islink(real):
-                try:
-                    os.remove(real)
-                except OSError:
-                    continue
-                done.append(c["path"])
-            continue
-        if not _mkdirs(real_root, os.path.dirname(rel)):
-            continue
-        if not _inside(real_root, real) or target_problem(real_root, rel)[0]:
-            continue
-        tmp = os.path.join(os.path.dirname(real), f".forge-airlock.{os.getpid()}.{os.urandom(6).hex()}.tmp")
-        try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        except OSError:
-            continue
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(c["new"])
-                os.fchmod(f.fileno(), 0o755 if c.get("mode") == "100755" else 0o644)
-            if target_problem(real_root, rel)[0] or (os.path.lexists(real) and os.path.islink(real)):
+class _Abort(Exception):
+    pass
+
+
+_HOLD = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def apply_changes(apply, real_root, problems=None):
+    """Write the approved changes ALL OR NOTHING (O5). Returns the list of applied paths.
+
+    1. Stage: for every change, check the target (target_problem: alias, symlink, .git), create its parents
+       and write the new content to a temp file beside the target.
+    2. Verify: every target is checked again, and the real file must still have the content the box started
+       from (the plan's base). Any failure, error or Ctrl-C up to here removes every temp file and every
+       directory made in step 1: the repository is unchanged, the return value is [], and the reason is
+       appended to `problems`.
+    3. Commit: one pass of renames (and deletes) with SIGINT, SIGTERM and SIGHUP held, so a Ctrl-C cannot stop
+       it half-way; a held signal is delivered after the pass. Each target is still checked right before its
+       rename, so a symlink that appears in this short window is never written through: that one change is
+       skipped and named in `problems` (the only case where the result is not all of the changes)."""
+    problems = [] if problems is None else problems
+    staged, created = [], []  # staged: (change, real path, temp path or None for a delete)
+    try:
+        for c in apply:
+            rel = c["path"].strip("/")
+            real = os.path.join(real_root, rel)
+            if (rel == ".git" or ".git" in fold(rel).split("/") or not _inside(real_root, real)
+                    or target_problem(real_root, rel)[0]):
+                raise _Abort(f"{rel}: the target is not safe to write (alias, symlink or .git)")
+            if c["status"] == "deleted":
+                staged.append((c, real, None))
                 continue
-            os.replace(tmp, real)
-        except OSError:
-            continue
-        finally:
-            if os.path.lexists(tmp):
+            if not _mkdirs(real_root, os.path.dirname(rel), created):
+                raise _Abort(f"{rel}: its parent directory cannot be made (a file or a symlink is in the way)")
+            if not _inside(real_root, real) or target_problem(real_root, rel)[0]:
+                raise _Abort(f"{rel}: the target is not safe to write (alias, symlink or .git)")
+            tmp = os.path.join(os.path.dirname(real), f".forge-airlock.{os.getpid()}.{os.urandom(6).hex()}.tmp")
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            except OSError as e:
+                raise _Abort(f"{rel}: cannot write a temp file: {e}") from None
+            staged.append((c, real, tmp))
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(c["new"])
+                    os.fchmod(f.fileno(), 0o755 if c.get("mode") == "100755" else 0o644)
+            except OSError as e:
+                raise _Abort(f"{rel}: cannot write a temp file: {e}") from None
+        for c, real, tmp in staged:  # verify
+            rel = c["path"].strip("/")
+            if target_problem(real_root, rel)[0] or not _inside(real_root, real):
+                raise _Abort(f"{rel}: the target changed and is not safe to write")
+            base = c.get("base")
+            if base is not None and _content_state(real) != _content_state(base):
+                raise _Abort(f"{rel}: changed in the real repository after the review (not overwritten)")
+            if tmp is None and _content_state(real) in (None, "other"):
+                raise _Abort(f"{rel}: the file to delete is gone or is not a regular file")
+    except BaseException as e:  # _Abort, OSError, KeyboardInterrupt, SystemExit: nothing was renamed yet
+        for _, _, tmp in staged:
+            if tmp is not None and os.path.lexists(tmp):
                 try:
                     os.remove(tmp)
                 except OSError:
                     pass
-        done.append(c["path"])
+        for d in reversed(created):
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+        if isinstance(e, (_Abort, OSError)):
+            problems.append(f"nothing applied: {e}")
+            return []
+        raise
+    done = []
+    with _signals_held():  # commit point: finish the pass
+        for c, real, tmp in staged:
+            rel = c["path"].strip("/")
+            try:
+                if target_problem(real_root, rel)[0] or (os.path.lexists(real) and os.path.islink(real)):
+                    problems.append(f"{rel}: not applied (the target changed during the commit)")
+                    continue
+                if tmp is None:
+                    os.remove(real)
+                else:
+                    os.replace(tmp, real)
+                done.append(c["path"])
+            except OSError as e:
+                problems.append(f"{rel}: not applied: {e}")
+            finally:
+                if tmp is not None and os.path.lexists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
     return done
+
+
+class _signals_held:
+    """Hold SIGINT, SIGTERM and SIGHUP for the commit pass: a signal that arrives is recorded and handed to the
+    earlier handler after the pass (Ctrl-C then raises KeyboardInterrupt, forge up's handler cleans up).
+    Python runs signal handlers only in the main thread, so from another thread there is nothing to hold."""
+
+    def __enter__(self):
+        self.pending, self.old = [], {}
+        if threading.current_thread() is threading.main_thread():
+            for sg in _HOLD:
+                self.old[sg] = signal.signal(sg, lambda n, _f: self.pending.append(n))
+        return self
+
+    def __exit__(self, *exc):
+        for sg, h in self.old.items():
+            signal.signal(sg, h if h is not None else signal.SIG_DFL)
+        if self.pending and exc[0] is None:
+            n = self.pending[0]
+            h = self.old.get(n)
+            if callable(h):
+                h(n, None)
+            elif h in (signal.SIG_DFL, None):
+                os.kill(os.getpid(), n)
+        return False
