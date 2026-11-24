@@ -174,11 +174,12 @@ class HttpUpstream:
                     return
         c.close()
 
-    def _headers(self, extra=None):
+    def _headers(self, session=False, extra=None):
         h = {"content-type": "application/json", "accept": "application/json, text/event-stream",
              "mcp-protocol-version": self.version}
-        if self.session is not None:
-            h["mcp-session-id"] = self.session
+        session = self.session if session is False else session
+        if session is not None:
+            h["mcp-session-id"] = session
         h.update(self.headers)
         h.update(extra or {})
         return h
@@ -187,12 +188,14 @@ class HttpUpstream:
     def _post(self, body, timeout):
         data = json.dumps(body, allow_nan=False).encode()
         method = body.get("method")
-        sent_session = self.session
+        with self._lock:  # C1: ONE read; the header and the 404 check use the same session id
+            sent_session = self.session
+        headers = self._headers(sent_session)
         c, reused = self._conn(timeout)
         reuse = False
         try:
             try:
-                c.request("POST", self._path, body=data, headers=self._headers())
+                c.request("POST", self._path, body=data, headers=headers)
                 r = c.getresponse()
             except (OSError, http.client.HTTPException) as e:  # timeouts, resets, DNS
                 c.close()
@@ -201,7 +204,7 @@ class HttpUpstream:
                     # connection as we sent. Only requests without side effects are sent again, once, fresh.
                     c = self._fresh(timeout)
                     try:
-                        c.request("POST", self._path, body=data, headers=self._headers())
+                        c.request("POST", self._path, body=data, headers=headers)
                         r = c.getresponse()
                     except (OSError, http.client.HTTPException) as e2:
                         raise UpstreamError(f"{self.name}: {type(e2).__name__}: {str(e2)[:120]}") from None
@@ -229,29 +232,40 @@ class HttpUpstream:
             elif sid is not None and sid != sent_session:
                 raise UpstreamError(f"{self.name}: the upstream answered with another Mcp-Session-Id")
             ctype = (r.getheader("content-type") or "").split(";")[0].strip().lower()
-            if ctype == "application/json":
-                raw = r.read(MAX_RESPONSE + 1)
-                if len(raw) > MAX_RESPONSE:
-                    raise UpstreamError(f"{self.name}: response body over {MAX_RESPONSE} bytes")
-                reuse = not r.will_close
-                try:  # F8: a body that does not parse is an UpstreamError (the gate step is finished)
-                    msg = strict_loads(raw)
-                except (ValueError, RecursionError):
-                    raise UpstreamError(f"{self.name}: response does not parse") from None
-                if not isinstance(msg, dict):
-                    raise UpstreamError(f"{self.name}: response is not an object")
-                if msg.get("id") != body.get("id") or type(msg.get("id")) is not type(body.get("id")):
-                    raise UpstreamError(f"{self.name}: response id does not match the request id")
-            elif ctype == "text/event-stream":
-                msg = self._sse(r, body.get("id"))  # the stream may stay open: never reused
-            else:
-                raise UpstreamError(f"{self.name}: unsupported content-type {ctype[:60]!r}")
+            msg = self._read_body(r, ctype, body)
+            reuse = ctype == "application/json" and not r.will_close  # SSE: the stream may stay open
             if method == "initialize":
                 with self._lock:
                     self.session = new_session
             return msg
         finally:
             self._release(c, reuse)
+
+    def _read_body(self, r, ctype, body):
+        """C2: a body that stalls past the timeout or is cut is an UpstreamError, like every other failure."""
+        try:
+            return self._parse_body(r, ctype, body)
+        except (OSError, http.client.HTTPException) as e:
+            raise UpstreamError(f"{self.name}: reading the answer: {type(e).__name__}: {str(e)[:120]}") from None
+
+    def _parse_body(self, r, ctype, body):
+        if ctype == "application/json":
+            raw = r.read(MAX_RESPONSE + 1)
+            if len(raw) > MAX_RESPONSE:
+                raise UpstreamError(f"{self.name}: response body over {MAX_RESPONSE} bytes")
+            try:  # F8: a body that does not parse is an UpstreamError (the gate step is finished)
+                msg = strict_loads(raw)
+            except (ValueError, RecursionError):
+                raise UpstreamError(f"{self.name}: response does not parse") from None
+            if not isinstance(msg, dict):
+                raise UpstreamError(f"{self.name}: response is not an object")
+            if msg.get("id") != body.get("id") or type(msg.get("id")) is not type(body.get("id")):
+                raise UpstreamError(f"{self.name}: response id does not match the request id")
+        elif ctype == "text/event-stream":
+            msg = self._sse(r, body.get("id"))  # the stream may stay open: never reused
+        else:
+            raise UpstreamError(f"{self.name}: unsupported content-type {ctype[:60]!r}")
+        return msg
 
     def _sse(self, r, want_id):
         """Read SSE events until the JSON-RPC response with want_id. Server notifications and

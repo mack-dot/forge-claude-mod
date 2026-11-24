@@ -562,8 +562,8 @@ M22_MUTANTS = [
     ("listen-side session check removed", "gateway.py", "elif sid is not None and not A.touch_session(sid):",
      "elif False:", "wrong Mcp-Session-Id is refused 404"),
     ("upstream body size check removed (oversized body)", "mcp_client.py",
-     "                raw = r.read(MAX_RESPONSE + 1)\n                if len(raw) > MAX_RESPONSE:\n",
-     "                raw = r.read()\n                if False:\n", "planted fault oversize"),
+     "            raw = r.read(MAX_RESPONSE + 1)\n            if len(raw) > MAX_RESPONSE:\n",
+     "            raw = r.read()\n            if False:\n", "planted fault oversize"),
     ("upstream session id check removed (wrong session id)", "mcp_client.py",
      "            elif sid is not None and sid != sent_session:\n", "            elif False:\n",
      "planted fault wrong_session"),
@@ -661,9 +661,18 @@ def test_mcp_client():
         case(name, bool(ok), detail[0] if detail else "")
 
 
+def test_concurrency():
+    """Review findings C1 to C4: session id read once, body read errors, llm endpoint framing / timeout / cap."""
+    sys.path.insert(0, HERE)
+    import concurrency_regress
+    for name, ok, *detail in concurrency_regress.cases():
+        case(name, bool(ok), detail[0] if detail else "")
+
+
 def main():
     for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static,
-              test_redteam, test_human_approval, test_isolation, test_names, test_m22, test_m22_controls, test_mcp_client):
+              test_redteam, test_human_approval, test_isolation, test_names, test_m22, test_m22_controls, test_mcp_client,
+              test_concurrency):
         try:
             t()
         except Exception as e:  # noqa: BLE001
