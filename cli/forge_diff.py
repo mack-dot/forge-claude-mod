@@ -46,6 +46,7 @@ import random
 import select
 import subprocess
 import sys
+import threading
 import time
 
 CALL_TIMEOUT_S = 2.0
@@ -259,13 +260,41 @@ class EvaluatorError(Exception):
     pass
 
 
+def drain(stream, keep=8000):
+    """Read a child's stderr until it closes, keeping the last `keep` characters. An undrained stderr pipe fills at
+    64 KB, and then a child that logs blocks on its next write: that showed up as a false "hang" of the code under
+    test. Returns a function that gives the text kept so far."""
+    tail = ['']
+
+    def run():
+        try:
+            for chunk in iter(lambda: stream.read(4096), ''):
+                tail[0] = (tail[0] + chunk)[-keep:]
+        except (OSError, ValueError):
+            pass
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+
+    def text(wait=0.0):
+        t.join(wait)
+        return tail[0]
+    return text
+
+
 class Evaluator:
     """One evaluator process, spoken to line by line."""
 
     def __init__(self, cmd, cwd, env):
         self.p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, universal_newlines=True, bufsize=1, encoding='utf-8')
-        hello = self._read(30.0)
+                                  stderr=subprocess.PIPE, universal_newlines=True, bufsize=1, encoding='utf-8',
+                                  errors='backslashreplace')
+        self.err = drain(self.p.stderr)
+        try:
+            hello = self._read(30.0)
+        except Exception:
+            self._stderr()  # stop the process: a hello that is not JSON must not leave it running
+            raise
         if not isinstance(hello, dict) or not isinstance(hello.get('candidates'), list):
             raise EvaluatorError('the evaluator did not start: %s' % self._stderr())
         self.candidates = hello['candidates']
@@ -277,9 +306,10 @@ class Evaluator:
     def _stderr(self):
         try:
             self.p.kill()
-            return (self.p.stderr.read() or '')[-800:]
+            self.p.wait(timeout=5)
         except Exception:  # noqa: BLE001
-            return ''
+            pass
+        return self.err(2.0)[-800:]
 
     def _read(self, timeout):
         ready, _, _ = select.select([self.p.stdout], [], [], timeout)
@@ -530,6 +560,9 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
         # 2. The person's recorded decisions (reported, not saved again; their kinds are then skipped below).
         for dec in getattr(gen, 'decisions', []):
             result['decisions']['total'] += 1
+            if not in_domain(dec['input']):  # never compared: not an agreement (forge_check.run_diff: DIFF_ERROR)
+                result['decisions'].setdefault('out_of_domain', []).append(dec['id'])
+                continue
             bad = [n for n in names if disagrees(n, dec['input'])]
             if bad:
                 result['decisions']['failing'].append({'id': dec['id'], 'candidates': bad})

@@ -657,8 +657,14 @@ class Runner:
             cmd = [sys.executable, os.path.join(HERE, 'eval', 'crash_py.py'), self.root, self.tfile]
         env = dict(os.environ, NODE_ENV='test', FORGE_CRASH_CHECK='1')
         self.p = subprocess.Popen(cmd, cwd=self.root, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, universal_newlines=True, bufsize=1, encoding='utf-8')
-        hello = self._read(60.0)
+                                  stderr=subprocess.PIPE, universal_newlines=True, bufsize=1, encoding='utf-8',
+                                  errors='backslashreplace')
+        self.err = forge_diff.drain(self.p.stderr)  # a full stderr pipe would block the runner: a false hang
+        try:
+            hello = self._read(60.0)
+        except Exception:
+            self._stderr()
+            raise
         if not isinstance(hello, dict) or 'ready' not in hello:
             raise CrashError('the %s runner did not start: %s' % (self.lang, self._stderr()))
         self.ready, self.missing = hello['ready'], hello.get('missing') or {}
@@ -666,9 +672,10 @@ class Runner:
     def _stderr(self):
         try:
             self.p.kill()
-            return (self.p.stderr.read() or '')[-600:]
+            self.p.wait(timeout=5)
         except Exception:  # noqa: BLE001
-            return ''
+            pass
+        return self.err(2.0)[-600:]
 
     def _read(self, timeout):
         ready, _, _ = select.select([self.p.stdout], [], [], timeout)

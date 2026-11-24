@@ -17,6 +17,11 @@ import signal
 import sys
 import traceback
 
+# The protocol owns the real stdout; a function under test that prints writes to stderr instead (before this, one
+# print() was reported as a crash of the process and the function was NOT judged).
+PROTO = sys.stdout
+sys.stdout = sys.stderr
+
 ROOT = os.path.realpath(sys.argv[1])
 TARGETS = json.load(open(sys.argv[2], encoding='utf-8'))
 CALL_S = 1
@@ -129,8 +134,8 @@ for t in TARGETS:
 has_alarm = hasattr(signal, 'SIGALRM')
 if has_alarm:
     signal.signal(signal.SIGALRM, _alarm)
-sys.stdout.write(json.dumps({'ready': list(fns), 'missing': missing}) + '\n')
-sys.stdout.flush()
+PROTO.write(json.dumps({'ready': list(fns), 'missing': missing}) + '\n')
+PROTO.flush()
 for line in sys.stdin:
     if not line.strip():
         continue
@@ -154,5 +159,5 @@ for line in sys.stdin:
     finally:
         if has_alarm:
             signal.alarm(0)
-    sys.stdout.write(json.dumps(out) + '\n')
-    sys.stdout.flush()
+    PROTO.write(json.dumps(out) + '\n')
+    PROTO.flush()

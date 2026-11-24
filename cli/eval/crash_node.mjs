@@ -12,6 +12,11 @@ import path from 'node:path'
 import { readFileSync, realpathSync } from 'node:fs'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 
+// The protocol owns the real stdout. Code under test that logs (console.log, process.stdout.write) writes to stderr
+// instead: before this, one console.log in the code under test broke the line protocol.
+const proto = process.stdout.write.bind(process.stdout)
+process.stdout.write = process.stderr.write.bind(process.stderr)
+
 const root = realpathSync(path.resolve(process.argv[2]))
 const targets = JSON.parse(readFileSync(process.argv[3], 'utf8'))
 const CALL_MS = 1000
@@ -124,7 +129,7 @@ let late = null
 process.on('unhandledRejection', e => { late = e })
 process.on('uncaughtException', e => { late = e })
 
-process.stdout.write(JSON.stringify({ ready: Object.keys(fns), missing }) + '\n')
+proto(JSON.stringify({ ready: Object.keys(fns), missing }) + '\n')
 let buf = ''
 process.stdin.setEncoding('utf8')
 for await (const chunk of process.stdin) {
@@ -139,7 +144,7 @@ for await (const chunk of process.stdin) {
     let out = await run(msg.id, msg.input)
     await new Promise(r => setImmediate(r))
     if (out.ok && late) out = verdict(late)
-    process.stdout.write(JSON.stringify(out) + '\n')
+    proto(JSON.stringify(out) + '\n')
   }
 }
 process.exit(0)

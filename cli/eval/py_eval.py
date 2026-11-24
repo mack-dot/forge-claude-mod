@@ -15,6 +15,10 @@ import json
 import os
 import sys
 
+# The protocol owns the real stdout. Code under test that prints (a log line, a debug print) writes to stderr
+# instead: before this, one print() in the shipped code broke every line after it (DIFF_ERROR).
+PROTO = sys.stdout
+sys.stdout = sys.stderr
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import forge_py_steer  # noqa: E402
 steer = forge_py_steer.start()  # before the adapter loads, so the watched files' import is traced too
@@ -66,15 +70,15 @@ def _trace_mode(spec):
                 break
         return out
 
-    sys.stdout.write(json.dumps({'candidates': tnames, 'trace': True}) + '\n')
-    sys.stdout.flush()
+    PROTO.write(json.dumps({'candidates': tnames, 'trace': True}) + '\n')
+    PROTO.flush()
     for line in sys.stdin:
         if not line.strip():
             continue
         results = [{'reference': run(machines[None], steps), 'candidates': {n: run(machines[n], steps) for n in tnames}}
                    for steps in json.loads(line)['traces']]
-        sys.stdout.write(json.dumps({'results': results}) + '\n')
-        sys.stdout.flush()
+        PROTO.write(json.dumps({'results': results}) + '\n')
+        PROTO.flush()
     sys.exit(0)
 
 
@@ -96,8 +100,8 @@ def call(fn, inp):
 
 if steer:
     steer.off()
-sys.stdout.write(json.dumps({'candidates': names, 'messy': list(wrappers)}) + '\n')
-sys.stdout.flush()
+PROTO.write(json.dumps({'candidates': names, 'messy': list(wrappers)}) + '\n')
+PROTO.flush()
 seq = 0
 for line in sys.stdin:
     if not line.strip():
@@ -113,8 +117,8 @@ for line in sys.stdin:
         out = {'reference': ref, 'candidates': {n: call(wrappers[n], inp) for n in wrappers}}
         if steer:
             steer.off()
-        sys.stdout.write(json.dumps(out) + '\n')  # ASCII escapes: a lone surrogate stays valid
-        sys.stdout.flush()
+        PROTO.write(json.dumps(out) + '\n')  # ASCII escapes: a lone surrogate stays valid
+        PROTO.flush()
         continue
     ref = call(adapter.reference, inp)
     if steer:
@@ -125,7 +129,7 @@ for line in sys.stdin:
         if steer.plain_done():
             out['novel'] = [seq]
         seq += 1
-    sys.stdout.write(json.dumps(out, ensure_ascii=False) + '\n')
-    sys.stdout.flush()
+    PROTO.write(json.dumps(out, ensure_ascii=False) + '\n')
+    PROTO.flush()
 if steer:
     steer.finish()

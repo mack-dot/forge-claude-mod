@@ -21,6 +21,11 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+// The protocol owns the real stdout. Code under test that logs (console.log, process.stdout.write) writes to stderr
+// instead: before this, one console.log in the code under test broke the line protocol.
+const proto = process.stdout.write.bind(process.stdout)
+process.stdout.write = process.stderr.write.bind(process.stderr)
+
 const adapterPath = path.resolve(process.argv[2])
 
 function loadDafny(file, names) {
@@ -99,7 +104,7 @@ if (adapter.trace) {
     }
     return out
   }
-  process.stdout.write(JSON.stringify({ candidates: tnames, trace: true }) + '\n')
+  proto(JSON.stringify({ candidates: tnames, trace: true }) + '\n')
   process.stdin.setEncoding('utf8')
   let buf = ''
   for await (const chunk of process.stdin) {
@@ -115,7 +120,7 @@ if (adapter.trace) {
         for (const n of tnames) candidates[n] = run(machines[n], steps)
         return { reference: run(machines.reference, steps), candidates }
       })
-      process.stdout.write(write({ results }) + '\n')
+      proto(write({ results }) + '\n')
     }
   }
   process.exit(0)
@@ -141,7 +146,7 @@ const call = (fn, input, messy) => {
     return { __throws__: e && e.name ? e.name : String(e) }
   }
 }
-process.stdout.write(JSON.stringify({ candidates: names, messy: messyNames, undefined: true }) + '\n')
+proto(JSON.stringify({ candidates: names, messy: messyNames, undefined: true }) + '\n')
 // Split on "\n" only: readline also splits at U+2028 and U+2029, which may appear inside JSON strings.
 async function* lines(stream) {
   let buf = ''
@@ -164,7 +169,7 @@ for await (const line of lines(process.stdin)) {
     if (isUndef(reference)) reference = call(adapter.reference, input, true)
     const out = { reference, candidates: {} }
     for (const n of messyNames) out.candidates[n] = call(wrappers[n], input, true)
-    process.stdout.write(write(out) + '\n')
+    proto(write(out) + '\n')
     continue
   }
   const out = { reference: call(adapter.reference, input), candidates: {} }
@@ -173,6 +178,6 @@ for await (const line of lines(process.stdin)) {
     const novel = steer.plain(seq++, () => { for (const n of names) call(all[n], input) })
     if (novel.length) out.novel = novel
   }
-  process.stdout.write(write(out) + '\n')
+  proto(write(out) + '\n')
 }
 if (steer) steer.finish()

@@ -101,8 +101,11 @@ LAST_DIFF = DIR + '/last-diff.json'
 DIFF_STATS = DIR + '/diff-stats.json'
 REGRESSIONS = DIR + '/regressions'
 
-# Constructs that make Dafny accept a claim without proof. A text scan, not a parser.
-UNSOUND = [r'\bassume\b', r'\{:\s*verify\s+false', r'\{:\s*axiom', r'\{:\s*extern', r'\{:\s*only']
+# Constructs that make Dafny accept a claim without proof. A text scan, not a parser. Dafny 4 also has an attribute
+# syntax (@Axiom is {:axiom}, @VerifyOnly is {:only}). Before these were listed, a body-less
+# `@Axiom lemma L() ensures false` passed the scan and `dafny verify` exited 0: VERIFIED with a proof of false.
+UNSOUND = [r'\bassume\b', r'\{:\s*verify\s+false', r'\{:\s*axiom', r'\{:\s*extern', r'\{:\s*only',
+           r'@\s*Axiom\b', r'@\s*VerifyOnly\b']
 TIMEOUT_S = 600
 DAFNY_VERSION = '4.11.0'
 # Release files of dafny-lang/dafny v4.11.0 and the SHA-256 that GitHub publishes for each.
@@ -999,10 +1002,14 @@ def build_one(root, cfg, c, dafny, check_only):
             pattern = unsound_in(inside(root, fuzz))
             if pattern:
                 fail('UNSOUND_CONSTRUCT', '%s matches %s' % (fuzz, pattern))
-            r = subprocess.run([dafny, 'verify', inside(root, fuzz)], cwd=root, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, universal_newlines=True)
+            try:
+                r = subprocess.run([dafny, 'verify', inside(root, fuzz)], cwd=root, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, universal_newlines=True,
+                                   timeout=TIMEOUT_S)
+            except subprocess.TimeoutExpired:  # before, no limit: a hang here hung the build
+                r = subprocess.CompletedProcess([], None, 'dafny ran longer than %d s' % TIMEOUT_S)
             if r.returncode != 0:
-                fail('FUZZ_NOT_VERIFIED', 'dafny verify %s: exit %d\n%s' % (fuzz, r.returncode, r.stdout[-600:]))
+                fail('FUZZ_NOT_VERIFIED', 'dafny verify %s: exit %s\n%s' % (fuzz, r.returncode, r.stdout[-600:]))
             else:
                 for t in bd['targets']:
                     work = os.path.join(tmp, 'fuzz-' + t)
@@ -1226,9 +1233,18 @@ def build_is_fresh(root, c):
     manifest = os.path.join(inside(root, c['build']['out']), c['name'], 'forge-build.json')
     if not os.path.isfile(manifest):
         return False
-    sources = (read_json(manifest, {}) or {}).get('sources', {})
+    data = read_json(manifest, {}) or {}
+    sources = data.get('sources', {})
     want = build_sources(root, c)
-    return sorted(sources) == sorted(want) and all(sources[f] == sha256(inside(root, f)) for f in want)
+    if not (sorted(sources) == sorted(want) and all(sources[f] == sha256(inside(root, f)) for f in want)):
+        return False
+    # The diff runs the emitted code as the reference: a hand edit there (one that agrees with the code under test)
+    # would make every disagreement vanish. The manifest holds the hash of every emitted file; `build --check` does
+    # the same comparison against a fresh build.
+    folder = os.path.join(inside(root, c['build']['out']), c['name'])
+    targets = data.get('targets') or {}
+    return all(t in targets and isinstance(targets[t].get('files'), dict) and
+               tree_hashes(os.path.join(folder, t)) == targets[t]['files'] for t in c['build'].get('targets', []))
 
 
 def run_diff(root, inputs=None, budget_ms=None, seed=None, coverage=False, only=None, tier=None, steer=None):
@@ -1263,7 +1279,9 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None, coverage=False, only=
             continue
         if not build_is_fresh(root, c):
             res['verdict'] = 'BUILD_STALE'
-            res['detail'] = 'the compiled proved code does not match the current Dafny files: run build'
+            res['detail'] = ('the compiled proved code does not match the current Dafny files, or a file under %s/%s '
+                             'differs from what build wrote (never edit emitted code by hand): run build'
+                             % (c['build']['out'], c['name']))
             continue
         local = tset['name'] == 'local'  # an entry's own numbers apply to the local tier only
         n = inputs if inputs is not None else df.get('inputs_per_run', tset['inputs']) if local else tset['inputs']
@@ -1344,6 +1362,17 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None, coverage=False, only=
                                               universal_newlines=True).stdout.strip())
         elif data.get('error'):
             res['verdict'] = 'DIFF_ERROR'
+        elif not data.get('candidates'):
+            # an adapter that names no candidates (a typo in "candidates") compares nothing
+            res['verdict'], res['error'] = 'DIFF_ERROR', 'the adapter names no candidates: nothing was compared'
+        elif (data.get('decisions') or {}).get('out_of_domain'):
+            res['verdict'], res['error'] = 'DIFF_ERROR', (
+                'recorded decision(s) %s are outside the rule (in_domain is false for them), so they were never '
+                'compared: fix the decision input or in_domain' % ', '.join(str(x) for x in data['decisions']['out_of_domain']))
+        elif data.get('inputs') and data['inputs'] <= data.get('out_of_domain', 0) + data.get('not_judged', 0) \
+                and not data.get('disagreements'):
+            res['verdict'], res['error'] = 'DIFF_ERROR', (
+                'no input was compared: all %d were outside the rule (in_domain) or not judged' % data['inputs'])
         elif data.get('disagreements') or (data.get('decisions') or {}).get('failing'):
             res['verdict'] = 'DISAGREE'
         else:
@@ -1823,9 +1852,22 @@ def next_rules(root, cfg, callers=None):
 
 
 def write_json(root, rel, value):
+    """Atomic: the status line (or a second run) reads these files while a run writes them; a reader saw a
+    half-written file before (ConfigError: not valid JSON), and a run killed mid-write left one behind."""
     os.makedirs(os.path.join(root, DIR), exist_ok=True)
-    with open(os.path.join(root, rel), 'w', encoding='utf-8', errors='backslashreplace') as f:  # a lone surrogate
-        f.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')  # (messy fuzz) is written as its JSON escape
+    path = os.path.join(root, rel)
+    fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(path) + '.', dir=os.path.dirname(path))
+    try:
+        mask = os.umask(0)
+        os.umask(mask)
+        os.chmod(tmp, os.stat(path).st_mode & 0o777 if os.path.exists(path) else 0o666 & ~mask)  # not mkstemp's 0600
+        with os.fdopen(fd, 'w', encoding='utf-8', errors='backslashreplace') as f:  # a lone surrogate (messy
+            f.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')  # fuzz) is written as its JSON escape
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
 
 # ---------------------------------------------------------------------------- bypass

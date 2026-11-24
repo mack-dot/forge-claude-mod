@@ -2,6 +2,28 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## Unreleased — checker and fuzzer review: fail-open paths and process lifecycle
+
+A review of the checker and the fuzzer for the class of bug the airlock's MCP client had (tests that ran one call at
+a time against well-behaved mocks). Each fix has a case in `tests/lifecycle_cases.py` that failed on main before it.
+- **Fix (soundness): `@Axiom` and `@VerifyOnly` are UNSOUND_CONSTRUCT.** Dafny 4 has an attribute syntax next to
+  `{:axiom}` / `{:only}`. Before, `@Axiom lemma L() ensures false` passed the text scan, `dafny verify` exited 0, and
+  `check` said VERIFIED for an implementation that shows every item (takedowns included).
+- **Fix (fail-open): `diff` no longer says DIFF_OK when it compared nothing.** An adapter that names no candidates
+  (a typo in `candidates`), a run where every generated input is outside `in_domain`, and a recorded decision outside
+  `in_domain` (counted as "agrees" before) are DIFF_ERROR now.
+- **Fix (fail-open): `diff` checks the emitted code against the build manifest.** Before, only the Dafny sources were
+  compared, so a hand edit of the emitted reference that agreed with a bug in the shipped code gave DIFF_OK. Now it is
+  BUILD_STALE (the same hashes `build --check` compares; Python caches are skipped as before).
+- **Fix: code under test that logs is fuzzed, not reported as broken.** The Python and JavaScript evaluators and
+  crash runners send the code's stdout to stderr (one `print` / `console.log` gave DIFF_ERROR, or a false ProcessExit
+  and "NOT judged" in CRASH-CHECK), and the runners drain stderr in a thread (after 64 KB of log the child blocked:
+  a false "hang"). Not changed: the Go, Rust, Java and C# evaluators (a candidate that prints there still breaks the
+  protocol, as a DIFF_ERROR).
+- **Fix: `.forge/*.json` state files are written atomically** (temp file and rename): the status line read a
+  half-written `last-diff.json` while a run wrote it. **Fix: `dafny verify` of the fuzz harness has the same time
+  limit as the other Dafny calls** (before, none: a hang hung `build`).
+
 ## Unreleased — recursive-rule acid test
 
 A recursive rule (a reply chain walked through a map by id, with cycles) taken through the whole Forge flow, on the
