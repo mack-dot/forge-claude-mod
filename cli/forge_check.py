@@ -256,8 +256,35 @@ def contract_extras(c):
     return [c[k] for k in ('examples', 'decisions') if c.get(k)]
 
 
-def contract_files(c):
-    return [c['spec']] + contract_extras(c)
+def spec_includes(root, c):
+    """The Dafny files the spec includes, directly or not (project-relative, without the spec). They are part of
+    what the spec means, so an approval covers them too (before 0.13.1 a change in an included file left the
+    approved spec's hash unchanged and gave no SPEC_CHANGED)."""
+    try:
+        return sorted(f for f in include_closure(root, [c['spec']]) if os.path.normpath(f) != os.path.normpath(c['spec']))
+    except ConfigError:
+        return []
+
+
+def contract_files(c, root=None):
+    """What an approval of this check covers: the spec, the files the spec includes (when root is given), and the
+    person's answers."""
+    return [c['spec']] + (spec_includes(root, c) if root else []) + contract_extras(c)
+
+
+def build_sources(root, c):
+    """The files whose hashes the build manifest records: the spec, the check's Dafny files and every file they
+    include (an unlisted included file changes the emitted code too)."""
+    try:
+        extra = include_closure(root, [c['spec']] + c['files'])
+    except ConfigError:
+        extra = []
+    seen = []
+    for f in [c['spec']] + c['files'] + sorted(extra):
+        f = os.path.normpath(f).replace(os.sep, '/')
+        if f not in seen:
+            seen.append(f)
+    return seen
 
 
 def cache_dir():
@@ -454,8 +481,8 @@ def trust_anchor(root, base, signers_arg):
                   'FORGE_ALLOWED_SIGNERS, or run with --base GIT_REF (CI)')
 
 
-def covered_files(cfg):
-    keys = [CONFIG] + sorted({f for c in cfg['checks'] for f in contract_files(c)})
+def covered_files(cfg, root=None):
+    keys = [CONFIG] + sorted({f for c in cfg['checks'] for f in contract_files(c, root)})
     return keys + [r for r in signed_extras(cfg) if r not in keys]
 
 
@@ -481,7 +508,7 @@ def signature_problem(root, cfg, base, signers_arg):
     if allowed and ktype not in allowed:
         return 'the approval is signed with a %s key; forge.json allows only %s' % (ktype, ', '.join(allowed))
     bad = []
-    for rel in covered_files(cfg):
+    for rel in covered_files(cfg, root):
         p = inside(root, rel)
         if not os.path.isfile(p):
             bad.append(rel + ' (missing)')
@@ -548,7 +575,7 @@ def run_checks(root, base=None, signers_arg=None, signed=True):
     config_ok = approved.get(CONFIG) == sha256(os.path.join(root, CONFIG))
     approval_changed = []
     if base:
-        protected = [CONFIG, APPROVED] + sorted({f for c in cfg['checks'] for f in contract_files(c)})
+        protected = [CONFIG, APPROVED] + sorted({f for c in cfg['checks'] for f in contract_files(c, root)})
         if signed and signing_required(root, cfg, base, signers_arg):
             protected += [SIG] + [r for r in signed_extras(cfg) if r not in protected]
         approval_changed = changed_since(root, base, protected)
@@ -578,15 +605,15 @@ def run_checks(root, base=None, signers_arg=None, signed=True):
         if not os.path.isfile(spec_path):
             put('ERROR', 'spec file %s is missing' % spec)
             continue
-        missing_contract = [f for f in contract_files(c) if not os.path.isfile(inside(root, f))]
+        missing_contract = [f for f in contract_files(c, root) if not os.path.isfile(inside(root, f))]
         if missing_contract:
             put('ERROR', 'missing contract file(s): ' + ', '.join(missing_contract))
             continue
-        unapproved = [f for f in contract_files(c) if f not in approved]
+        unapproved = [f for f in contract_files(c, root) if f not in approved]
         if unapproved:
             put('NOT_APPROVED', '%s never approved. Read and approve.' % ', '.join(unapproved))
             continue
-        changed = [f for f in contract_files(c) if not approved_matches(approved, f, inside(root, f))]
+        changed = [f for f in contract_files(c, root) if not approved_matches(approved, f, inside(root, f))]
         if changed:
             put('SPEC_CHANGED', '%s changed after approval. Read the new version and approve it.'
                 % ', '.join(changed))
@@ -1050,7 +1077,7 @@ def run_build(root, check_only):
                     'check': c['name'],
                     'labels': 'Dafny model: PROVED. This emitted code: NATIVE CHECK (unverified compiler). '
                               'Fuzz run: FINITE TEST.',
-                    'sources': {f: sha256(inside(root, f)) for f in [c['spec']] + c['files']},
+                    'sources': {f: sha256(inside(root, f)) for f in build_sources(root, c)},
                     'targets': b['targets'],
                 }
                 dest = os.path.join(inside(root, c['build']['out']), c['name'])
@@ -1166,7 +1193,7 @@ def build_is_fresh(root, c):
     if not os.path.isfile(manifest):
         return False
     sources = (read_json(manifest, {}) or {}).get('sources', {})
-    want = [c['spec']] + c['files']
+    want = build_sources(root, c)
     return sorted(sources) == sorted(want) and all(sources[f] == sha256(inside(root, f)) for f in want)
 
 
@@ -1403,7 +1430,7 @@ def invariants_text(root):
     rows, sections = [], []
     for c in cfg['checks']:
         name = c['name']
-        files = contract_files(c)
+        files = contract_files(c, root)
         state = []
         for f in files:
             p = inside(root, f)
@@ -1533,6 +1560,11 @@ def config_digest(cfg):
     return '\n'.join(lines)
 
 
+def contract_kind(c, rel):
+    return ('spec' if rel == c['spec'] else 'your answers' if rel == c.get('examples')
+            else 'decision record' if rel == c.get('decisions') else 'file the spec includes')
+
+
 def show_specs(root, full=False):
     """Text of what an approval covers, and the hashes of exactly the files it covers. By default a digest for
     reading (every spec clause complete, every answer, the whole decision record); full=True prints every file."""
@@ -1549,7 +1581,7 @@ def show_specs(root, full=False):
     parts = ['=== which code is checked against which spec: %s (%s) ===\n%s'
              % (CONFIG, state(CONFIG), json.dumps(cfg, indent=2) if full else config_digest(cfg))]
     for c in cfg['checks']:
-        for rel in contract_files(c):
+        for rel in contract_files(c, root):
             if rel in hashes:
                 continue
             hashes[rel] = contract_hash(inside(root, rel))
@@ -1559,8 +1591,7 @@ def show_specs(root, full=False):
             if not full and state(rel) == 'approved':
                 # Already approved and unchanged: one line, so the screen shows only what is new.
                 parts.append('=== %s %s: %s (approved, unchanged, sha256 %s…) ===' % (
-                    c['name'], 'spec' if rel == c['spec'] else 'your answers' if rel == c.get('examples')
-                    else 'decision record', rel, hashes[rel][:12]))
+                    c['name'], contract_kind(c, rel), rel, hashes[rel][:12]))
                 continue
             if not full and rel == c['spec']:
                 body = spec_digest(body)
@@ -1569,7 +1600,7 @@ def show_specs(root, full=False):
                 body = ('%d answers written as Dafny asserts (%s); each must follow from the spec, or check fails with '
                         'EXAMPLES_FAILED.' % (len(set(ids)), ', '.join(sorted(set(ids), key=lambda x: (len(x), x))))
                         if ids else body)
-            kind = 'spec' if rel == c['spec'] else 'your answers' if rel == c.get('examples') else 'decision record'
+            kind = contract_kind(c, rel)
             parts.append('=== %s %s: %s (%s, sha256 %s…) ===\n%s'
                          % (c['name'], kind, rel, state(rel), hashes[rel][:12], body))
     if cfg.get('require_signed_approval'):
@@ -1625,7 +1656,7 @@ def described_files(root, c):
 
 
 def refs_in_text(root, c, text):
-    own = set(contract_files(c) + [c['spec']] + c['files'] + [CONFIG])
+    own = set(contract_files(c, root) + [c['spec']] + c['files'] + [CONFIG])
     out_dir = (c.get('build') or {}).get('out')
     found = set()
     for m in _PATHLIKE.finditer(text):
@@ -1691,6 +1722,14 @@ def next_rules(root, cfg):
     path), as the suggested next rule. The record lists what the rule assumes; proving one of those assumptions
     closes a gap the proof depends on. A heuristic over the person's own words."""
     out = {}
+    # A name that another check's record states as its subject (outside its Out of scope and Notes) is covered by
+    # that check: once a second rule proves `walk_thread()`, the first rule no longer offers it as the next rule.
+    covered = {}
+    for c in cfg['checks']:
+        rel = c.get('decisions')
+        if rel and os.path.isfile(inside(root, rel)):
+            for m in _IDENT.finditer(normative_text(read_text(inside(root, rel)))):
+                covered.setdefault(m.group(1), set()).add(c['name'])
     for c in cfg['checks']:
         rel = c.get('decisions')
         if not rel or not os.path.isfile(inside(root, rel)):
@@ -1698,6 +1737,9 @@ def next_rules(root, cfg):
         for line in _section(read_text(inside(root, rel)), 'Out of scope').split('\n'):
             item = line.strip().lstrip('-*').strip()
             if not item:
+                continue
+            subject = _IDENT.search(item)
+            if subject and covered.get(subject.group(1), set()) - {c['name']}:
                 continue
             refs = sorted(refs_in_text(root, c, item))
             if refs:
@@ -1859,7 +1901,7 @@ def scope_matchers(c):
 
 def rule_own_files(root, cfg, c):
     """Project-relative files (and folders, ending in /) that belong to the rule itself: never reported."""
-    files = set(contract_files(c)) | set(c['files'])
+    files = set(contract_files(c, root)) | set(c['files'])
     bd = c.get('build') or {}
     if bd.get('fuzz'):
         files.add(bd['fuzz'])

@@ -2,6 +2,36 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## Unreleased — recursive-rule acid test
+
+A recursive rule (a reply chain walked through a map by id, with cycles) taken through the whole Forge flow, on the
+owner's app copy and on a new synthetic fixture. Each item says what was tested and how.
+- **New fixture** `examples/thread-visibility` (synthetic, written for this repository): a thread whose replies share
+  the fate of every post above them (takedown, flag, other channel); the walk has a visited set, so a cycle ends it.
+  The Dafny model proves termination and the rule; `tests/run_tests.py` runs it with planted bugs that must be caught:
+  a cycle hang (DIFF_ERROR in seconds), a reply that ignores its parent chain (D1, D3, D4, D5 fail), a check of the
+  direct parent only (D3 fails), a Dafny walk without its visited set and a Dafny model without the ancestors
+  (FAILED). Negative control: the correct code gives DIFF_OK with 9 of 9 decisions.
+- **Fix (soundness): an approval now covers the files the spec includes.** Before, `spec/X.dfy` could include a file
+  with the rule's predicates; a change there left the spec's own hash unchanged and `check` said VERIFIED (the model
+  calls the changed predicate). Now such a file is a contract file: `SPEC_CHANGED`, shown in `/forge approve` as
+  "file the spec includes". Upgrade: a project whose spec includes files gets NOT_APPROVED once; approve again.
+- **Fix: the build manifest and `diff`'s freshness test cover included Dafny files.** Before, a changed included
+  file (for example the impl of another check that this impl includes) did not make the build stale, and `diff`
+  ran the old compiled code. Upgrade: such a project is BUILD_STALE once; run build.
+- **Fix: shrinking no longer uses up the fuzz budget.** All shrinking in one run (failing recorded decisions and new
+  disagreements) gets at most a quarter of the time budget. Before, one failing decision was shrunk with up to 300
+  evaluator calls; with a slow evaluator that was the whole 1.5 s end-of-turn budget. Measured (one machine, shared
+  with other jobs, so noisy): the fixture with a 4 ms buggy candidate searched 0, 8 and 11 fresh inputs on main (one
+  run took 3.1 s), 8, 77 and 73 with the fix (1.5 to 2.1 s). A test pins >= 25. On the owner's app copy (nested rows,
+  ~200 messy field/kind pairs) the gain was not clear under that load: main 7 to 40 inputs, fix 5 to 30 (6 seeds).
+  A cap on the messy step's share was tried and dropped: it cut messy coverage without a clear gain.
+- **Fix: the next-rule hint skips an item whose subject another check states as its rule** (in its decision record,
+  outside Out of scope and Notes). Before, a rule kept offering a function as its next rule after a second rule had proved that function.
+- `/forge:add`: a spec may import another check's abstract spec; extra includes go in the binding prefix.
+- Found, not fixed: `bypass` lists the check's own unproved wrapper (a file that imports the emitted module) as a
+  hit; `mutate` copies the whole project for each mutant (2.2 GB on the owner's app copy); `check` took 35 to 49 s
+  there (the proofs alone about 15 s; the rest is not profiled yet).
 ## Unreleased
 
 - New (diff): **stateful trace fuzz** (`cli/forge_trace.py`) for models of the form `Step(State, Event, now)`. A

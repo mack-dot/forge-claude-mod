@@ -52,6 +52,10 @@ CALL_TIMEOUT_S = 2.0
 MAX_PER_CANDIDATE = 40  # examples kept per candidate per run
 MAX_PER_GROUP = 3  # differently shaped examples kept per kind of wrong answer
 MESSY_PER_INPUT = 1  # messy variants tried per generated input once every (field, kind) pair has been tried
+# All shrinking in one run (failing recorded decisions and new disagreements) may use at most this share of the
+# time budget. Shrinking only makes an example smaller; it must not stop the search (before 0.13.1 one known failing
+# decision with a slow evaluator took 300 calls, the whole 1.5 s end-of-turn budget, and no fresh input was tried).
+SHRINK_SHARE = 0.25
 MESSY_MAX_DEPTH = 4  # how deep into nested objects and lists the messy fields go
 MESSY_MAX_FIELDS = 64  # fields considered per input
 MESSY_LIST_ITEMS = 2  # list elements considered per list
@@ -444,14 +448,23 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
                         continue
                     m_record(name, apply_messy(small, path, kind), meta, True)
 
+        shrink_left = [budget_ms * SHRINK_SHARE / 1000.0]  # seconds of shrinking left in this run
+
         def shrink(name, inp):
+            t0 = time.time()
+            try:
+                return shrink_within(name, inp, t0 + max(shrink_left[0], 0.0))
+            finally:
+                shrink_left[0] -= time.time() - t0
+
+        def shrink_within(name, inp, deadline):
             sig = signature(*disagrees(name, inp))
             best, steps, improved = inp, 0, True
             while improved and steps < 300:
                 improved = False
                 for s in shrinks(best):
                     steps += 1
-                    if steps > 300:
+                    if steps > 300 or time.time() > deadline:
                         break
                     d = disagrees(name, s)
                     if d and signature(*d) == sig:
