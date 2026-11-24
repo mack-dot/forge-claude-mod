@@ -82,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kind: [clean, spec-weakened, spec-weakened-nobase, bypass, stale-invariants, logic-bug]
+        kind: [clean, spec-weakened, spec-weakened-nobase, bypass, stale-invariants, logic-bug, unverified-caller]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

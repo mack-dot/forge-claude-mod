@@ -62,6 +62,22 @@ owner's app copy and on a new synthetic fixture. Each item says what was tested 
   frameworks run for real (Express, Next.js, Flask, Django, FastAPI apps are called directly with fake request
   objects); steering of Go, Rust, Java, C#; the `diff-tier` Action input in a hosted workflow other than this
   repository's own jobs.
+- New (callers): a static call graph for JavaScript/TypeScript and Python (`cli/forge_callgraph.py`; standard
+  library only). A check's `"callers"` names its governed decision, the wrapper that calls the proved code and the
+  replaced logic; `check` gives `UNVERIFIED_CALLER` (exit 1) for a caller of the replaced logic (also through an
+  import alias, a re-export or a namespace import), a same-name re-implementation, an unresolved member call by the
+  decision's name, or a decision that no longer reaches its wrapper, unless it is in `"allowedCallers"`. Other
+  languages: `callers not checked`. New commands `callers` (report, `--record`) and `status` (the one-line status).
+- New (feeders): the same graph ranks the unproved functions that feed the decision's parameters (direct callers that
+  compute an argument; functions whose return values flow into one) by leverage; `next_rule` names the top one.
+- New (status line): the mod's line comes from `forge_check.py status`: green `forge ✓ model PROVED · 0 bypasses ·
+  fuzz N ok · callers N ok · records current`; yellow `forge ⚠ DRIFT: …` naming a stale decision note, a wrapper
+  changed since the last approval or clean diff run (`.forge/wrapper-hashes.json`, a `WRAPPER_CHANGED` warning in
+  `check`), or a new unverified caller; red `forge ✗` otherwise.
+- forge-ci: its own summary rows for the caller gate and for each `serviceTest` (`NOT_CALLED`), the caller part in each
+  rule's status line, the top feeder, and a new Action negative control `unverified-caller`.
+- Tested: `tests/callgraph_cases.py` (in `tests/run_tests.py`), 23 cases; see the pull request for what ran where.
+
 - New (diff): **stateful trace fuzz** (`cli/forge_trace.py`) for models of the form `Step(State, Event, now)`. A
   `"trace"` block on a `js` or `py` diff entry gives seeded multi-event traces with the clock moving and injected
   retries, replays, reorders and restarts (save, then load). Model and candidates run in lockstep; verdict and state

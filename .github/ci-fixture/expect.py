@@ -8,11 +8,14 @@ v = r['verdicts']
 check = (v.get('check') or {}).get('wallet-cap')
 want = {
     'clean': ('success', lambda: check == 'VERIFIED' and v['build'] == {'wallet-cap': 'BUILT'}
+              and r['gates']['callers']['ok'] is True and r['callers']['wallet-cap']['unverified'] == []
               and v['invariants'] == 'INVARIANTS_OK' and v['diff'] == {'wallet-cap': 'DIFF_OK'}
               and r['diff']['wallet-cap']['inputs'] == 50000),
     'spec-weakened': ('failure', lambda: check == 'APPROVAL_CHANGED'),
     'spec-weakened-nobase': ('failure', lambda: check == 'SPEC_CHANGED'),
     'bypass': ('failure', lambda: check == 'UNAPPROVED_BYPASS' and r['bypasses']['unreviewed'] == 1),
+    'unverified-caller': ('failure', lambda: check == 'UNVERIFIED_CALLER' and r['gates']['callers']['ok'] is False
+                          and [(h['file'], h['line']) for h in r['callers']['wallet-cap']['unverified']] == [('fast_path.py', 5)]),
     'stale-invariants': ('failure', lambda: check == 'VERIFIED' and v['invariants'] == 'INVARIANTS_STALE'),
     'logic-bug': ('failure', lambda: check == 'VERIFIED' and v['diff'] == {'wallet-cap': 'DISAGREE'}
                   and r['diff']['wallet-cap']['disagreements'] >= 1),

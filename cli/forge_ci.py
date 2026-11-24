@@ -136,10 +136,10 @@ def fmt(n):
     return format(n, ',')
 
 
-def status_line(name, verdict, cfg_check, outside, diff_rows, build, inv_ok):
+def status_line(name, verdict, cfg_check, outside, diff_rows, build, inv_ok, callers=None, service=None):
     """One scope-honest line per rule, the same parts as the Claude Code status line. ✓ only if every part passed."""
     good = verdict == 'VERIFIED'
-    parts = ['model PROVED' if good else 'model PROVED, %s' % verdict if verdict == 'UNAPPROVED_BYPASS'
+    parts = ['model PROVED' if good else 'model PROVED, %s' % verdict if verdict in ('UNAPPROVED_BYPASS', 'UNVERIFIED_CALLER')
              else '%s (model NOT shown proved)' % verdict]
     if diff_rows:
         bad = sum(len(r.get('disagreements') or []) + len((r.get('decisions') or {}).get('failing') or [])
@@ -158,6 +158,20 @@ def status_line(name, verdict, cfg_check, outside, diff_rows, build, inv_ok):
             len(outside), '' if len(outside) == 1 else 'es', len(cfg_check.get('allowedBypasses') or [])))
     else:
         parts.append('bypasses NOT searched (no watchedFields)')
+    if cfg_check.get('callers'):
+        if callers is None or callers.get('verdict') == 'CALLERS_ERROR':
+            good = False
+            parts.append('callers ERROR')
+        elif callers.get('verdict') == 'NOT_CHECKED':
+            parts.append('callers not checked (other language)')
+        else:
+            unv = len(callers.get('unverified') or [])
+            good = good and not unv
+            parts.append('%d unverified caller%s' % (unv, '' if unv == 1 else 's') if unv else
+                         'callers %d ok' % len(callers.get('verified') or []))
+    if service is not None:
+        good = good and service == 'CALLED'
+        parts.append('serviceTest %s' % service)
     if build is not None:
         good = good and build == 'BUILT'
         parts.append('build %s' % build)
@@ -205,7 +219,7 @@ def run(a):
     gate('check', ok, (', '.join('%s %s' % kv for kv in verdicts.items()) if verdicts else
                        'ERROR: %s' % ((res or {}).get('error') or raw.strip()[-300:])),
          'Dafny proof; NOT_APPROVED, SPEC_CHANGED, CONFIG_CHANGED, APPROVAL_CHANGED, BINDING_BROKEN, '
-         'UNSOUND_CONSTRUCT (included files too), EXAMPLES_FAILED, UNAPPROVED_BYPASS')
+         'UNSOUND_CONSTRUCT (included files too), EXAMPLES_FAILED, UNAPPROVED_BYPASS, UNVERIFIED_CALLER')
     outside = (res or {}).get('outside') or {}
     n_bypass = sum(len(v) for v in outside.values())
     allowed = sum(len(c.get('allowedBypasses') or []) for c in cfg['checks'])
@@ -215,8 +229,38 @@ def run(a):
          ('%d unreviewed, %d allowed by a person' % (n_bypass, allowed)) if watched else
          'NOT searched: no check has watchedFields', 'UNAPPROVED_BYPASS (a text search, not data flow)')
 
-    # 3. build --check.
-    build_v = {}
+    # 2b. callers: every caller of each governed decision goes through its wrapper (static call graph, in check).
+    callers = (res or {}).get('callers') or {}
+    with_callers = [c['name'] for c in cfg['checks'] if c.get('callers')]
+    report['callers'] = {k: {x: v.get(x) for x in ('verdict', 'unverified', 'tests', 'reviewed', 'not_checked', 'error')}
+                         for k, v in callers.items()}
+    report['callers'].update({k: {'verdict': 'CALLERS_ERROR', 'error': (res or {}).get('callers_error') or 'no result'}
+                              for k in with_callers if k not in callers})
+    if not with_callers:
+        gate('callers', None, 'NOT checked: no check has "callers" (a decision and its wrapper)',
+             'UNVERIFIED_CALLER (static call graph, JS/TS and Python)')
+    else:
+        texts, ok_c = [], True
+        for k in with_callers:
+            r = report['callers'][k]
+            v = r.get('verdict')
+            if v == 'UNVERIFIED_CALLER':
+                ok_c = False
+                texts.append('%s: %d unverified caller(s): %s' % (k, len(r['unverified']), ', '.join(
+                    '%s:%d' % (h['file'], h['line']) for h in r['unverified'][:8])))
+            elif v == 'CALLERS_ERROR':
+                ok_c = False
+                texts.append('%s: ERROR %s' % (k, r.get('error')))
+            elif v == 'NOT_CHECKED':
+                texts.append('%s: callers not checked (%s)' % (k, '; '.join(r.get('not_checked') or [])))
+            else:
+                texts.append('%s: %d through the decision, 0 unverified, %d in tests (not gated)' % (
+                    k, len(callers[k].get('verified') or []), r.get('tests') or 0))
+        gate('callers', ok_c, '; '.join(texts), 'UNVERIFIED_CALLER (static call graph, JS/TS and Python)')
+
+    # 3. build --check (it also runs each "serviceTest": NOT_CALLED if no process called the built code).
+    build_v, service_v = {}, {}
+    with_service = [c['name'] for c in cfg['checks'] if (c.get('build') or {}).get('serviceTest')]
     if a.build == 'false':
         gate('build', None, 'off (build: false)', 'STALE_BUILD, APP_SYNTAX_ERROR, NOT_CALLED')
     elif not p['build']:
@@ -228,11 +272,29 @@ def run(a):
         print('::endgroup::')
         build_v = {n: b['verdict'] for n, b in ((res_b or {}).get('build') or {}).items()}
         report['verdicts']['build'] = build_v
+        for n, b in ((res_b or {}).get('build') or {}).items():
+            if b.get('service_test') is not None or b['verdict'] in ('NOT_CALLED', 'SERVICE_TEST_FAILED'):
+                st = b.get('service_test') or {}
+                service_v[n] = 'NOT_CALLED' if b['verdict'] == 'NOT_CALLED' else 'FAILED' if b['verdict'] == \
+                    'SERVICE_TEST_FAILED' else 'CALLED' if st.get('calls') else 'NOT_CALLED'
+                report.setdefault('service_test', {})[n] = dict(st, verdict=service_v[n])
         ok = code == 0 and bool(build_v)
         gate('build', ok, ', '.join('%s %s' % kv for kv in build_v.items()) or
              'not run: %s' % ('check is not VERIFIED' if res_b and 'verdicts' in res_b else raw.strip()[-300:]),
              'compiled code fuzzed per target, committed emitted code equals a fresh build (STALE_BUILD), '
              'APP_SYNTAX_ERROR, serviceTest (NOT_CALLED)')
+    if not with_service:
+        gate('serviceTest', None, 'NOT run: no check has a "build" "serviceTest" (a live trace that the app calls '
+             'the built code)', 'NOT_CALLED, SERVICE_TEST_FAILED')
+    elif not service_v:
+        gate('serviceTest', None if a.build == 'false' else False,
+             'off (build: false)' if a.build == 'false' else 'NOT run: the build gate stopped first',
+             'NOT_CALLED, SERVICE_TEST_FAILED')
+    else:
+        gate('serviceTest', all(v == 'CALLED' for v in service_v.values()),
+             '; '.join('%s %s%s' % (n, v, ' (%d process(es) called the built code)' % report['service_test'][n]['calls']
+                                    if report['service_test'][n].get('calls') else '') for n, v in service_v.items()),
+             'NOT_CALLED, SERVICE_TEST_FAILED (a live trace, js target)')
 
     # 4. INVARIANTS.md.
     inv_ok = None
@@ -296,7 +358,10 @@ def run(a):
         name = c['name']
         rows_c = [r for k, r in diff_rows.items() if k == name or k.startswith(name + ':')]
         lines.append('- ' + status_line(name, verdicts.get(name, 'ERROR'), c, outside.get(name) or [], rows_c,
-                                        build_v.get(name), inv_ok))
+                                        build_v.get(name), inv_ok, callers.get(name), service_v.get(name)))
+    for name, n in ((res or {}).get('next_rule') or {}).items():
+        if n.get('feeder'):
+            lines.append('- next rule for %s (call graph): prove %s' % (name, n['feeder']['text']))
     lines += ['', '| Gate | Result | Covers |', '| --- | --- | --- |']
     lines += ['| %s | %s | %s |' % (k, t.replace('|', '\\|').replace('\n', ' '), cov) for k, t, cov in rows]
     rel = os.path.relpath(root)
@@ -306,6 +371,8 @@ def run(a):
     if base:
         cmd.append('git fetch --no-tags --depth=1 origin %s' % base)
     cmd.append('python3 %s check --root %s%s' % (fcp, rel, ' --base ' + base if base else ''))
+    if with_callers:
+        cmd.append('python3 %s callers --root %s' % (fcp, rel))
     if 'build' in report['verdicts']:
         cmd.append('python3 %s build --check --no-write --root %s' % (fcp, rel))
     if inv_ok is not None:
@@ -317,8 +384,8 @@ def run(a):
                    % (fcp, rel, a.inputs, int(a.budget_s) * 1000, seed))
     lines += ['', 'Reproduce locally, in this repository:', '', '```sh', '\n'.join(cmd), '```', '',
               'Labels: the Dafny model is PROVED against the approved spec. The compiled code, the wrapper and '
-              'other app code are NOT proved: the build fuzz and the diff sweep are FINITE TESTS, and the bypass '
-              'gate is a text search.']
+              'other app code are NOT proved: the build fuzz and the diff sweep are FINITE TESTS, the bypass '
+              'gate is a text search, and the caller gate is a static call graph (no dynamic dispatch).']
     report['reproduce'] = cmd
     text = '\n'.join(lines) + '\n'
     print(text)
