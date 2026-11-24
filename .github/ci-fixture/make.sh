@@ -42,4 +42,6 @@ git -c user.name=fixture -c user.email=fixture@example.invalid commit -q -m "fix
 git init -q --bare "$dest.origin.git"
 git remote add origin "$dest.origin.git"
 git push -q origin main
+# A stacked pull request has a base other than main: the Action fetches that name, so the fixture has it too.
+if [ -n "${GITHUB_BASE_REF:-}" ] && [ "$GITHUB_BASE_REF" != main ]; then git push -q origin "main:refs/heads/$GITHUB_BASE_REF"; fi
 echo "fixture ready: $dest (origin $dest.origin.git)"
