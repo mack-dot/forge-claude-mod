@@ -653,9 +653,17 @@ def test_names():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_mcp_client():
+    """HttpUpstream regressions R1 (parallel calls after a 404) and R2 (idle pooled connection closed)."""
+    sys.path.insert(0, HERE)
+    import mcp_client_regress
+    for name, ok, *detail in mcp_client_regress.cases():
+        case(name, bool(ok), detail[0] if detail else "")
+
+
 def main():
     for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static,
-              test_redteam, test_human_approval, test_isolation, test_names, test_m22, test_m22_controls):
+              test_redteam, test_human_approval, test_isolation, test_names, test_m22, test_m22_controls, test_mcp_client):
         try:
             t()
         except Exception as e:  # noqa: BLE001

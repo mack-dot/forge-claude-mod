@@ -12,8 +12,10 @@ import itertools
 import json
 import os
 import re
+import select
 import subprocess
 import threading
+import time
 from urllib.parse import urlsplit
 
 from policy import strict_loads
@@ -110,6 +112,8 @@ SUPPORTED = ("2025-06-18", "2025-03-26")  # MCP versions with the Streamable HTT
 MAX_RESPONSE = int(os.environ.get("FORGE_UPSTREAM_MAX_BODY", str(8 << 20)))  # bytes per upstream answer
 MAX_LINE = 1 << 20  # one SSE line
 SESSION_RE = re.compile(r"[\x21-\x7e]{1,256}")  # MCP: visible ASCII only
+POOL_IDLE_S = float(os.environ.get("FORGE_UPSTREAM_POOL_IDLE_S", "4"))  # below common keep-alive timeouts (5 s)
+SAFE_TO_RESEND = ("initialize", "tools/list")  # never tools/call: a gated call must not run twice
 
 
 class HttpUpstream:
@@ -133,29 +137,40 @@ class HttpUpstream:
         self._path = (u.path or "/") + (f"?{u.query}" if u.query else "")
         self._ids = itertools.count(1)
         self._lock = threading.Lock()  # session state
-        self._pool, self._plock = [], threading.Lock()
+        self._init_lock = threading.Lock()  # one re-initialize at a time; other calls wait for it (R1)
+        self._pool, self._plock = [], threading.Lock()  # (connection, time it was released)
         self.session, self.version = None, PROTOCOL
         self._need_init = False
         self._init_params = None
 
     # -- connections
     def _conn(self, timeout):
-        with self._plock:
-            c = self._pool.pop() if self._pool else None
-        if c is None:
-            cls = http.client.HTTPSConnection if self._https else http.client.HTTPConnection
-            c = cls(self._host, self._port, timeout=timeout)
-        else:
-            c.timeout = timeout
-            if c.sock is not None:
+        """A pooled keep-alive connection that is still open, else a new one. Returns (connection, reused).
+        R2: a connection the upstream closed while it sat in the pool is dropped here, before a request is
+        sent on it (a closed socket is readable: EOF; any other unread byte also means it is not clean)."""
+        while True:
+            with self._plock:
+                item = self._pool.pop() if self._pool else None
+            if item is None:
+                break
+            c, since = item
+            if c.sock is not None and time.monotonic() - since < POOL_IDLE_S and not _readable(c.sock):
+                c.timeout = timeout
                 c.sock.settimeout(timeout)
-        return c
+                return c, True
+            c.close()
+        cls = http.client.HTTPSConnection if self._https else http.client.HTTPConnection
+        return cls(self._host, self._port, timeout=timeout), False
+
+    def _fresh(self, timeout):
+        cls = http.client.HTTPSConnection if self._https else http.client.HTTPConnection
+        return cls(self._host, self._port, timeout=timeout)
 
     def _release(self, c, reuse):
-        if reuse:
+        if reuse and c.sock is not None:
             with self._plock:
                 if len(self._pool) < 16:
-                    self._pool.append(c)
+                    self._pool.append((c, time.monotonic()))
                     return
         c.close()
 
@@ -173,14 +188,25 @@ class HttpUpstream:
         data = json.dumps(body, allow_nan=False).encode()
         method = body.get("method")
         sent_session = self.session
-        c = self._conn(timeout)
+        c, reused = self._conn(timeout)
         reuse = False
         try:
             try:
                 c.request("POST", self._path, body=data, headers=self._headers())
                 r = c.getresponse()
             except (OSError, http.client.HTTPException) as e:  # timeouts, resets, DNS
-                raise UpstreamError(f"{self.name}: {type(e).__name__}: {str(e)[:120]}") from None
+                c.close()
+                if reused and method in SAFE_TO_RESEND and isinstance(e, (ConnectionError, http.client.RemoteDisconnected)):
+                    # R2, the narrow race left after the check in _conn: the upstream closed the kept-alive
+                    # connection as we sent. Only requests without side effects are sent again, once, fresh.
+                    c = self._fresh(timeout)
+                    try:
+                        c.request("POST", self._path, body=data, headers=self._headers())
+                        r = c.getresponse()
+                    except (OSError, http.client.HTTPException) as e2:
+                        raise UpstreamError(f"{self.name}: {type(e2).__name__}: {str(e2)[:120]}") from None
+                else:
+                    raise UpstreamError(f"{self.name}: {type(e).__name__}: {str(e)[:120]}") from None
             sid = r.getheader("mcp-session-id")
             if r.status == 404 and sent_session is not None:
                 _drain(r)
@@ -273,6 +299,8 @@ class HttpUpstream:
             raise UpstreamError(f"{self.name}: upstream protocol version {str(v)[:30]!r} is not one of {SUPPORTED}")
         self.version = v
         self._post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, timeout)
+        with self._lock:
+            self._need_init = False
         return res
 
     def notify(self, method, params=None):
@@ -286,14 +314,12 @@ class HttpUpstream:
             self._init_params = params or {}
             return self._initialize(self._init_params, timeout)
         if self._need_init:
-            with self._lock:
-                need, self._need_init = self._need_init, False
-            if need:
-                try:
+            # R1: one thread re-initializes; calls that arrive meanwhile wait for it and then use the new
+            # session (before, they went out with no session id and failed). A failed initialize leaves
+            # _need_init set, so the next call tries again.
+            with self._init_lock:
+                if self._need_init:
                     self._initialize(self._init_params or {}, timeout)
-                except UpstreamError:
-                    self._need_init = True
-                    raise
         body = {"jsonrpc": "2.0", "id": next(self._ids), "method": method, "params": params or {}}
         msg = self._post(body, timeout)
         if msg is None:
@@ -305,13 +331,22 @@ class HttpUpstream:
         if self.session is None:
             return
         try:
-            c = self._conn(2)
+            c = self._fresh(2)
             c.request("DELETE", self._path, headers=self._headers())
             _drain(c.getresponse())
             c.close()
         except (OSError, http.client.HTTPException):
             pass
         self.session = None
+
+
+def _readable(sock):
+    """True if the idle socket has something to read: EOF (the peer closed it) or stray bytes."""
+    try:
+        r, _, _ = select.select([sock], [], [], 0)
+        return bool(r)
+    except (OSError, ValueError):
+        return True
 
 
 def _drain(r):
