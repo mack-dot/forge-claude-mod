@@ -13,6 +13,10 @@ import re
 import sys
 import unicodedata
 
+# run as `python3 -I policy.py check` in the image: -I leaves this folder off sys.path, and the folded
+# path rules import sync.fold from here (as gateway.py and export_changes.py do)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 MONEY_MAX = (1 << 63) - 1
 U64_MAX = (1 << 64) - 1
 

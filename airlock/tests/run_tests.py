@@ -693,10 +693,20 @@ def test_observations():
         case(name, bool(ok), detail[0] if detail else "")
 
 
+def test_policy_cli_isolated():
+    """The image runs `python3 -I /forge/airlock/policy.py check`: -I drops the script folder from sys.path.
+    A local import in policy.py must still work (regression: the O6 fold import broke every forge up)."""
+    pol = os.path.join(HERE, "..", "proof", "policies", "codebase.yaml")
+    r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "..", "engine", "policy.py"), "check", pol],
+                       capture_output=True, text=True)
+    case("policy CLI: `python3 -I policy.py check` runs (as in the image)", r.returncode == 0,
+         (r.returncode, r.stderr[-300:]))
+
+
 def main():
     for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static,
               test_redteam, test_human_approval, test_isolation, test_names, test_m22, test_m22_controls, test_inbox,
-              test_mcp_client, test_concurrency, test_rest, test_observations):
+              test_mcp_client, test_concurrency, test_policy_cli_isolated, test_rest, test_observations):
         try:
             t()
         except Exception as e:  # noqa: BLE001
