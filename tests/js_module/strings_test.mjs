@@ -23,7 +23,7 @@ const ovs = q => q.toVerbatimString(false)
 
 let seed = 12345
 const rand = n => { seed = (Math.imul(seed, 1103515245) + 12345) >>> 0; return (seed >>> 8) % n }
-const ALPHABET = [' ', '\t', '\n', ' ', ' ', '　', 'a', 'b', 'é', '😀', '*', 'companion', 'x', '漢']
+const ALPHABET = [' ', '\t', '\n', ' ', ' ', '　', 'a', 'b', 'é', '😀', '*', 'system', 'x', '漢']
 const pool = Array.from({ length: 300 }, () => Array.from({ length: rand(8) }, () => ALPHABET[rand(ALPHABET.length)]).join(''))
 const pick = () => pool[rand(pool.length)]
 
@@ -89,11 +89,11 @@ if (hits === 0) failures.push('the cache was never filled')
 
 // a cached seq is frozen: a change throws (ES modules are strict) and the next call still gets the same value
 M.setStringCacheLimit(100)
-const q = M.toDafnyString('companion')
+const q = M.toDafnyString('system')
 if (!Object.isFrozen(q) || !Object.isFrozen(q[0])) failures.push('a cached seq is not frozen')
 try { q[0] = M.toDafnyString('x')[0]; failures.push('a cached seq could be changed') } catch { /* expected */ }
-check('after a change attempt', M.fromDafnyString(M.toDafnyString('companion')), 'companion')
-check('same object from the cache', M.toDafnyString('companion') === q, true)
+check('after a change attempt', M.fromDafnyString(M.toDafnyString('system')), 'system')
+check('same object from the cache', M.toDafnyString('system') === q, true)
 
 // conversions refuse what they cannot hold exactly
 const throwsOf = f => { try { f(); return 'none' } catch (e) { return e.name } }
