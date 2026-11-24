@@ -212,10 +212,10 @@ Measured (one machine, Node 24.3.0, warm, median of 5 passes):
 | Case (one pass) | old loader (`new Function` / `Module._compile`) | generated module |
 | --- | --- | --- |
 | wallet-cap `Spend`, 2,000 entries x 10 calls, ints only | 6.34–6.42 ms | 6.48–6.73 ms |
-| a chronicle rule (strings, 10 consent limits), 2,000 calls | 62.6–81.9 ms | 26.7–41.3 ms |
+| a string-heavy rule from a real app (10 limits per call), 2,000 calls | 62.6–81.9 ms | 26.7–41.3 ms |
 | wallet variant with a bounded `newtype` instead of `int` (not the approved spec) | — | 0.40–0.46 ms |
 
-Ranges are the medians of 3 runs. Same answers on every call compared (20,000 wallet calls, 8,000 chronicle calls).
+Ranges are the medians of 3 runs. Same answers on every call compared (20,000 wallet calls, and every call of the app rule).
 The gain comes from the string cache; code that uses only `int` is not faster, because bignumber.js does the work
 (`tests/js_module/bench_wallet.mjs` reproduces the wallet row).
 
@@ -315,11 +315,11 @@ score is a FINITE TEST of the fuzz, not of the code.
 ## Bypass: code that goes around a proved rule
 
 A proof is only as strong as the guarantee that nothing goes around it. On a real app, a proved read rule decided that
-`body.for` counts only on Companion's rows, but two other functions still trusted `body.for` on any row. A person
+one field counts only on one kind of row, but two other functions still trusted that field on any row. A person
 found that by hand. `bypass` finds such places.
 
-Add `"watchedFields"` to a check: the texts that name what the rule decides on (field names such as `body.for` or
-`householdId`, a comparison, function names). A text between slashes is a regular expression
+Add `"watchedFields"` to a check: the texts that name what the rule decides on (field names such as `body.owner` or
+`groupId`, a comparison, function names). A text between slashes is a regular expression
 (`"/spent\\s*\\+\\s*amount[^;{]*<=?\\s*cap/"`); anything else is literal. `/forge:bypass` proposes them from the approved
 spec and decision record. Then:
 
@@ -342,7 +342,7 @@ but a line outside the rule matches and is not in its approved `allowedBypasses`
 proof (or any other verdict) still wins. A check without `watchedFields` behaves as before.
 
 **Specific terms.** Because it is a gate, a term must name the forms that decide, not every mention:
-`.body.for` (a property access), `/\\bhouseholdId\\s*(===|!==|==|!=)/` (a comparison), not a bare `householdId`.
+`.body.owner` (a property access), `/\\bgroupId\\s*(===|!==|==|!=)/` (a comparison), not a bare `groupId`.
 `bypass --count --rule NAME --set-terms TERM…` previews the number of lines per term and writes nothing.
 
 | Bypass verdict | Meaning | Exit |
@@ -353,17 +353,16 @@ proof (or any other verdict) still wins. A check without `watchedFields` behaves
 | `UNAPPROVED_BYPASS` (a `check` verdict) | The proof passed, but an unallowed line outside the rule matches | 1 |
 
 `check` runs the same search: the unreviewed places also go under `"outside"` in its JSON and on one line of its
-report (`3 places decide with body.for outside gate-mayread: gate.ts:83 mayRetract, …`).
+report (`3 places decide with body.owner outside policy-view: src/policy.ts:8 canCancel, …`).
 `/forge approve yes` prints the count; bare `/forge` offers `/forge:bypass` for a check without watched fields.
 
-Measured on that app (a copy, 205 files searched, about 0.3 s): the bare terms `body.for` and `householdId` match 290
-lines in 25 files (275 of them for `householdId`): too many for a gate. The specific terms `.body.for`,
-`/\\bhouseholdId\\s*(===|!==|==|!=)/` and `/(===|!==|==|!=)\\s*[\\w.]*\\bhouseholdId\\b/` match 19 lines in 10 files,
-and still name the three places found by hand (`gate.ts:83 mayRetract`, `companion.ts:186 retract`,
-`companion.ts:224 forget`).
+Measured on that app (a copy, 205 files searched, about 0.3 s): the two bare field names match 290 lines in 25
+files (275 of them for the id field): too many for a gate. The specific terms (the property access with its dot, and
+a comparison on the id field from each side, the forms shown above) match 19 lines in 10 files, and still name the
+three places found by hand.
 
 Limits: a text search per line, not a data-flow analysis (a FINITE TEST of the listed terms). It misses aliases
-(`const f = body.for`), dynamic access (`body[key]`), destructuring (`const { for: f } = body`), a term split over
+(`const f = body.owner`), dynamic access (`body[key]`), destructuring (`const { owner: f } = body`), a term split over
 lines, and code that decides the same question under other names. The function name is a heuristic on indentation.
 
 ## INVARIANTS.md: every approved rule in one place
@@ -509,7 +508,7 @@ python3 cli/forge_check.py mutate    # plant small bugs, count how many the proo
 
 The wrapper that turns your app's values (often JSON) into the proved code's values is not proved. Runtime JSON
 does not follow your types: a field can be `undefined`, `null`, a number where text was expected, or missing. On a
-real app, `householdId: undefined` reached such a wrapper and it threw instead of answering "forbid". The plain
+real app, an id field set to `undefined` reached such a wrapper and it threw instead of answering "forbid". The plain
 fuzz never sent that value, so it did not see it.
 
 If the adapter (any of the six languages) exports a raw-value wrapper, the fuzz also sends **messy variants**
@@ -522,8 +521,8 @@ text (`"5"` for `5`), or removed. Big integers in the other fields stay exact.
 export const wrapper = (i) => myRealWrapper(i)        // the app's REAL wrapper, raw values, no conversion here
 // or: export const wrappers = { name: fn, ... }
 export function failClosed(i) {                        // the spec's fail-closed answer for a value the
-  return typeof i.householdId === 'string' ? undefined // proved rule does not take; undefined: the rule
-    : { effect: 'forbid', rule: 'other_household' }    // takes it, so the proved rule's answer is expected
+  return typeof i.groupId === 'string' ? undefined     // proved rule does not take; undefined: the rule
+    : { effect: 'forbid', rule: 'other_group' }        // takes it, so the proved rule's answer is expected
 }
 ```
 
@@ -539,7 +538,7 @@ Rules: a throw from the wrapper on any messy input is always a disagreement of k
 Otherwise its answer must equal `failClosed(input)`, or the proved rule's answer where `failClosed` returns
 `undefined`. Messy disagreements are grouped, shrunk (the messy field and its kind stay; the rest of the input
 shrinks) and saved like the others. `"messy": false` on a diff entry turns them off; an inputs module can list
-fields to leave alone in `messy_skip = ['retracted', 'limits[].setBy']`. A messy input that has no fail-closed
+fields to leave alone in `messy_skip = ['archived', 'limits[].label']`. A messy input that has no fail-closed
 answer and that the proved rule cannot take is counted as "not judged" (only a throw is reported for it).
 
 ```
