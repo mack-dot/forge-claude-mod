@@ -15,6 +15,9 @@ Usage:
   forge_check.py bypass  [--root DIR] [--json]       (code outside the rule that reads its "watchedFields")
   forge_check.py bypass  --rule NAME --set-terms TERM...  |  --rule NAME --record FILE:LINE --note TEXT
   forge_check.py bypass  --count [--rule NAME --set-terms TERM...]   (lines per term; with terms: a preview)
+  forge_check.py callers [--root DIR] [--json]       (who calls each check's "callers" decision; ranked feeders)
+  forge_check.py callers --rule NAME --record FILE:LINE --note TEXT   (allow one reviewed caller)
+  forge_check.py status  [--root DIR] [--json]       (the one-line status: green ✓, yellow ⚠ drift, red ✗)
 
 `diff` compares code under test (the shipped app function, the wrapper around the proved code) with the
 compiled proved rule on fresh random inputs (see forge_diff.py for the line protocol). A disagreement is
@@ -38,6 +41,12 @@ copy) and runs the diff on each: it measures the fuzz, not the proof (see forge_
   3. requires each "usedBy" file to contain its text (a text check that the app imports it).
 With --check nothing is written: the emitted code on disk must equal a fresh build.
 Targets: py, js, go, java, cs, rs. Exit 0 only if every check is VERIFIED and BUILT.
+
+`callers` (forge_callgraph.py): a check with "callers": {"decision": "file:function", "wrapper": "file:function",
+"replaced": ["file:function", ...]} gets a static call graph of its JavaScript/TypeScript or Python project. Every
+caller of the replaced logic, every call by the decision's name that resolves elsewhere, and a decision that does not
+reach the wrapper is UNVERIFIED_CALLER in `check` (exit 1), listed with file:line, unless it is in "allowedCallers".
+The same graph ranks the unproved functions that feed the decision's parameters: `next_rule` names the top one.
 
 Exit codes of `check`: 0 every check VERIFIED; 1 at least one check is not
 VERIFIED; 2 usage or configuration error, or APPROVAL_UNSIGNED (signed approvals are
@@ -242,7 +251,19 @@ def load_config(root):
                     forge_trace.options(df['trace'])
                 except ValueError as e:
                     raise ConfigError('check %s: %s' % (c['name'], e))
+        problems = _callgraph().validate(c)
+        if problems:
+            raise ConfigError('check %s: %s' % (c['name'], '; '.join(sorted(set(problems)))))
+        for e in _callgraph().entries_of(c):
+            for ref in [e['decision']] + ([e['wrapper']] if e.get('wrapper') else []) + list(e.get('replaced') or []):
+                inside(root, _callgraph().parse_ref(ref)[0])
     return cfg
+
+
+def _callgraph():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import forge_callgraph
+    return forge_callgraph
 
 
 def diff_entries(c):
@@ -539,6 +560,7 @@ def finish_approval(root, hashes, hardware, key):
     cfg = load_config(root)
     write_json(root, APPROVED, hashes)
     record_described(root)
+    record_wrappers(root, cfg)
     lines = []
     if cfg.get('require_signed_approval'):
         inv = os.path.relpath(invariants_path(root, cfg), root)
@@ -564,7 +586,7 @@ def finish_approval(root, hashes, hardware, key):
     return lines
 
 
-def run_checks(root, base=None, signers_arg=None, signed=True):
+def run_checks(root, base=None, signers_arg=None, signed=True, callers=True):
     cfg = load_config(root)
     approved = read_json(os.path.join(root, APPROVED), {}) or {}
     dafny = find_dafny(root, cfg)
@@ -683,13 +705,19 @@ def run_checks(root, base=None, signers_arg=None, signed=True):
         verdict = 'VERIFIED' if r.returncode == 0 else 'FAILED' if r.returncode == 4 else 'ERROR'
         put(verdict, 'dafny exit %d: %s' % (r.returncode, tail))
 
-    return {
+    callers, callers_error = callers_of(root, cfg) if callers else ({}, None)
+    out = {
         'at': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
         'verdicts': verdicts,
         'detail': detail,
-        'warnings': stale_records(root, cfg) + app_syntax_warnings(root, cfg),
-        'next_rule': next_rules(root, cfg),
+        'warnings': stale_records(root, cfg) + app_syntax_warnings(root, cfg) + wrapper_drift(root, cfg),
+        'next_rule': next_rules(root, cfg, callers),
     }
+    if callers or callers_error:
+        out['callers'] = callers
+    if callers_error:
+        out['callers_error'] = callers_error
+    return out
 
 
 def summary(result):
@@ -709,9 +737,14 @@ def report(result):
         if verdict != 'VERIFIED':
             lines.append('\n--- %s ---\n%s' % (name, result['detail'][name]))
     lines += ['! ' + w for w in result.get('warnings', [])]
+    lines += callers_lines(result)
     for name, n in (result.get('next_rule') or {}).items():
-        lines.append('next rule for %s: "%s" (%s) is assumed by this rule but not proved. /forge:add it to close '
-                     'the gap.' % (name, n['item'], ', '.join(n['code'])))
+        if n.get('item'):
+            lines.append('next rule for %s: "%s" (%s) is assumed by this rule but not proved. /forge:add it to close '
+                         'the gap.' % (name, n['item'], ', '.join(n['code'])))
+        if n.get('feeder'):
+            lines.append('next rule for %s (call graph): prove %s. Unproved code that feeds the proved decision; '
+                         'leverage %d.' % (name, n['feeder']['text'], n['feeder']['score']))
     if result['verdicts'] and all(x == 'VERIFIED' for x in result['verdicts'].values()):
         lines.append('VERIFIED covers: the Dafny model meets the approved spec. Not covered: Dafny\'s compilers (the '
                      'build fuzzes them), the wrapper that turns app values into model values, and any app code that '
@@ -1140,7 +1173,7 @@ def mutation_sites(text, skip_until):
 
 
 def run_mutate(root, limit):
-    base = run_checks(root, signed=False)
+    base = run_checks(root, signed=False, callers=False)
     if any(v != 'VERIFIED' for v in base['verdicts'].values()):
         raise ConfigError('every check must be VERIFIED before mutation testing: ' + json.dumps(base['verdicts']))
     cfg = load_config(root)
@@ -1164,7 +1197,7 @@ def run_mutate(root, limit):
             shutil.copytree(root, copy, ignore=shutil.ignore_patterns('.git', 'node_modules', 'verified'))
             with open(os.path.join(copy, f), 'w', encoding='utf-8') as fh:
                 fh.write(mutated)
-            verdict = run_checks(copy, signed=False)['verdicts'].get(name, 'ERROR')
+            verdict = run_checks(copy, signed=False, callers=False)['verdicts'].get(name, 'ERROR')
         status = 'survived' if verdict == 'VERIFIED' else 'caught'
         out[status] += 1
         out['mutants'].append({'check': name, 'file': f, 'line': line, 'mutation': mname,
@@ -1478,6 +1511,12 @@ def invariants_text(root):
         if c.get('watchedFields'):
             code.append('- Code outside the rule is searched (`bypass`) for: %s; %d allowed bypass(es), each approved here (UNAPPROVED_BYPASS for any other)' % (
                 ', '.join('`%s`' % t for t in c['watchedFields']), len(c.get('allowedBypasses') or [])))
+        for e in _callgraph().entries_of(c):
+            code.append('- Callers (static call graph, `callers`): every caller of `%s` goes through `%s`%s; %d allowed '
+                        'caller(s), each approved here (UNVERIFIED_CALLER for any other)' % (
+                            e['decision'], e.get('wrapper') or e['decision'],
+                            '; the replaced logic (%s) has no caller' % ', '.join('`%s`' % x for x in e['replaced'])
+                            if e.get('replaced') else '', len(c.get('allowedCallers') or [])))
         for d in diff_entries(c):
             code.append('- Fuzzed against the shipped code (%s): %s' % (d['lang'], ', '.join('`%s`' % w for w in d.get('watch') or []) or d.get('adapter')))
         sec += ['### Code', ''] + code + ['']
@@ -1551,6 +1590,11 @@ def config_digest(cfg):
         if c.get('watchedFields'):
             lines.append('  watched fields (code outside the rule that decides on them is listed): %s'
                          % ', '.join(map(str, c['watchedFields'])))
+        for e in _callgraph().entries_of(c):
+            lines.append('  callers: every caller of %s must go through %s%s (UNVERIFIED_CALLER otherwise; %d allowed)'
+                         % (e['decision'], e.get('wrapper') or e['decision'],
+                            '; replaced logic: ' + ', '.join(e['replaced']) if e.get('replaced') else '',
+                            len(c.get('allowedCallers') or [])))
         bd = c.get('build') or {}
         if bd:
             lines.append('  build: %s into %s/; app callers: %s' % (', '.join(bd.get('targets', [])), bd.get('out'),
@@ -1717,11 +1761,18 @@ def stale_records(root, cfg):
     return out
 
 
-def next_rules(root, cfg):
+def next_rules(root, cfg, callers=None):
     """For each check: the first "Out of scope" item that names code in this repo (a backticked function or a file
     path), as the suggested next rule. The record lists what the rule assumes; proving one of those assumptions
-    closes a gap the proof depends on. A heuristic over the person's own words."""
+    closes a gap the proof depends on. A heuristic over the person's own words.
+    With "callers" (the call graph, see forge_callgraph.py) also the unproved function with the most leverage over
+    the decision's inputs ("feeder"), and the next few ("feeders")."""
     out = {}
+    for name, r in (callers or {}).items():
+        if r.get('feeders'):
+            params = (r.get('decisions') or [{}])[0].get('params')
+            out[name] = {'feeder': dict(r['feeders'][0], text=_callgraph().feeder_text(r['feeders'][0], params)),
+                         'feeders': r['feeders'][:5]}
     # A name that another check's record states as its subject (outside its Out of scope and Notes) is covered by
     # that check: once a second rule proves `walk_thread()`, the first rule no longer offers it as the next rule.
     covered = {}
@@ -1743,7 +1794,7 @@ def next_rules(root, cfg):
                 continue
             refs = sorted(refs_in_text(root, c, item))
             if refs:
-                out[c['name']] = {'item': item, 'code': refs}
+                out.setdefault(c['name'], {}).update({'item': item, 'code': refs})
                 break
     return out
 
@@ -2125,6 +2176,216 @@ def _bypass_edit(root, rule, set_terms, record, note):
         CONFIG, what, CONFIG)
 
 
+# ---------------------------------------------------------------------------- callers, drift and the status line
+# forge_callgraph.py builds the call graph (JavaScript/TypeScript and Python). Here: the UNVERIFIED_CALLER gate, the
+# allow-list, the wrapper hashes behind the drift warning, and the one-line status that the mod shows.
+
+WRAPPERS = DIR + '/wrapper-hashes.json'
+
+
+def callers_of(root, cfg):
+    """({check: caller result}, error text or None). {} when no check has "callers"."""
+    if not any(c.get('callers') for c in cfg['checks']):
+        return {}, None
+    try:
+        return _callgraph().analyze(root, cfg, project_files(root), own_files=lambda c: rule_own_files(root, cfg, c)), None
+    except Exception as e:  # the analysis must never crash `check`; checks with "callers" fail closed (gate_callers)
+        return {}, '%s: %s' % (type(e).__name__, e)
+
+
+def gate_callers(result, cfg):
+    """A check whose proof passed, but with an unverified caller of its decision, is UNVERIFIED_CALLER. A proof
+    failure (or any other verdict) still wins. A caller analysis that did not run is ERROR (fail closed)."""
+    callers = result.get('callers') or {}
+    for c in cfg['checks']:
+        name = c['name']
+        if not c.get('callers') or result['verdicts'].get(name) != 'VERIFIED':
+            continue
+        r = callers.get(name)
+        if r is None or r['verdict'] == 'CALLERS_ERROR':
+            result['verdicts'][name] = 'ERROR'
+            result['detail'][name] = 'the caller check did not run: %s' % (
+                (r or {}).get('error') or result.get('callers_error') or 'no result')
+        elif r['verdict'] == 'UNVERIFIED_CALLER':
+            hits = r['unverified']
+            result['verdicts'][name] = 'UNVERIFIED_CALLER'
+            result['detail'][name] = ('the proof passed, but %d place(s) may decide this question without the proved '
+                                      'code (not in "allowedCallers"):\n%s\nRoute each through the decision (%s), or '
+                                      'allow it (forge_check.py callers --rule %s --record FILE:LINE --note WHY) and '
+                                      'approve forge.json again.' % (
+                                          len(hits), '\n'.join('  %s:%d%s  [%s]  %s' % (
+                                              h['file'], h['line'], '  in ' + h['function'] if h['function'] else '',
+                                              h['kind'], h['why']) for h in hits[:40]),
+                                          ', '.join(d['decision'] for d in r['decisions']) or '?', name))
+
+
+def callers_lines(result):
+    lines = []
+    for name, r in (result.get('callers') or {}).items():
+        for t in r.get('not_checked') or []:
+            lines.append('callers of %s: %s' % (name, t))
+        if r['verdict'] == 'CALLERS_ERROR':
+            lines.append('callers of %s: ERROR %s' % (name, r.get('error')))
+            continue
+        if not r.get('decisions'):
+            continue
+        ver = r['verified']
+        lines.append('callers of %s (%s): %d through the decision%s; %d unverified; %d in test files (not gated)%s' % (
+            name, ', '.join(d['decision'] for d in r['decisions']), len(ver),
+            ' (%s)' % ', '.join('%s:%d%s' % (v['file'], v['line'], ' ' + v['function'] if v['function'] else '')
+                                for v in ver[:6]) + (' …' if len(ver) > 6 else '') if ver else '',
+            len(r['unverified']), r['tests'], '; %d allowed by a person' % r['reviewed'] if r['reviewed'] else ''))
+        for h in r['unverified'][:12]:
+            lines.append('  UNVERIFIED %s:%d%s  %s' % (h['file'], h['line'], ' in ' + h['function'] if h['function'] else '', h['why']))
+        for e in r.get('outdated_reviews') or []:
+            lines.append('  outdated allowed caller (the line changed or is gone): %s: %s' % (e['file'], e.get('note', '')))
+    return lines
+
+
+def callers_report(out, error):
+    if error:
+        return 'forge callers: ERROR %s' % error
+    if not out:
+        return 'forge callers: no check has "callers" (a decision to follow), so nothing was analyzed.'
+    lines = callers_lines({'callers': out})
+    for name, r in out.items():
+        for f in r.get('feeders', [])[:5]:
+            lines.append('  feeder of %s, leverage %d: %s' % (name, f['score'], _callgraph().feeder_text(
+                f, (r.get('decisions') or [{}])[0].get('params'))))
+        if r.get('parse_errors'):
+            lines.append('  not parsed (skipped): ' + '; '.join(r['parse_errors'][:5]))
+    lines.append('A static call graph (imports and call sites), not a proof: it does not see dynamic dispatch, eval, '
+                 'functions passed through data, path aliases or callers in other languages.')
+    return '\n'.join(lines)
+
+
+def _callers_edit(root, rule, record, note):
+    cfg = load_config(root)
+    c = next((x for x in cfg['checks'] if x['name'] == rule), None)
+    if c is None:
+        raise ConfigError('no check named %s' % rule)
+    m = re.match(r'^(.+):(\d+)$', record or '')
+    if not m or not (note or '').strip():
+        raise ConfigError('--record needs FILE:LINE and --note "why this caller is fine"')
+    rel, n = os.path.normpath(m.group(1)).replace(os.sep, '/'), int(m.group(2))
+    out, err = callers_of(root, cfg)
+    if err:
+        raise ConfigError('the caller analysis did not run: ' + err)
+    hit = next((h for h in (out.get(rule) or {}).get('unverified', []) if h['file'] == rel and h['line'] == n), None)
+    if hit is None:
+        raise ConfigError('%s:%d is not an unverified caller of %s (run callers first)' % (rel, n, rule))
+    c.setdefault('allowedCallers', []).append({'file': rel, 'line_text_sha256': hit['line_text_sha256'], 'note': note.strip()})
+    with open(os.path.join(root, CONFIG), 'w', encoding='utf-8') as f:
+        f.write(json.dumps(cfg, indent=2, ensure_ascii=False) + '\n')
+    return 'wrote %s (allowed caller %s:%d of %s). %s changed: the person approves it again.' % (CONFIG, rel, n, rule, CONFIG)
+
+
+def wrapper_files(root, c):
+    """The unproved code between the app and the proved code: the "callers" wrapper files and the diff adapters."""
+    out = []
+    for e in _callgraph().entries_of(c):
+        if e.get('wrapper'):
+            out.append(_callgraph().parse_ref(e['wrapper'])[0])
+    out += [d['adapter'] for d in diff_entries(c) if d.get('adapter')]
+    seen = []
+    for f in out:
+        if f not in seen and os.path.isfile(inside(root, f)):
+            seen.append(f)
+    return seen
+
+
+def record_wrappers(root, cfg, names=None):
+    """Written at approval, and after a diff run with no disagreement: the wrapper files as they were then."""
+    seen = read_json(os.path.join(root, WRAPPERS), {}) or {}
+    for c in cfg['checks']:
+        if names is None or c['name'] in names:
+            seen[c['name']] = {f: sha256(inside(root, f)) for f in wrapper_files(root, c)}
+    write_json(root, WRAPPERS, seen)
+
+
+def wrapper_drift(root, cfg):
+    """Warnings (never a failed verdict): a wrapper file changed since the last approval or clean fuzz run."""
+    seen = read_json(os.path.join(root, WRAPPERS), {}) or {}
+    out = []
+    for c in cfg['checks']:
+        rec = seen.get(c['name'])
+        if rec is None:
+            continue
+        files = wrapper_files(root, c)
+        changed = [f for f in files if rec.get(f) != sha256(inside(root, f))] + [f for f in rec if f not in files]
+        if changed:
+            out.append('WRAPPER_CHANGED %s: %s changed since the last approval or clean fuzz run. The wrapper is not '
+                       'proved: fuzz it again (/forge diff) or approve again.' % (c['name'], ', '.join(changed)))
+    return out
+
+
+def status(root):
+    """The one-line status (the mod's status line): green ✓, yellow ⚠ (drift: the proof still passes, something it
+    rests on moved), red ✗ (a verdict or the fuzz failed). Reads the last check and diff; hashes a few files."""
+    try:
+        cfg = load_config(root)
+    except ConfigError:
+        return {'level': 'none', 'line': 'forge: not set up · /forge', 'reasons': []}
+    last = read_json(os.path.join(root, LAST))
+    if not last or not isinstance(last.get('verdicts'), dict):
+        return {'level': 'none', 'line': 'forge: not checked yet · /forge check', 'reasons': []}
+    v = last['verdicts']
+    if not v:
+        return {'level': 'none', 'line': 'forge: no checks · /forge', 'reasons': []}
+    ok = sum(1 for x in v.values() if x in ('VERIFIED', 'UNVERIFIED_CALLER'))
+    hard = [(n, x) for n, x in v.items() if x not in ('VERIFIED', 'UNVERIFIED_CALLER')]
+    if hard:
+        return {'level': 'red', 'reasons': [{'kind': hard[0][1], 'text': '%s %s' % (hard[0][1], hard[0][0])}],
+                'line': 'forge ✗ %s %s · %d/%d verified' % (hard[0][1], hard[0][0], len(v) - len(hard), len(v))}
+    level, reasons = 'green', []
+    parts = ['model PROVED' if len(v) == 1 else '%d models PROVED' % len(v)]
+    if any(c.get('watchedFields') for c in cfg['checks']) or last.get('outside'):
+        k = sum(len(x or []) for x in (last.get('outside') or {}).values())
+        parts.append('%d bypass%s' % (k, '' if k == 1 else 'es'))
+    diff = read_json(os.path.join(root, LAST_DIFF)) or {}
+    rows = list((diff.get('checks') or {}).values())
+    if rows:
+        bad = sum(len(r.get('disagreements') or []) for r in rows)
+        broken = [r['verdict'] for r in rows if r.get('verdict') not in ('DIFF_OK', 'DISAGREE')]
+        n = sum(r.get('inputs') or 0 for r in rows)
+        if broken or bad:
+            level = 'red'
+            parts.append('fuzz %s' % broken[0] if broken else 'fuzz ✗ %d disagreement%s' % (bad, '' if bad == 1 else 's'))
+        else:
+            parts.append('fuzz %s ok' % format(n, ','))
+    elif not any(diff_entries(c) for c in cfg['checks']):
+        parts.append('app code NOT fuzzed')
+    callers = last.get('callers') or {}
+    if any(c.get('callers') for c in cfg['checks']):
+        unv = [(n, h) for n, r in callers.items() for h in r.get('unverified') or []]
+        nc = [t for r in callers.values() for t in r.get('not_checked') or []]
+        if unv:
+            n, h = unv[0]
+            reasons.append({'kind': 'UNVERIFIED_CALLER', 'text': 'unverified caller %s:%d%s (check exits 1)' % (
+                h['file'], h['line'], ' and %d more' % (len(unv) - 1) if len(unv) > 1 else '')})
+        elif callers:
+            k = sum(len(r.get('verified') or []) for r in callers.values())
+            parts.append('callers %d ok' % k if not nc else 'callers not checked (other language)')
+        else:
+            parts.append('callers not checked yet')
+    stale = stale_records(root, cfg)
+    for w in stale:
+        m = re.match(r'DECISION_NOTE_STALE (\S+): the decision record (\S+) describes (.+), which changed', w)
+        reasons.append({'kind': 'DECISION_NOTE_STALE', 'text': 'decision note stale: %s describes %s' % (
+            m.group(2), m.group(3)) if m else w})
+    if any(c.get('decisions') for c in cfg['checks']):
+        parts.append('records current' if not stale else 'record stale')
+    for w in wrapper_drift(root, cfg):
+        m = re.match(r'WRAPPER_CHANGED (\S+): (.+) changed since', w)
+        reasons.append({'kind': 'WRAPPER_CHANGED', 'text': 'wrapper changed since last approval/fuzz: %s' % (
+            m.group(2) if m else w)})
+    if reasons and level == 'green':
+        level = 'yellow'
+    glyph = {'green': '✓', 'yellow': '⚠', 'red': '✗'}[level]
+    head = ['DRIFT: ' + '; '.join(r['text'] for r in reasons)] if reasons else []
+    return {'level': level, 'reasons': reasons, 'line': 'forge %s %s' % (glyph, ' · '.join(head + parts))}
+
+
 def main(argv=None):
     # Dafny's bundled .NET runtime stops on Linux systems without the ICU library (minimal images, many servers):
     # "Couldn't find a valid ICU package". Dafny does not need culture data, so run it without (found in a clean
@@ -2132,7 +2393,7 @@ def main(argv=None):
     os.environ.setdefault('DOTNET_SYSTEM_GLOBALIZATION_INVARIANT', '1')
     p = argparse.ArgumentParser(prog='forge_check.py', description='Forge proof check')
     p.add_argument('command', choices=['check', 'approve', 'spec', 'build', 'setup', 'mutate', 'diff', 'invariants',
-                                       'bypass'])
+                                       'bypass', 'callers', 'status'])
     p.add_argument('--root', default='.', help='project folder (default: current folder)')
     p.add_argument('--json', action='store_true', help='print the result as JSON')
     p.add_argument('--base', help='git ref; any change to forge.json, approved.json or a spec '
@@ -2159,7 +2420,8 @@ def main(argv=None):
                                              'FORGE_ALLOWED_SIGNERS, else .forge/allowed_signers at --base)')
     p.add_argument('--check', action='store_true', help='build: write nothing; the emitted code on '
                                                         'disk must equal a fresh build')
-    p.add_argument('--rule', help='bypass: the check whose watchedFields or allowedBypasses to write')
+    p.add_argument('--rule', help='bypass / callers: the check whose watchedFields, allowedBypasses or allowedCallers '
+                                  'to write')
     p.add_argument('--set-terms', nargs='+', metavar='TERM', help='bypass --rule NAME: write its watchedFields')
     p.add_argument('--record', metavar='FILE:LINE', help='bypass --rule NAME: record a hit as reviewed (with --note)')
     p.add_argument('--count', action='store_true', help='bypass: only count unreviewed lines per term (with --rule '
@@ -2168,6 +2430,21 @@ def main(argv=None):
     a = p.parse_args(argv)
     root = os.path.abspath(a.root)
     try:
+        if a.command == 'status':
+            st = status(root)
+            print(json.dumps(st, ensure_ascii=False) if a.json else st['line'])
+            return 0
+        if a.command == 'callers':
+            if a.record:
+                if not a.rule:
+                    raise ConfigError('--record needs --rule NAME')
+                print(_callers_edit(root, a.rule, a.record, a.note))
+                return 0
+            cfg = load_config(root)
+            out, err = callers_of(root, cfg)
+            print(json.dumps({'callers': out, 'error': err}, indent=2, ensure_ascii=False) if a.json else callers_report(out, err))
+            return 2 if err or any(r['verdict'] == 'CALLERS_ERROR' for r in out.values()) else \
+                1 if any(r['verdict'] == 'UNVERIFIED_CALLER' for r in out.values()) else 0
         if a.command == 'bypass':
             if a.count:
                 if a.set_terms is not None and not a.rule:
@@ -2208,6 +2485,11 @@ def main(argv=None):
             if not a.no_write:
                 update_diff_stats(root, out)
                 write_json(root, LAST_DIFF, out)
+                clean = [c['name'] for c in load_config(root)['checks'] if diff_entries(c) and all(
+                    r['verdict'] == 'DIFF_OK' for k, r in out['checks'].items() if k == c['name'] or k.startswith(c['name'] + ':'))
+                    and any(k == c['name'] or k.startswith(c['name'] + ':') for k in out['checks'])]
+                if clean:
+                    record_wrappers(root, load_config(root), clean)
             print(json.dumps(out, indent=2, ensure_ascii=False) if a.json else diff_report(out))
             return 0 if all(r['verdict'] == 'DIFF_OK' for r in out['checks'].values()) else 1
         if a.command == 'mutate' and a.app:
@@ -2280,6 +2562,7 @@ def main(argv=None):
                     result['verdicts'][c['name']] = 'ERROR'
                     result['detail'][c['name']] = 'the bypass search did not run: ' + outside_error
         gate_bypass(result, result['outside'], outside_error)
+        gate_callers(result, load_config(root))
         if not a.no_write:
             write_json(root, LAST, result)
         text = report(result) + ''.join('\n' + l for l in outside_lines(result['outside']))
