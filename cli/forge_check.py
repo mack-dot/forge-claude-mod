@@ -72,6 +72,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -234,6 +235,13 @@ def load_config(root):
             inside(root, df['inputs'])
             if df.get('adapter'):
                 inside(root, df['adapter'])
+            if df.get('trace') is not None:
+                sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                import forge_trace
+                try:
+                    forge_trace.options(df['trace'])
+                except ValueError as e:
+                    raise ConfigError('check %s: %s' % (c['name'], e))
     return cfg
 
 
@@ -1263,9 +1271,16 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None, coverage=False, only=
             import forge_coverage
             cov = forge_coverage.Session(df['lang'], root, df.get('watch'))
             cmd, env = cov.wrap(cmd, env)
-        data = forge_diff.run_entry(cmd, root, env, inside(root, df['inputs']), s, n, ms,
-                                    os.path.join(root, REGRESSIONS, key.replace(':', '-')),
-                                    messy=df.get('messy', True) is not False)
+        if df.get('trace') is not None:
+            import forge_trace
+            data = forge_trace.run_trace_entry(cmd, root, env, inside(root, df['inputs']), s, df['trace'],
+                                               os.path.join(root, REGRESSIONS, key.replace(':', '-')),
+                                               count=inputs, budget_ms=budget_ms)
+        else:
+            data = forge_diff.run_entry(cmd, root, env, inside(root, df['inputs']), s, n, ms,
+                                        os.path.join(root, REGRESSIONS, key.replace(':', '-')),
+                                        messy=df.get('messy', True) is not False)
+        data['repro'] = [sys.executable, os.path.abspath(__file__), 'diff', '--root', root, '--seed', str(s)]
         res.update(data)
         if cov:
             res['coverage'] = cov.collect()
@@ -1329,6 +1344,11 @@ def diff_report(out):
     lines = []
     for name, r in out['checks'].items():
         v = r['verdict']
+        if r.get('mode') == 'trace' and v in ('DIFF_OK', 'DISAGREE'):
+            import forge_trace
+            base = ' '.join(shlex.quote(x) for x in r.get('repro') or [])
+            lines += forge_trace.report_lines(name, r, lambda k: '%s --inputs %d' % (base, k))
+            continue
         dec = r.get('decisions') or {}
         dec_line = ('  your recorded decisions: %d of %d agree%s' % (
             dec['agree'], dec['total'], '; failing: ' + ', '.join('%s (%s)' % (f['id'], ', '.join(f['candidates']))
@@ -2121,7 +2141,8 @@ def main(argv=None):
     p.add_argument('--hashes', help='approve: the hashes that `spec --json` printed; refused if any '
                                     'file changed since')
     p.add_argument('--max', type=int, default=40, help='mutate: at most this many mutants')
-    p.add_argument('--inputs', type=int, help='diff: at most this many random inputs (default from forge.json, 1500)')
+    p.add_argument('--inputs', type=int, help='diff: at most this many random inputs, or traces for a "trace" entry '
+                                             '(default from forge.json: 1500 inputs, 2000 traces)')
     p.add_argument('--budget-ms', type=int, help='diff: time budget per check in ms (default 1500)')
     p.add_argument('--seed', type=int, help='diff: random seed (default: a fresh one each run)')
     p.add_argument('--coverage', action='store_true', help='diff: also report the lines and branches of the watched '

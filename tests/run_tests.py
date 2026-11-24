@@ -246,6 +246,83 @@ BUILD_CASES = [
 ]
 
 
+MACHINE = os.path.join(HERE, '..', 'examples', 'subscription-machine')
+# Planted bugs in examples/subscription-machine/app/subscription_planted.* and the length of their minimal trace.
+PLANTED_MIN = {'replay-off-by-one': 2, 'pause-expiry': 4, 'restart-drops-id': 2, 'reject-leaks': 2}
+
+
+def trace_cases():
+    """Stateful trace fuzzing (cli/forge_trace.py) on examples/subscription-machine, with negative controls."""
+    out = []
+    with tempfile.TemporaryDirectory() as tmp:
+        def fresh(name, change=None):
+            root = os.path.join(tmp, name)
+            shutil.copytree(MACHINE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
+            if change:
+                cfg = json.load(open(os.path.join(root, CONFIG)))
+                for df in cfg['checks'][0]['diff']:
+                    df['trace'].update(change)
+                json.dump(cfg, open(os.path.join(root, CONFIG), 'w'))
+            return root
+
+        def run(root, *extra, env=None):
+            r = subprocess.run([sys.executable, CLI, 'diff', '--root', root, '--json', '--no-write'] + list(extra),
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                               env=dict(os.environ, **(env or {})))
+            try:
+                j = json.loads(r.stdout)
+                return r.returncode, j['checks'] if 'checks' in j else j
+            except ValueError:
+                return r.returncode, {'error': r.stdout[-300:] + r.stderr[-300:]}
+
+        def shortest(res):
+            best = {}
+            for d in res.get('disagreements', []):
+                best[d['candidate']] = min(best.get(d['candidate'], 99), d['shrunk_len'])
+            return best
+
+        root = fresh('a')
+        code, res = run(root, '--seed', '7')
+        js, py = res.get('subscription-machine:js', {}), res.get('subscription-machine:py', {})
+        out.append(('trace: every planted multi-event bug is caught and shrunk to its minimal trace (JS and Python)',
+                    code == 1 and shortest(js) == PLANTED_MIN and shortest(py) == PLANTED_MIN))
+        out.append(('trace: the correct shipped step function has 0 disagreements beside them',
+                    js.get('per_candidate', {}).get('shipped') == 0 and py.get('per_candidate', {}).get('shipped') == 0))
+        out.append(('trace: retries, replays, reorders and restarts were injected; a repro command is printed',
+                    all(js.get('injected', {}).get(k, 0) > 50 for k in ('retry', 'replay', 'reorder', 'restart'))
+                    and '--seed' in (js.get('repro') or [])
+                    and all(d.get('trace_index') is not None for d in js.get('disagreements', []))))
+        # The printed repro (same seed, the failing trace's index + 1 traces) finds the same shrunk trace again.
+        d0 = next(d for d in js.get('disagreements', [{}]) if d.get('candidate') == 'pause-expiry')
+        _, again = run(fresh('repro'), '--seed', '7', '--inputs', str(d0['trace_index'] + 1))
+        out.append(('trace: the repro command finds the same minimal trace again (deterministic for a seed)',
+                    any(d['candidate'] == 'pause-expiry' and d['trace'] == d0['trace']
+                        for d in again.get('subscription-machine:js', {}).get('disagreements', []))))
+        code2, res2 = run(root, '--seed', '8', '--inputs', '0')
+        out.append(('trace: saved failing traces replay first next run',
+                    code2 == 1 and res2.get('subscription-machine:py', {}).get('replayed', 0) >= 4
+                    and shortest(res2.get('subscription-machine:py', {})) == PLANTED_MIN))
+        # Negative controls: one event per trace finds none of the planted bugs (each needs two or more events);
+        # without restarts the bug that loses lastId on restart stays hidden.
+        _, one = run(fresh('one', {'max_len': 1}), '--seed', '7')
+        out.append(('trace: negative control, traces of one event find none of the planted bugs',
+                    all(r.get('verdict') == 'DIFF_OK' for r in one.values()) and len(one) == 2))
+        _, nor = run(fresh('norestart', {'restart': 0}), '--seed', '7')
+        out.append(('trace: negative control, without restart injection the restart bug is not found',
+                    all('restart-drops-id' not in shortest(r) and r.get('injected', {}).get('restart') == 0
+                        and 'replay-off-by-one' in shortest(r) for r in nor.values()) and len(nor) == 2))
+        code_bad, bad = run(fresh('bad', {'length': 3}))
+        out.append(('trace: an unknown "trace" key is a configuration error', code_bad == 2 and 'length' in str(bad)))
+        # 50,000 traces of the correct wrapper: 0 disagreements (time printed, not gated).
+        code50, r50 = run(fresh('50k'), '--seed', '1', '--inputs', '50000', '--budget-ms', '600000',
+                          env={'FORGE_TRACE_PLANTED': '0'})
+        out.append(('trace: 50,000 traces of the correct wrapper, 0 disagreements (js %s ms, py %s ms)' % (
+            r50.get('subscription-machine:js', {}).get('ms'), r50.get('subscription-machine:py', {}).get('ms')),
+                    code50 == 0 and all(r.get('traces') == 50000 and r.get('verdict') == 'DIFF_OK' for r in r50.values())
+                    and len(r50) == 2))
+    return out
+
+
 def js_module_cases():
     """The generated ES module of the js target (cli/js_wrapper.py), each with a negative control."""
     sys.path.insert(0, os.path.join(HERE, '..', 'cli'))
@@ -1136,6 +1213,10 @@ def main():
         extra += 1
         print('%s  diff: two bugs with the same wrong answer (zero and empty text) are both reported  %s' % ('ok  ' if ok else 'FAIL', found))
 
+    for name, ok in trace_cases():
+        failed += not ok
+        extra += 1
+        print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
     for name, ok in js_module_cases():
         failed += not ok
         extra += 1

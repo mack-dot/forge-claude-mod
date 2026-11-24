@@ -34,6 +34,19 @@ owner's app copy and on a new synthetic fixture. Each item says what was tested 
   there (the proofs alone about 15 s; the rest is not profiled yet).
 ## Unreleased
 
+- New (diff): **stateful trace fuzz** (`cli/forge_trace.py`) for models of the form `Step(State, Event, now)`. A
+  `"trace"` block on a `js` or `py` diff entry gives seeded multi-event traces with the clock moving and injected
+  retries, replays, reorders and restarts (save, then load). Model and candidates run in lockstep; verdict and state
+  are compared after every step; a failing trace is shrunk by delta debugging (drop events, then simplify times and
+  fields) and printed with an `again:` command. Failing traces are saved and replay first.
+- New example `examples/subscription-machine` (Dafny model proved, py and js built) with a correct shipped step
+  function and four planted multi-event bugs.
+- Tested (`tests/run_tests.py`, 9 new cases): all four planted bugs caught and shrunk to 2, 4, 2 and 2 steps in JS and
+  Python; the correct code 0 disagreements over 50,000 traces per language; the repro command finds the same trace;
+  saved traces replay; negative controls (`max_len: 1` finds nothing; `restart: 0` hides the restart bug); an
+  unknown `trace` key is a configuration error.
+- Not tested: trace mode for the Go, Rust, Java and C# evaluators (not built); time going backwards
+  (`time_backwards`) has no test case.
 - **Bypass gate: decision reads only (AST) in TS/JS and Python.** A text hit of a watched field counts only where the
   field is read in a decision (if/while condition, comparison, `in`, `.includes`, ternary, switch/case, `&&`/`||`
   guard, filter/find/some/every predicate, comprehension `if`, assert, SQL `WHERE` parameter, alias). Each hit names
