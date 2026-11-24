@@ -19,6 +19,8 @@ cfg = json.load(open('.forge/forge.json'))
 c = cfg['checks'][0]
 c['build']['targets'] = ['py']
 c['diff'] = [d for d in c['diff'] if d['lang'] == 'py']
+# The governed decision is the app's wrapper; the legacy function is the logic it replaced (UNVERIFIED_CALLER control).
+c['callers'] = {'decision': 'app.py:spend', 'replaced': ['legacy_wallet.py:legacy_spend']}
 json.dump(cfg, open('.forge/forge.json', 'w'), indent=2)
 src = open('diff/wallet_diff.py').read()
 # Only the wrapper the app calls; the legacy function keeps its planted bugs for the example's own tests.

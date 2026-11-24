@@ -1,0 +1,7 @@
+{
+  ".forge/forge.json": "10ef6a9a15896cd465e8c4a759637d08ff9b5ad04f15cce40d2c79d9a5dc5614",
+  "spec/ThreadSpec.dfy": "aea86b64196fa6ff6d20b1471cb7406f63b3eb3a9bcaaa1f36bd9e0aa77cd6d3",
+  "spec/ThreadRules.dfy": "75615a0a068c6d13d9d9bb4d9e58dc2faab2ab6c76f4055a9ddebb3b3e53624c",
+  "spec/ThreadExamples.dfy": "17d82a322ca1c46fa8cfe31eff6aa92d65db90ece89549ed48fc0d661ae05620",
+  ".forge/decisions/thread-visibility.md": "n:6a0ef54358f476fe840040589a190c5a4be1698712af048ee2a4df1750b1346f"
+}

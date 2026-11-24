@@ -29,6 +29,8 @@ proved rule, in any language, through a small line protocol:
   Forge ships evaluators for JavaScript/TypeScript (cli/eval/node_eval.mjs), Python (cli/eval/py_eval.py), and Go,
   Rust, Java and C# (cli/eval/<lang>/, built by eval_build.py); all of them take messy inputs.
   Any other language (Go, Rust, Java, C#, ...) plugs in as a "cmd" entry: a program that speaks the protocol.
+  State machines (many events per case, with retries, replays, reordering and restarts) use the trace mode of the
+  same evaluators: see cli/forge_trace.py.
 
 This core does the rest: fresh seeds, the decisions, replay of saved cases, shrinking (the failure signature
 stays fixed, so a disagreement cannot slide into a different bug), one saved case per kind of failure, and a
@@ -44,12 +46,18 @@ import random
 import select
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 
 CALL_TIMEOUT_S = 2.0
 MAX_PER_CANDIDATE = 40  # examples kept per candidate per run
 MAX_PER_GROUP = 3  # differently shaped examples kept per kind of wrong answer
 MESSY_PER_INPUT = 1  # messy variants tried per generated input once every (field, kind) pair has been tried
+# All shrinking in one run (failing recorded decisions and new disagreements) may use at most this share of the
+# time budget. Shrinking only makes an example smaller; it must not stop the search (before 0.13.1 one known failing
+# decision with a slow evaluator took 300 calls, the whole 1.5 s end-of-turn budget, and no fresh input was tried).
+SHRINK_SHARE = 0.25
 MESSY_MAX_DEPTH = 4  # how deep into nested objects and lists the messy fields go
 MESSY_MAX_FIELDS = 64  # fields considered per input
 MESSY_LIST_ITEMS = 2  # list elements considered per list
@@ -244,6 +252,73 @@ def apply_messy(base, path, kind):
     return out
 
 
+class LockTimeout(Exception):
+    pass
+
+
+class Locked:
+    """An exclusive lock on a file, held across processes (flock; msvcrt on Windows), for state that two runs at once
+    share: the end-of-turn fuzz and a manual diff both read-modify-write .forge/diff-stats.json and build into the
+    same .forge/cache/diff-<key> folder. Before, one run's stats update was lost, and a concurrent Go build crashed
+    the other run (a folder copied while the other run deleted it). Waits up to `timeout` seconds, then LockTimeout."""
+
+    def __init__(self, path, timeout=300.0):
+        self.path, self.timeout, self.f = path, timeout, None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path) or '.', exist_ok=True)
+        self.f = open(self.path, 'a+')
+        end = time.time() + self.timeout
+        while True:
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    self.f.seek(0)
+                    msvcrt.locking(self.f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if time.time() > end:
+                    self.f.close()
+                    raise LockTimeout('another forge run held %s for more than %d s' % (self.path, self.timeout))
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                self.f.seek(0)
+                msvcrt.locking(self.f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.f.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.f.close()
+        return False
+
+
+def write_atomic(path, text, errors='strict'):
+    """Write `text` to `path` through a temp file in the same folder and a rename: a reader (the status line, a second
+    run, the next run's replay) sees the old file or the new one, never a part. Before, a run killed while it saved a
+    case left an empty or cut .json that stopped every later run. The temp name starts with "." and does not end in
+    .json, so a replay never reads it. The file mode is that of the old file, else the umask default."""
+    folder = os.path.dirname(path) or '.'
+    fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(path) + '.', suffix='.tmp', dir=folder)
+    try:
+        mask = os.umask(0)
+        os.umask(mask)
+        os.chmod(tmp, os.stat(path).st_mode & 0o777 if os.path.exists(path) else 0o666 & ~mask)
+        with os.fdopen(fd, 'w', encoding='utf-8', errors=errors) as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
 def dumps_any(v, **kw):
     """JSON text that may hold a lone surrogate (written as an escape, so the file stays valid JSON)."""
     return json.dumps(v, ensure_ascii=False, **kw).encode('utf-8', 'backslashreplace').decode('utf-8')
@@ -253,26 +328,56 @@ class EvaluatorError(Exception):
     pass
 
 
+def drain(stream, keep=8000):
+    """Read a child's stderr until it closes, keeping the last `keep` characters. An undrained stderr pipe fills at
+    64 KB, and then a child that logs blocks on its next write: that showed up as a false "hang" of the code under
+    test. Returns a function that gives the text kept so far."""
+    tail = ['']
+
+    def run():
+        try:
+            for chunk in iter(lambda: stream.read(4096), ''):
+                tail[0] = (tail[0] + chunk)[-keep:]
+        except (OSError, ValueError):
+            pass
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+
+    def text(wait=0.0):
+        t.join(wait)
+        return tail[0]
+    return text
+
+
 class Evaluator:
     """One evaluator process, spoken to line by line."""
 
     def __init__(self, cmd, cwd, env):
         self.p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, universal_newlines=True, bufsize=1, encoding='utf-8')
-        hello = self._read(30.0)
+                                  stderr=subprocess.PIPE, universal_newlines=True, bufsize=1, encoding='utf-8',
+                                  errors='backslashreplace')
+        self.err = drain(self.p.stderr)
+        try:
+            hello = self._read(30.0)
+        except Exception:
+            self._stderr()  # stop the process: a hello that is not JSON must not leave it running
+            raise
         if not isinstance(hello, dict) or not isinstance(hello.get('candidates'), list):
             raise EvaluatorError('the evaluator did not start: %s' % self._stderr())
         self.candidates = hello['candidates']
         self.messy = [n for n in hello.get('messy') or [] if n in self.candidates]
         self.has_undefined = hello.get('undefined') is True
+        self.trace_mode = hello.get('trace') is True  # the adapter exports machines (cli/forge_trace.py)
         self.skip_kinds = [k for k in hello.get('skip') or [] if k in MESSY_KINDS]
 
     def _stderr(self):
         try:
             self.p.kill()
-            return (self.p.stderr.read() or '')[-800:]
+            self.p.wait(timeout=5)
         except Exception:  # noqa: BLE001
-            return ''
+            pass
+        return self.err(2.0)[-800:]
 
     def _read(self, timeout):
         ready, _, _ = select.select([self.p.stdout], [], [], timeout)
@@ -289,15 +394,24 @@ class Evaluator:
         self.p.stdin.flush()
         out = self._read(CALL_TIMEOUT_S)
         if out is None:
+            self.hung = True
             raise EvaluatorError('no answer within %.0f s for input %s (a hang?)' % (CALL_TIMEOUT_S, canon(inp)[:200]))
         return out
 
+    hung = False
+
     def close(self):
         try:
+            if self.hung:  # it does not read stdin any more: waiting 5 s for it to exit only delays the verdict
+                raise RuntimeError('hung')
             self.p.stdin.close()
             self.p.wait(timeout=5)
         except Exception:  # noqa: BLE001
             self.p.kill()
+            try:
+                self.p.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def load_inputs_module(path):
@@ -311,9 +425,10 @@ def load_inputs_module(path):
     return mod
 
 
-def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, messy=True):
+def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, messy=True, steer=None):
     """Run one diff entry. Returns the result dict (same shape for every language). `messy`: also send messy
-    variants of the inputs to the candidates the evaluator names as raw-value wrappers (see the top of this file)."""
+    variants of the inputs to the candidates the evaluator names as raw-value wrappers (see the top of this file).
+    `steer`: a forge_steer.Steer that picks the random inputs from coverage feedback (None: blind random)."""
     started = time.time()
     result = {'inputs': 0, 'out_of_domain': 0, 'replayed': 0, 'seed': seed, 'disagreements': [],
               'decisions': {'total': 0, 'agree': 0, 'failing': []}}
@@ -321,6 +436,8 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
     try:
         gen = load_inputs_module(inputs_path)
         in_domain = getattr(gen, 'in_domain', lambda _: True)
+        if steer:
+            steer.bind(gen)
         ev = Evaluator(cmd, cwd, env)
         names = ev.candidates
         result['candidates'] = names
@@ -332,6 +449,8 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
                 if len(cache) > 20000:
                     cache.clear()
                 cache[key] = ev.run(copy.deepcopy(inp))
+                if steer:
+                    steer.sent(inp, cache[key])
             return cache[key]
 
         def disagrees(name, inp):
@@ -400,10 +519,9 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
             path = os.path.join(reg_dir, fname)
             if is_new and not os.path.exists(path):
                 os.makedirs(reg_dir, exist_ok=True)
-                with open(path, 'w', encoding='utf-8') as f:
-                    f.write(dumps_any({'candidate': name, 'messy': meta, 'input': inp, 'reference': d[1], 'got': d[2],
-                                       'seed': seed, 'found_at': datetime.datetime.now(datetime.timezone.utc).isoformat(
-                                           timespec='seconds')}, indent=2) + '\n')
+                write_atomic(path, dumps_any({'candidate': name, 'messy': meta, 'input': inp, 'reference': d[1],
+                                              'got': d[2], 'seed': seed, 'found_at': datetime.datetime.now(
+                                                  datetime.timezone.utc).isoformat(timespec='seconds')}, indent=2) + '\n')
             result['disagreements'].append({'candidate': name, 'input': inp, 'reference': d[1], 'got': d[2],
                                             'file': fname, 'new': is_new, 'group': '%s at %s' % (d[0], meta['pattern']),
                                             'messy': meta,
@@ -441,14 +559,23 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
                         continue
                     m_record(name, apply_messy(small, path, kind), meta, True)
 
+        shrink_left = [budget_ms * SHRINK_SHARE / 1000.0]  # seconds of shrinking left in this run
+
         def shrink(name, inp):
+            t0 = time.time()
+            try:
+                return shrink_within(name, inp, t0 + max(shrink_left[0], 0.0))
+            finally:
+                shrink_left[0] -= time.time() - t0
+
+        def shrink_within(name, inp, deadline):
             sig = signature(*disagrees(name, inp))
             best, steps, improved = inp, 0, True
             while improved and steps < 300:
                 improved = False
                 for s in shrinks(best):
                     steps += 1
-                    if steps > 300:
+                    if steps > 300 or time.time() > deadline:
                         break
                     d = disagrees(name, s)
                     if d and signature(*d) == sig:
@@ -487,10 +614,10 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
             path = os.path.join(reg_dir, fname)
             if is_new and not os.path.exists(path):
                 os.makedirs(reg_dir, exist_ok=True)
-                with open(path, 'w', encoding='utf-8') as f:
-                    f.write(json.dumps({'candidate': name, 'input': inp, 'reference': d[0], 'got': d[1], 'seed': seed,
-                                        'found_at': datetime.datetime.now(datetime.timezone.utc).isoformat(
-                                            timespec='seconds')}, indent=2, ensure_ascii=False) + '\n')
+                write_atomic(path, json.dumps({'candidate': name, 'input': inp, 'reference': d[0], 'got': d[1],
+                                               'seed': seed, 'found_at': datetime.datetime.now(
+                                                   datetime.timezone.utc).isoformat(timespec='seconds')},
+                                              indent=2, ensure_ascii=False) + '\n')
             result['disagreements'].append({'candidate': name, 'input': inp, 'reference': d[0], 'got': d[1],
                                             'file': fname, 'new': is_new, 'group': signature(*d)})
 
@@ -509,6 +636,9 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
         # 2. The person's recorded decisions (reported, not saved again; their kinds are then skipped below).
         for dec in getattr(gen, 'decisions', []):
             result['decisions']['total'] += 1
+            if not in_domain(dec['input']):  # never compared: not an agreement (forge_check.run_diff: DIFF_ERROR)
+                result['decisions'].setdefault('out_of_domain', []).append(dec['id'])
+                continue
             bad = [n for n in names if disagrees(n, dec['input'])]
             if bad:
                 result['decisions']['failing'].append({'id': dec['id'], 'candidates': bad})
@@ -519,7 +649,7 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
         # 3. Fresh random inputs within the input and time budget.
         rng = Rng(seed)
         while result['inputs'] < max_inputs and (time.time() - started) * 1000 < budget_ms:
-            inp = gen.generate(rng)
+            inp = steer.next(rng) if steer else gen.generate(rng)
             result['inputs'] += 1
             if not in_domain(inp):
                 result['out_of_domain'] += 1
@@ -544,6 +674,8 @@ def run_entry(cmd, cwd, env, inputs_path, seed, max_inputs, budget_ms, reg_dir, 
             mstats['pairs_tried'] = len(tried)
             result['messy'] = mstats
         result['per_candidate'] = {n: sum(d['candidate'] == n for d in result['disagreements']) for n in names}
+        if steer:
+            result['steer'] = steer.stats()
     except EvaluatorError as e:
         result['error'] = str(e)
     except Exception as e:  # noqa: BLE001

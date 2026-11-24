@@ -1,0 +1,36 @@
+{
+  "check": "subscription-machine",
+  "labels": "Dafny model: PROVED. This emitted code: NATIVE CHECK (unverified compiler). Fuzz run: FINITE TEST.",
+  "sources": {
+    "impl/Subscription.dfy": "7221c5170f4e08ac7e895e4d520974435895d9159827af52f7e3f435c100e3ad",
+    "spec/SubscriptionSpec.dfy": "39e69d8f617de29946f9fb92f715d75e2d8e436b75ea9859615f52c17225f0c1"
+  },
+  "targets": {
+    "js": {
+      "emit": "OK",
+      "files": {
+        "subscription_machine-js.dtr": "7a9548b42daee33cfa2e88052c4565daa1a34453d99eec10aa58cf8912608949",
+        "subscription_machine.d.mts": "6357a0ae1ef9f6f8765ea38c6366083e278c54c9383f3f8a3282a8d157f7a28c",
+        "subscription_machine.js": "cb82d113a8935e87d6d7e22d182c5fdddb5c8c221144edbd03025f77fb49c22b",
+        "subscription_machine.mjs": "b0c28575a44ae6b0aa5d9d69aa6753a306e477f09a01a951773164312868a9e9"
+      },
+      "fuzz": "PASSED",
+      "fuzz_output_lines": 301,
+      "fuzz_output_sha256": "8990129d9edd9e7ce2a500b52a65230329755bc14098961768c74b87fa2399a5"
+    },
+    "py": {
+      "emit": "OK",
+      "files": {
+        "subscription_machine-py/Subscription.py": "0ab9fdaff42c743ccaddc6c0977a4d6be45b50ff037f18d671b27855b66e1620",
+        "subscription_machine-py/System_/__init__.py": "96b6e33c036bc3aeab6d1810c7aef085184d09c407bdec032ea89d7a98843edf",
+        "subscription_machine-py/__main__.py": "20934aa836f29b29edfebea85ece075e00027eff083b249fbd337594353dea98",
+        "subscription_machine-py/_dafny/__init__.py": "18d39decdedad0e188456e15d17f1dcd5113c4abc258ad6cb718e39534555e7a",
+        "subscription_machine-py/module_.py": "e8265fb4555d48345ce8dc9e2262440bae5ef18ae6f8de7adabdc6c006d9ce74",
+        "subscription_machine-py/subscription_machine-py.dtr": "7a9548b42daee33cfa2e88052c4565daa1a34453d99eec10aa58cf8912608949"
+      },
+      "fuzz": "PASSED",
+      "fuzz_output_lines": 301,
+      "fuzz_output_sha256": "8990129d9edd9e7ce2a500b52a65230329755bc14098961768c74b87fa2399a5"
+    }
+  }
+}

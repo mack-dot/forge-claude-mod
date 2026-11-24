@@ -101,7 +101,11 @@ func main() {
 		wnames = append(wnames, n)
 	}
 	sort.Strings(wnames)
-	w := bufio.NewWriter(os.Stdout)
+	// The protocol owns the real stdout. Code under test that prints (fmt.Println) writes to stderr instead: before
+	// this, one print in the shipped code broke the line protocol (DIFF_ERROR). Not covered: a print in an init().
+	proto := os.Stdout
+	os.Stdout = os.Stderr
+	w := bufio.NewWriter(proto)
 	enc := json.NewEncoder(w)
 	enc.Encode(map[string]any{"candidates": append(append([]string{}, names...), wnames...), "messy": wnames})
 	w.Flush()

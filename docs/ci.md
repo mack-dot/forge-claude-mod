@@ -33,9 +33,11 @@ for `js` or JS/TS app files, Go for `go`; Java, Rust and .NET come from the runn
 
 | Gate | Runs | Fails with |
 | --- | --- | --- |
-| `check` | always | the proof (`FAILED`), `NOT_APPROVED`, `SPEC_CHANGED`, `CONFIG_CHANGED`, `BINDING_BROKEN`, `UNSOUND_CONSTRUCT` (included files too), `EXAMPLES_FAILED`, `UNAPPROVED_BYPASS` |
+| `check` | always | the proof (`FAILED`), `NOT_APPROVED`, `SPEC_CHANGED`, `CONFIG_CHANGED`, `BINDING_BROKEN`, `UNSOUND_CONSTRUCT` (included files too), `EXAMPLES_FAILED`, `UNAPPROVED_BYPASS`, `UNVERIFIED_CALLER` |
+| callers | when a check has `"callers"` (its own row in the summary) | `UNVERIFIED_CALLER`, the analysis did not run |
 | approvals against the base | when the event has a base: the pull request's base branch, the merge group's base commit, or the commit before a push | `APPROVAL_CHANGED` |
 | `build --check` | when a check has a `build` entry | `STALE_BUILD`, `APP_SYNTAX_ERROR`, `NOT_CALLED`, a target's fuzz |
+| serviceTest | when a check has a `build` `serviceTest` (run by `build --check`; its own row in the summary) | `NOT_CALLED`, `SERVICE_TEST_FAILED` |
 | `invariants --check` | always | `INVARIANTS_STALE` |
 | diff sweep | when a check has `diff` entries: 50,000 inputs per entry, a 600 s budget per entry, seed = the workflow run ID | `DISAGREE`, `THROWS_ON_MESSY_INPUT`, `TOOLCHAIN_MISSING` |
 
@@ -48,7 +50,8 @@ workflow run uses the same seed. On an event without a base (for example `workfl
 
 Inputs, all optional: `root`, `base` (a git ref, or `none` only for repositories whose approvals are test
 fixtures), `build`/`diff` (`auto` or `false`), `invariants` (`true` or `false`), `diff-inputs`,
-`diff-budget-seconds`, `diff-seed`, `dafny-version`, `node-version`, `go-version`. Outputs: `result` (`pass` or
+`diff-budget-seconds`, `diff-seed`, `diff-tier` (`ci` or `nightly`: input count, budget and steering from the
+tier in `forge.json`), `dafny-version`, `node-version`, `go-version`. Outputs: `result` (`pass` or
 `fail`) and `report` (a JSON file with every verdict). More below.
 
 `APPROVAL_CHANGED` means a person with the right to approve specs must review the change. To make this a lock,
@@ -113,10 +116,11 @@ inputs, and `.github/ci-fixture/expect.py` requires the outcome and verdict:
 
 | Entry | Change | Required |
 | --- | --- | --- |
-| `clean` | none | pass; 50,000 inputs, `DIFF_OK` |
+| `clean` | none | pass; 50,000 inputs, `DIFF_OK`; callers gate passes (the fixture's `"callers"`: `app.py:spend`, replaced `legacy_wallet.py:legacy_spend`) |
 | `spec-weakened` | W1 removed from the spec | fail, `APPROVAL_CHANGED` |
 | `spec-weakened-nobase` | same, with `base: none` | fail, `SPEC_CHANGED` |
 | `bypass` | a new `refund.py` that compares `spent + amount <= cap` itself | fail, `UNAPPROVED_BYPASS` |
+| `unverified-caller` | a new `fast_path.py` that calls the replaced `legacy_spend` through an import alias | fail, `UNVERIFIED_CALLER`, callers gate names `fast_path.py:5` |
 | `stale-invariants` | a hand edit of `INVARIANTS.md` | fail, `INVARIANTS_STALE` |
 | `logic-bug` | `app.py` rejects an exact-cap spend when `cap % 250 == 27` | fail, `DISAGREE` |
 

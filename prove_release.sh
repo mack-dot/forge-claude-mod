@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# prove_release.sh - the release battery of the forge plugin: 8 gates, exit 0 only if all pass.
+# prove_release.sh - the release battery of the forge plugin: 9 gates, exit 0 only if all pass.
 #   ./prove_release.sh [out_dir]          (default: .forge/cache/release/<time>)
 # Needs: python3, git, Dafny 4.11 or the pinned download, node 22.18+, go + goimports, cargo,
 # java (the checker tests), Claude Code (`claude plugin validate`), Docker with Compose v2.
@@ -15,6 +15,10 @@
 #   G7 README: the unified workflow and its honest labels (the README, and the docs pages it links)
 #   G8 llm model proxy (fake provider, fake key): no key in the box, SSE, settlement = reported usage,
 #      error / cut stream / kill keep the reservation, 20 concurrent stop at the cap, restart, forge up
+#   G9 in-box red team (M2.3) through the real forge up: probes in the agent box for /proc, git objects,
+#      fds and sockets, env, temp files find no hidden content, hidden name, canary token, upstream key
+#      or host path; one planted breach per family is detected; Docker sync-back of case / NFD /
+#      trailing dot-space aliases, a case-only rename, a FIFO and a socket: all refused, export finishes
 # Label: FINITE TEST (one machine, the listed inputs). Container tier: shares the host kernel.
 set -u
 cd "$(dirname "$0")"
@@ -163,6 +167,23 @@ python3 airlock/tests/run_llm_gate.py >"$OUT/g8-llm-gate.txt" 2>&1 || g=1
 grep -E "^(FAIL|llm gate:|timings)" "$OUT/g8-llm-gate.txt" | sed 's/^/     /'
 gate G8 "llm proxy: no key in box, SSE, settle, error/cut/kill keep, 20 parallel at cap, restart" $g $((SECONDS-t))
 
+# ---------------------------------------------------------------- G9
+t=$SECONDS; g=0
+python3 airlock/tests/inbox_probes/run_inbox_probes.py >"$OUT/g9-inbox-probes.txt" 2>&1 || g=1
+grep -E "^(ok|FAIL)  inbox (baseline|negative)" "$OUT/g9-inbox-probes.txt" | cut -c1-150 | sed 's/^/     /'
+tail -1 "$OUT/g9-inbox-probes.txt" | sed 's/^/     /'
+python3 airlock/tests/inbox_probes/run_alias_e2e.py >"$OUT/g9-alias-e2e.txt" 2>&1 || g=1
+grep -E "^FAIL|negative control|finished" "$OUT/g9-alias-e2e.txt" | cut -c1-150 | sed 's/^/     /'
+tail -1 "$OUT/g9-alias-e2e.txt" | sed 's/^/     /'
+i_ok=$(grep -c '^ok    inbox' "$OUT/g1-airlock-unit.txt"); i_bad=$(grep -c '^FAIL  inbox' "$OUT/g1-airlock-unit.txt")
+echo "     in-box unit regressions (G1): $i_ok ok, $i_bad failed"
+[ "$i_bad" = 0 ] && [ "$i_ok" -ge 12 ] || g=1
+for f in proc git fd env files; do
+  grep -q "^ok    inbox baseline $f:" "$OUT/g9-inbox-probes.txt" || { echo "     missing baseline family: $f"; g=1; }
+  grep -q "^ok    inbox negative control $f:" "$OUT/g9-inbox-probes.txt" || { echo "     missing negative control: $f"; g=1; }
+done
+gate G9 "in-box probes (proc, git, fd, env, files) + 5 planted breaches; Docker alias sync-back" $g $((SECONDS-t))
+
 # ---------------------------------------------------------------- G7
 t=$SECONDS
 python3 - <<'PY'; g=$?
@@ -188,14 +209,15 @@ gate G7 "README: unified workflow and honest labels" $g $((SECONDS-t))
 
 # ---------------------------------------------------------------- cleanup and result
 docker image rm "forge-airlock-proof:$FORGEAIR_RUN" >/dev/null 2>&1 || true
+docker image rm "forge-airlock-inbox:$FORGEAIR_RUN" >/dev/null 2>&1 || true   # G9 harness image of this run
 NEW=$(comm -13 <(echo "$BEFORE") <(docker_names) | grep -v '^$')
 OTHER=$(echo "$NEW" | grep -v "^forgeair-$FORGEAIR_RUN-" | grep -v '^$')
 MINE=$(echo "$NEW" | grep "^forgeair-$FORGEAIR_RUN-")
-echo "cleanup: run $FORGEAIR_RUN: $(echo "$NEW" | grep -c .) Docker object(s) left that did not exist at the start (forgeair*, forge-airlock*, llm-*)" | tee -a "$OUT/scoreboard.txt"
+echo "cleanup: run $FORGEAIR_RUN: $(echo "$MINE" | grep -c .) of this run's Docker objects left; $(echo "$OTHER" | grep -c .) new object(s) from other runs (forgeair*, forge-airlock*, llm-*)" | tee -a "$OUT/scoreboard.txt"
 [ -n "$NEW" ] && echo "$NEW" | sed 's/^/     left: /' | tee -a "$OUT/scoreboard.txt"
-[ -n "$OTHER" ] && [ -z "$MINE" ] && echo "     (names without this run's id may belong to another run on this host; rerun on a quiet host to tell)" | tee -a "$OUT/scoreboard.txt"
+[ -n "$OTHER" ] && echo "     names without this run's id ($FORGEAIR_RUN) belong to other runs on this host or are kept by design (forge-airlock-logs-<repo>); each tool above checks its own leftovers, so only this run's names fail the release" | tee -a "$OUT/scoreboard.txt"
 fail=0
 for e in "${G_EXIT[@]}"; do [ "$e" = 0 ] || fail=1; done
-[ -z "$NEW" ] || fail=1
+[ -z "$MINE" ] || fail=1
 echo "prove_release: $([ $fail = 0 ] && echo PASS || echo FAIL) total=$((SECONDS-T0))s out=${OUT#"$PWD"/}" | tee -a "$OUT/scoreboard.txt"
 exit $fail

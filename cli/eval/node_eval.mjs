@@ -13,10 +13,18 @@
 // wrapper(input) or wrappers { name: input => output }, which call the app's REAL wrapper with the raw values, and
 // failClosed(input), the spec's fail-closed answer for a value the proved rule does not take (return undefined when
 // the proved rule takes it). Messy inputs go only to the wrappers; {"__undefined__": true} in them becomes undefined.
+//
+// Steered runs (cli/forge_steer.py, node_steer.mjs): with FORGE_STEER_FILES set, a plain answer may carry
+// "novel": [n, ...], the numbers of plain inputs (0, 1, ...) that reached a block of a watched file first.
 import { createRequire, Module } from 'node:module'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+
+// The protocol owns the real stdout. Code under test that logs (console.log, process.stdout.write) writes to stderr
+// instead: before this, one console.log in the code under test broke the line protocol.
+const proto = process.stdout.write.bind(process.stdout)
+process.stdout.write = process.stderr.write.bind(process.stderr)
 
 const adapterPath = path.resolve(process.argv[2])
 
@@ -47,7 +55,76 @@ const plain = x => {
 }
 const write = obj => JSON.stringify(plain(obj), (k, x) => (typeof x === 'bigint' ? JSON.rawJSON(x.toString()) : x))
 
+// Before the adapter loads, so the watched files' blocks are counted from their first run.
+const steer = process.env.FORGE_STEER_FILES
+  ? (await import('./node_steer.mjs')).start(JSON.parse(process.env.FORGE_STEER_FILES), process.env.FORGE_STEER_OUT,
+    Number(process.env.FORGE_STEER_BATCH || 16))
+  : null
+let seq = 0
 const adapter = await import(pathToFileURL(adapterPath).href)
+
+// Trace mode (cli/forge_trace.py): the adapter exports trace = { reference: machine, candidates: { name: machine } },
+// machine = { init(), step(state, event, now) -> { ok: state } | { reject: reason }, view(state) -> JSON,
+// save(state)?, load(saved)? }. A rejected step keeps the state object it got (so a step that changes it before it
+// rejects shows up). "restart" runs load(save(state)) through JSON text; without save/load it changes nothing.
+if (adapter.trace) {
+  const machines = { reference: adapter.trace.reference, ...(adapter.trace.candidates || {}) }
+  const tnames = Object.keys(adapter.trace.candidates || {})
+  const errName = e => (e && e.name ? e.name : String(e))
+  const run = (m, steps) => {
+    const out = []
+    let s
+    try {
+      s = m.init()
+    } catch (e) {
+      return [{ __throws__: errName(e) }]
+    }
+    for (const st of steps) {
+      try {
+        let v
+        if (st.restart) {
+          if (m.save && m.load) s = m.load(parse(write(m.save(s))))
+          v = 'restart'
+        } else {
+          const r = m.step(s, parse(write(st.event)), st.now)
+          if (r && typeof r === 'object' && 'ok' in r) {
+            s = r.ok
+            v = 'ok'
+          } else if (r && typeof r === 'object' && 'reject' in r) {
+            v = 'reject:' + String(r.reject)
+          } else {
+            throw new TypeError('step returned neither { ok } nor { reject }')
+          }
+        }
+        out.push({ v, s: parse(write(m.view(s))) })
+      } catch (e) {
+        out.push({ __throws__: errName(e) })
+        break
+      }
+    }
+    return out
+  }
+  proto(JSON.stringify({ candidates: tnames, trace: true }) + '\n')
+  process.stdin.setEncoding('utf8')
+  let buf = ''
+  for await (const chunk of process.stdin) {
+    buf += chunk
+    let i
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i)
+      buf = buf.slice(i + 1)
+      if (!line.trim()) continue
+      const { traces } = parse(line)
+      const results = traces.map(steps => {
+        const candidates = {}
+        for (const n of tnames) candidates[n] = run(machines[n], steps)
+        return { reference: run(machines.reference, steps), candidates }
+      })
+      proto(write({ results }) + '\n')
+    }
+  }
+  process.exit(0)
+}
 const wrappers = adapter.wrappers ? { ...adapter.wrappers } : adapter.wrapper ? { wrapper: adapter.wrapper } : {}
 const all = { ...(adapter.candidates || {}), ...wrappers }
 const names = Object.keys(all)
@@ -69,7 +146,7 @@ const call = (fn, input, messy) => {
     return { __throws__: e && e.name ? e.name : String(e) }
   }
 }
-process.stdout.write(JSON.stringify({ candidates: names, messy: messyNames, undefined: true }) + '\n')
+proto(JSON.stringify({ candidates: names, messy: messyNames, undefined: true }) + '\n')
 // Split on "\n" only: readline also splits at U+2028 and U+2029, which may appear inside JSON strings.
 async function* lines(stream) {
   let buf = ''
@@ -92,10 +169,15 @@ for await (const line of lines(process.stdin)) {
     if (isUndef(reference)) reference = call(adapter.reference, input, true)
     const out = { reference, candidates: {} }
     for (const n of messyNames) out.candidates[n] = call(wrappers[n], input, true)
-    process.stdout.write(write(out) + '\n')
+    proto(write(out) + '\n')
     continue
   }
   const out = { reference: call(adapter.reference, input), candidates: {} }
   for (const n of names) out.candidates[n] = call(all[n], input)
-  process.stdout.write(write(out) + '\n')
+  if (steer) {
+    const novel = steer.plain(seq++, () => { for (const n of names) call(all[n], input) })
+    if (novel.length) out.novel = novel
+  }
+  proto(write(out) + '\n')
 }
+if (steer) steer.finish()

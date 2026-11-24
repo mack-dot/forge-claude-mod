@@ -13,6 +13,10 @@ import re
 import sys
 import unicodedata
 
+# run as `python3 -I policy.py check` in the image: -I leaves this folder off sys.path, and the folded
+# path rules import sync.fold from here (as gateway.py and export_changes.py do)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 MONEY_MAX = (1 << 63) - 1
 U64_MAX = (1 << 64) - 1
 
@@ -98,17 +102,33 @@ def glob_to_regex(pat):
 
 
 class PathSet:
-    def __init__(self, patterns, what):
+    """fold=True (hidden_paths, readonly_paths, the policy file): a path also matches when its FOLDED form
+    (sync.fold: case, Unicode normalization, ignorable code points, trailing dots and spaces) matches a folded
+    pattern. The sync-back rule folds for a case-insensitive host (macOS); without this, 'Secrets/key' was not
+    hidden by 'secrets/**' in the case-sensitive box although both are one file on that host (O6). Folding
+    only makes these sets match MORE paths; visible_paths is never folded (that would widen what is seen)."""
+
+    def __init__(self, patterns, what, fold=False):
         if not isinstance(patterns, list) or not all(isinstance(x, str) for x in patterns):
             raise PolicyError(f"paths.{what} must be a list of strings")
         self.patterns = list(patterns)
         self._re = [glob_to_regex(x) for x in patterns]
+        self._fold = None
+        if fold:
+            from sync import fold as _fold  # the same folding as the sync-back rule
+            self._fold = (_fold, [glob_to_regex(_fold(x)) for x in patterns])
 
     def match(self, rel):
         rel = rel.strip("/")
         if rel in ("", "."):
             return False
-        return any(r.match(rel) for r in self._re)
+        if any(r.match(rel) for r in self._re):
+            return True
+        if self._fold is not None:
+            f, res = self._fold
+            frel = f(rel)
+            return any(r.match(frel) for r in res)
+        return False
 
     def closes_dir(self, rel_dir):
         """True when every new child of rel_dir would match (e.g. 'tests' for 'tests/**')."""
@@ -232,6 +252,8 @@ class ToolPolicy:
         if not isinstance(self.name, str) or not self.name:
             raise PolicyError(f"{where}.tool must be a non-empty string")
         self.upstream = spec.get("upstream")
+        self.raw = self.name  # the name the upstream knows (differs when namespace: true)
+        self.role_log = self.role_cap = None  # set by a role with a cap for this tool (an extra, smaller log)
         self.gated = gated
         # Held until a person signs this exact call with a hardware key (human_approval.py).
         rha = spec.get("require_human_approval")
@@ -383,25 +405,86 @@ def _resolve(v, environ, where):
     return ENV_REF.sub(sub, v)
 
 
+SEP = "__"
+UPSTREAM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}")
+ROLE_RE = re.compile(r"[a-z][a-z0-9_-]{0,23}")
+
+
+def check_url(url, where):
+    """An http upstream URL after ${NAME} substitution: http or https, a host, no user:pass@
+    (credentials go in headers), no fragment."""
+    from urllib.parse import urlsplit
+    try:
+        u = urlsplit(url)
+        port = u.port
+    except ValueError as e:
+        raise PolicyError(f"{where}: {e}") from None
+    if u.scheme not in ("http", "https") or not u.hostname or "@" in u.netloc or u.fragment:
+        raise PolicyError(f"{where} must be http(s)://host[:port]/path without user info or fragment")
+    return port
+
+
+def pattern_inside(p, b):
+    """Conservative test: every path that glob p matches is also matched by glob b. False
+    when unsure (so a role is refused rather than allowed to widen)."""
+    p, b = p.rstrip("/"), b.rstrip("/")
+    if p == b or b == "**":
+        return True
+    if "/" not in p:  # a basename pattern matches at any depth: inside only '**' or itself
+        return False
+    if b.endswith("/**"):
+        return p.startswith(b[:-2])  # b 'src/**': p must start with the same leading segments 'src/'
+    return False
+
+
 ISOLATION_BACKENDS = ("docker", "gvisor", "microvm")  # the same names as airlock/backends
 
 
 class Policy:
-    def __init__(self, doc, environ=None, resolve=True):
+    def __init__(self, doc, environ=None, resolve=True, role=None):
         """resolve=True replaces ${NAME} in upstreams with the value from environ (the
-        airlock side). resolve=False keeps the names (host side: no secret is read)."""
-        _keys(doc, "forge.yaml", required=("version", "upstreams", "tools"), optional=("paths", "canary", "agent", "llm", "human_approval", "isolation"))
+        airlock side). resolve=False keeps the names (host side: no secret is read).
+        role: the name of one entry of `roles:` (or None for the base policy). A role can
+        only narrow the base policy; an unknown role is a load error (fail closed)."""
+        _keys(doc, "forge.yaml", required=("version", "upstreams", "tools"),
+              optional=("paths", "canary", "agent", "llm", "human_approval", "isolation", "namespace", "roles"))
         if doc["version"] != 1:
             raise PolicyError("version must be 1")
+        if "namespace" in doc and not isinstance(doc["namespace"], bool):
+            raise PolicyError("namespace must be true or false")
+        self.namespace = doc.get("namespace", False)
         # upstreams
         if not isinstance(doc["upstreams"], list) or not doc["upstreams"]:
             raise PolicyError("upstreams must be a non-empty list")
         self.upstreams = {}
+        folded = {}
         for i, u in enumerate(doc["upstreams"]):
             w = f"upstreams[{i}]"
-            _keys(u, w, required=("name", "transport"), optional=("command", "url", "env", "headers", "timeout_s", "user"))
+            _keys(u, w, required=("name",), optional=("transport", "command", "url", "env", "headers", "timeout_s",
+                                                      "user"))
+            if not isinstance(u["name"], str) or not u["name"]:
+                raise PolicyError(f"{w}.name must be a non-empty string")
+            if self.namespace and not UPSTREAM_RE.fullmatch(u["name"]):
+                raise PolicyError(f"{w}.name must match {UPSTREAM_RE.pattern} with namespace: true")
             if u["name"] in self.upstreams:
                 raise PolicyError(f"{w}: duplicate upstream {u['name']!r}")
+            # namespacing collision: with namespace: true the tool fs__x belongs to upstream fs.
+            # An upstream named 'a__b' would make 'a__b__c' ambiguous ('a' + 'b__c' or 'a__b' + 'c'),
+            # and 'fs' / 'FS' are confusable; both are load errors.
+            if self.namespace and (SEP in u["name"] or u["name"].endswith("_")):
+                raise PolicyError(f"{w}.name {u['name']!r}: contains {SEP!r} or ends in '_'; with namespace: true the tool names "
+                                  f"<upstream>{SEP}<tool> would collide")
+            if u["name"].casefold() in folded:
+                raise PolicyError(f"{w}: upstream {u['name']!r} collides with {folded[u['name'].casefold()]!r} "
+                                  "(names differ only in case)")
+            folded[u["name"].casefold()] = u["name"]
+            if "transport" not in u:  # the kind follows from the keys: url -> http, command -> stdio
+                if ("url" in u) == ("command" in u):
+                    raise PolicyError(f"{w}: give transport, or exactly one of url (http) and command (stdio)")
+                u = dict(u, transport="http" if "url" in u else "stdio")
+            if "timeout_s" in u and (isinstance(u["timeout_s"], bool) or not isinstance(u["timeout_s"], (int, float))
+                                     or not 0 < u["timeout_s"] <= 3600):
+                raise PolicyError(f"{w}.timeout_s must be a number in (0, 3600]")
             if u["transport"] == "stdio":
                 if "user" in u:
                     _int(u["user"], f"{w}.user", 1, 65534)
@@ -410,6 +493,8 @@ class Policy:
             elif u["transport"] == "http":
                 if not isinstance(u.get("url"), str) or "command" in u or "env" in u or "user" in u:
                     raise PolicyError(f"{w}: http needs url and no command/env")
+                if not re.match(r"https?://", u["url"]):
+                    raise PolicyError(f"{w}.url must start with http:// or https://")
             else:
                 raise PolicyError(f"{w}.transport must be stdio or http")
             if resolve:
@@ -419,6 +504,7 @@ class Policy:
                     u["command"] = [_resolve(x, env, f"{w}.command") for x in u["command"]]
                 if "url" in u:
                     u["url"] = _resolve(u["url"], env, f"{w}.url")
+                    check_url(u["url"], f"{w}.url")
                 for k in ("env", "headers"):
                     if k in u:
                         if not isinstance(u[k], dict):
@@ -441,7 +527,16 @@ class Policy:
                     raise PolicyError(f"tool {tp.name!r} is both denied and allowed/gated")
                 if tp.upstream is not None and tp.upstream not in self.upstreams:
                     raise PolicyError(f"tool {tp.name!r}: unknown upstream {tp.upstream!r}")
+                if self.namespace:
+                    up, raw = self.split_name(tp.name, f"tools.{key}[{i}].tool")
+                    if tp.upstream is not None and tp.upstream != up:
+                        raise PolicyError(f"tool {tp.name!r}: upstream {tp.upstream!r} does not match its "
+                                          f"namespace {up!r}")
+                    tp.upstream, tp.raw = up, raw
                 self.tools[tp.name] = tp
+        if self.namespace:
+            for i, n in enumerate(self.deny):
+                self.split_name(n, f"tools.deny[{i}]")
         # human_approval: the keys that may sign a held call (allowed-signers lines) and how long a call waits
         ha = doc.get("human_approval")
         self.approval_signers, self.approval_timeout_s = [], 300
@@ -469,11 +564,21 @@ class Policy:
             key = (tp.cap, tp.expires_in_s, tp.expires_at)
             if self.logs.setdefault(tp.log, key) != key:
                 raise PolicyError(f"log {tp.log!r}: gated tools that share it disagree on cap/expiry")
+        roles = doc.get("roles")
+        if roles is not None:
+            _keys(roles, "roles", optional=list(roles))
+            if not roles:
+                raise PolicyError("roles must not be empty (omit it instead)")
+            for rn in roles:
+                if not isinstance(rn, str) or not ROLE_RE.fullmatch(rn):
+                    raise PolicyError(f"roles: role name {rn!r} must match {ROLE_RE.pattern}")
+        self.role_names = sorted(roles or {})
+        self.role = role or None
         # paths
         p = doc.get("paths") or {}
         _keys(p, "paths", optional=("hidden_paths", "visible_paths", "readonly_paths", "mcp_root", "agent_root",
                                     "keep_commit_messages"))
-        self.hidden = PathSet(p.get("hidden_paths") or [], "hidden_paths")
+        self.hidden = PathSet(p.get("hidden_paths") or [], "hidden_paths", fold=True)
         # visible_paths absent: everything except hidden_paths. Present: ONLY matches, minus hidden.
         self.visible = PathSet(p["visible_paths"], "visible_paths") if "visible_paths" in p else None
         if self.visible is not None and not self.visible.patterns:
@@ -481,7 +586,14 @@ class Policy:
         ro = p.get("readonly_paths") or []
         if isinstance(ro, list) and "forge.yaml" not in ro:
             ro = list(ro) + ["forge.yaml"]  # the policy file is always read-only in the box
-        self.readonly = PathSet(ro, "readonly_paths")
+        self.readonly = PathSet(ro, "readonly_paths", fold=True)
+        # every role is checked at load (a widening role is an error even when not selected)
+        for rn in self.role_names:
+            self._role(rn, roles[rn], apply=False)
+        if self.role is not None:
+            if self.role not in self.role_names:
+                raise PolicyError(f"role {self.role!r} is not defined in roles: {self.role_names} (fail closed)")
+            self._role(self.role, roles[self.role], apply=True)
         self.mcp_root = p.get("mcp_root", "/ws")
         self.agent_root = p.get("agent_root", "/workspace")
         self.keep_commit_messages = bool(p.get("keep_commit_messages", False))
@@ -508,7 +620,86 @@ class Policy:
             if not self.llm_key:
                 raise PolicyError(f"llm.key_env: environment variable {self.llm['key_env']} is not set (fail closed)")
         # The policy file itself is never writable by the agent and never synced back.
-        self.protected = PathSet(["forge.yaml"], "protected")
+        self.protected = PathSet(["forge.yaml"], "protected", fold=True)
+
+    # ------------------------------------------------------------ namespacing and roles
+    def split_name(self, name, where):
+        """namespace: true. '<upstream>__<tool>' -> (upstream, tool); anything else is an error."""
+        up, sep, raw = name.partition(SEP) if isinstance(name, str) else ("", "", "")
+        if not sep or not raw or up not in self.upstreams:
+            raise PolicyError(f"{where} {name!r}: with namespace: true a tool is named <upstream>{SEP}<tool> "
+                              f"with a known upstream ({sorted(self.upstreams)})")
+        return up, raw
+
+    def _role(self, rn, spec, apply):
+        """Check one role and, with apply=True, narrow this policy to it. A role can only
+        remove tools, lower caps, add hidden paths and restrict visible paths. Every attempt
+        to widen (a tool the base does not allow or gate, a cap above the base cap, a
+        visible pattern outside the base visible_paths) is a load error."""
+        w = f"roles.{rn}"
+        _keys(spec, w, optional=("tools", "hidden_paths", "visible_paths", "cap"))
+        names = spec.get("tools")
+        if names is not None:
+            if not isinstance(names, list) or not all(isinstance(x, str) for x in names):
+                raise PolicyError(f"{w}.tools must be a list of tool names")
+            for n in names:
+                if n in self.deny:
+                    raise PolicyError(f"{w}.tools: {n!r} is denied by the base policy (a role cannot widen)")
+                if n not in self.tools:
+                    raise PolicyError(f"{w}.tools: {n!r} is not allowed or gated by the base policy "
+                                      "(a role cannot widen)")
+        keep = set(self.tools) if names is None else set(names)
+        caps = spec.get("cap")
+        if caps is not None:
+            gated = [n for n in keep if self.tools[n].gated]
+            if type(caps) is int:
+                caps = {n: caps for n in gated}
+            if not isinstance(caps, dict):
+                raise PolicyError(f"{w}.cap must be an integer or a mapping tool -> integer")
+            for n, c in caps.items():
+                tp = self.tools.get(n)
+                if tp is None or not tp.gated or n not in keep:
+                    raise PolicyError(f"{w}.cap.{n}: not a gated tool of this role")
+                _int(c, f"{w}.cap.{n}", 0, MONEY_MAX)
+                if c > tp.cap:
+                    raise PolicyError(f"{w}.cap.{n} = {c} is above the base cap {tp.cap} (a role cannot widen)")
+            rlogs = {}
+            for n, c in caps.items():
+                tp = self.tools[n]
+                ln = f"{tp.log}.role-{rn}"
+                if len(ln) > 64:
+                    raise PolicyError(f"{w}: log name {ln!r} is longer than 64 characters")
+                key = (c, tp.expires_in_s, tp.expires_at)
+                if rlogs.setdefault(ln, key) != key:
+                    raise PolicyError(f"{w}.cap: tools that share log {tp.log!r} need the same role cap")
+        hid = spec.get("hidden_paths")
+        if hid is not None:
+            PathSet(hid, f"{w}.hidden_paths")
+        vis = spec.get("visible_paths")
+        if vis is not None:
+            PathSet(vis, f"{w}.visible_paths")
+            if not vis:
+                raise PolicyError(f"{w}.visible_paths must not be empty (omit it instead)")
+            if self.visible is not None:
+                for pat in vis:
+                    if not any(pattern_inside(pat, b) for b in self.visible.patterns):
+                        raise PolicyError(f"{w}.visible_paths: {pat!r} is not inside the base visible_paths "
+                                          f"{self.visible.patterns} (a role cannot widen)")
+        if not apply:
+            return
+        self.tools = {n: tp for n, tp in self.tools.items() if n in keep}
+        for n, c in (caps or {}).items():
+            tp = self.tools[n]
+            tp.role_log = f"{tp.log}.role-{rn}"
+            tp.role_cap = c
+            self.logs[tp.role_log] = (c, tp.expires_in_s, tp.expires_at)
+        if hid:
+            self.hidden = PathSet(self.hidden.patterns + [x for x in hid if x not in self.hidden.patterns],
+                                  "hidden_paths", fold=True)
+        if vis is not None:
+            # every role pattern lies inside a base pattern (checked above), so the role set
+            # alone is the intersection
+            self.visible = PathSet(list(vis), "visible_paths")
 
     @staticmethod
     def load_doc(path):
@@ -521,8 +712,8 @@ class Policy:
             raise PolicyError(f"forge.yaml does not parse: {e}") from None
 
     @staticmethod
-    def load(path, resolve=True):
-        return Policy(Policy.load_doc(path), resolve=resolve)
+    def load(path, resolve=True, role=None):
+        return Policy(Policy.load_doc(path), resolve=resolve, role=role)
 
     def secrets(self):
         """Every credential value held on the airlock side (for the canary)."""
@@ -665,14 +856,14 @@ def canonical_json(v):
 
 
 def main(argv):
-    """policy.py check <forge.yaml>: validate without secrets and print the parsed document
+    """policy.py check <forge.yaml> [role]: validate without secrets and print the parsed document
     as JSON (names of ${VARS} kept). Used by forge_airlock.py on the host. Exit 2 if invalid."""
-    if len(argv) != 3 or argv[1] != "check":
-        print("usage: policy.py check <forge.yaml>", file=sys.stderr)
+    if len(argv) not in (3, 4) or argv[1] != "check":
+        print("usage: policy.py check <forge.yaml> [role]", file=sys.stderr)
         return 2
     try:
         doc = Policy.load_doc(argv[2])
-        Policy(doc, resolve=False)
+        Policy(doc, resolve=False, role=argv[3] if len(argv) == 4 else None)
     except (PolicyError, OSError) as e:
         print(json.dumps({"ok": False, "error": str(e)}))
         return 2

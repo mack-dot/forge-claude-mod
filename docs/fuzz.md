@@ -88,6 +88,46 @@ diff run per mutant: on the example 150–220 ms (Python), 210–430 ms (TypeScr
 warm cargo cache) and 1.4 s (Java) per mutant. Labels: both measures are test tooling (not proved); a mutation
 score is a FINITE TEST of the fuzz, not of the code.
 
+## Fuzz tiers and coverage-guided steering
+
+The end-of-turn fuzz must stay fast; big volume belongs in CI. Three tiers, set in `.forge/forge.json` (all optional;
+these are the defaults):
+
+```json
+"fuzz": {"tiers": {"local":   {"inputs": 1500,    "budget_ms": 1500,    "steer": false},
+                   "ci":      {"inputs": 100000,  "budget_ms": 600000,  "steer": true},
+                   "nightly": {"inputs": 1000000, "budget_ms": 3600000, "steer": true}}}
+```
+
+`diff` runs the local tier (a diff entry's own `inputs_per_run` / `budget_ms` still win there); `diff --tier ci` and
+`diff --tier nightly` run the others; `--inputs` / `--budget-ms` win over every tier; `--steer` / `--no-steer` win
+over the tier's steering. In the Action: `diff-tier: ci` (or `nightly` in a scheduled workflow).
+
+**Steering** (`--steer`; py and js entries). Blind random inputs reach a narrow branch only by luck. A steered run
+gets per-input coverage from the evaluator itself (Python: a tracer around the candidate calls only; JS/TS: V8
+block coverage through `node:inspector`, read once per 16 inputs and per input only when the batch found something
+new), keeps every input that reaches a new step of the shipped code as a seed and mostly tries small changes of the
+seeds (an AFL-style corpus loop), and puts in constants read from the watched files' comparisons (`amount == 7777`
+gives `amount` the values 7776, 7777, 7778: a dictionary). Steering changes which inputs are tried, never how they
+are judged. It also names every line no input reached, plainly: `legacy_wallet.py:3 was never reached`. Go, Rust,
+Java, C# and cmd entries are not steered (no per-input coverage) and say so.
+
+Measured (`tests/bench_steer.py --seeds 20`, macOS arm64, Python 3.10, Node 24.3): the example with the shipped
+code fixed and ONE bug planted behind `amount == 7777`, 1,500 inputs per run, seeds 1 to 20, the same input count
+for every mode:
+
+| Mode | Python: bug found | Python: `legacy_wallet.py` branches reached (median) | TS: bug found | TS: `legacy_wallet.ts` code lines reached (median) |
+| --- | --- | --- | --- | --- |
+| blind random (`--no-steer`) | 0 of 20 | 3 of 4 | 0 of 20 | 4 of 5 |
+| corpus only (kept seeds, no constants) | 1 of 20 | 3 of 4 | 1 of 20 | 4 of 5 |
+| dictionary only (constants, no seeds) | 20 of 20 | 4 of 4 | 20 of 20 | 5 of 5 |
+| steered (`--steer`: both) | 20 of 20 | 4 of 4 | 20 of 20 | 5 of 5 |
+
+On this bug the constants from the code do the work; the corpus alone adds little (1 of 20). A narrow branch
+whose value is computed, not written in the code, is not reached this way.
+
+Labels: tiers and steering are test tooling (not proved); every run is a FINITE TEST.
+
 ## Messy inputs: the wrapper must fail closed, never throw
 
 The wrapper that turns your app's values (often JSON) into the proved code's values is not proved. Runtime JSON
@@ -144,5 +184,3 @@ messy inputs share the budget, so fewer plain inputs run (584 instead of 1,500 f
 
 Labels: the messy values are a fixed list, not every possible value; the fail-closed answer is the adapter's (the
 person's) choice, not proved; a run is a FINITE TEST.
-
-See `PLAN.md` for what is built and what is not.

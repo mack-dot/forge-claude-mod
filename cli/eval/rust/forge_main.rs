@@ -75,14 +75,37 @@ fn call_any(f: impl FnOnce() -> Value) -> Value {
     }
 }
 
+// The protocol owns the real stdout. Code under test that prints (println!) writes to stderr instead: before this, one
+// println! in the shipped code broke the line protocol (DIFF_ERROR). On Unix: fd 1 is duplicated for the protocol,
+// then fd 2 is copied onto fd 1. Elsewhere the protocol keeps stdout (a print there still breaks it).
+#[cfg(unix)]
+fn protocol_out() -> Box<dyn Write> {
+    use std::os::unix::io::FromRawFd;
+    extern "C" {
+        fn dup(fd: i32) -> i32;
+        fn dup2(from: i32, to: i32) -> i32;
+    }
+    unsafe {
+        let fd = dup(1);
+        if fd < 0 || dup2(2, 1) < 0 {
+            return Box::new(std::io::stdout());
+        }
+        Box::new(std::io::BufWriter::new(std::fs::File::from_raw_fd(fd)))
+    }
+}
+
+#[cfg(not(unix))]
+fn protocol_out() -> Box<dyn Write> {
+    Box::new(std::io::stdout())
+}
+
 fn main() {
     std::panic::set_hook(Box::new(|_| {})); // panics are reported in the protocol, not printed
     let mut cands = adapter::candidates();
     cands.sort_by(|a, b| a.0.cmp(b.0));
     let mut wraps = messy_wrappers();
     wraps.sort_by(|a, b| a.0.cmp(b.0));
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
+    let mut out = protocol_out();
     let mut all: Vec<&str> = cands.iter().map(|c| c.0).collect();
     all.extend(wraps.iter().map(|c| c.0));
     let wnames: Vec<&str> = wraps.iter().map(|c| c.0).collect();

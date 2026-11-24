@@ -35,3 +35,15 @@ Honest labels:
 concurrent symlink swap; gated MCP incl. crash, timeout and restart; planted breaches; diff sync-back; gate
 latency; the README and its docs pages; the `llm` model proxy against a fake provider) and exits 0 only if all pass. Not tested: see "Not tested" in `airlock/README.md`
 (no real model session in the box, no Linux or Windows host, no real paid upstream).
+
+## More in `airlock/README.md`
+
+Each of these is optional and has its own section, honest labels and test list in
+[`airlock/README.md`](../airlock/README.md):
+
+- Streamable HTTP MCP servers, several upstreams in one box, and roles that only narrow what a box may see and call.
+- Held calls that wait for a person (`require_human_approval: hardware`).
+- Isolation backends (`--isolation`): `docker` (the container tier: shares the host kernel), `gvisor` and `microvm`
+  (a Kata VM per agent container), both on Linux hosts only and run on CI only. On macOS a vfkit microVM boot check
+  exists as the positive control of that design; running the agent itself in such a VM is NOT built.
+- Protocol hardening and the in-box red team (probes run inside the box); every finding has a regression test.

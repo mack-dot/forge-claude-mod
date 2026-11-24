@@ -44,6 +44,8 @@ FWD_HEADERS = ("content-type", "accept", "anthropic-version", "anthropic-beta", 
 DROP_RESP = {"connection", "keep-alive", "transfer-encoding", "content-length", "content-encoding",
              "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade", "set-cookie"}
 TOKEN_FIELDS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
+READ_TIMEOUT_S = float(os.environ.get("FORGE_READ_TIMEOUT_S", "30"))  # C4: per socket operation (as gateway F1)
+MAX_CONN = int(os.environ.get("FORGE_MAX_CONN", "256"))  # C4: concurrent connections (threads)
 
 
 def _fsync_append(path, entry):
@@ -276,7 +278,20 @@ class LLMGate:
         return done, None
 
     def settle(self, logs, rid, actual, note):
-        return [lg.settle(rid, actual, note) for lg in logs]
+        """S4: each log is settled on its own. An OSError in one log (disk full, I/O error) does not stop the
+        others. Fail closed, never undercounted: the failing log keeps the reservation open and counted in
+        memory (if the step reached the log before the error, it is counted twice until the restart), and its
+        .llm.jsonl still says PENDING, so the restart settles it (_recover: COMMITTED if the step is in the
+        log, else the FULL reservation as spent)."""
+        out = []
+        for lg in logs:
+            try:
+                out.append(lg.settle(rid, actual, note))
+            except OSError as e:
+                print(f"[airlock] llm log {lg.name}: settle failed ({type(e).__name__}: {str(e)[:120]}); "
+                      "the reservation stays counted and is settled as spent at restart", flush=True)
+                out.append("SETTLE_ERROR")
+        return out
 
     def status(self):
         out = {"unit": self.cfg["unit"], "session": self.session.status()}
@@ -343,6 +358,7 @@ def refusal(code, message):
 
 class LLMHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = READ_TIMEOUT_S  # C4: an idle or slow connection does not hold a thread forever
     A = None      # the Airlock (canary state)
     G = None      # the LLMGate
     CFG = None
@@ -385,6 +401,7 @@ class LLMHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0]
         if self.headers.get("transfer-encoding"):
+            self.close_connection = True  # C3: the body is not read, so its bytes must not become a request
             return self._refuse(411, "FORGE_LLM_BODY", "a content-length body is required")
         try:
             n = int(self.headers.get("content-length") or 0)
@@ -575,8 +592,33 @@ class LLMHandler(BaseHTTPRequestHandler):
 
 
 class LLMServer(ThreadingHTTPServer):
+    """C4: at most max_conn connections are served at once (one thread each); one more gets 503 and is closed."""
     request_queue_size = 256
     daemon_threads = True
+
+    def __init__(self, *a, max_conn=None, **kw):
+        self._slots = threading.BoundedSemaphore(max_conn or MAX_CONN)
+        super().__init__(*a, **kw)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 def serve(airlock, gate, cfg, key, port):

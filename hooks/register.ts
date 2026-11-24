@@ -7,7 +7,8 @@ import type { Register } from 'claude-code'
 //                   (/forge approve yes --hardware [--key KEY]: also sign the approval with a security key)
 //   /forge check    proves every check in .forge/forge.json with Dafny; verdict in the status line
 //   /forge status   prints the last verdicts
-//   /forge more     every other command (advanced tools stay out of the day-1 surface)
+//   /forge more     every other command (advanced tools stay out of the day-1 surface), for example
+//   /forge crash-fuzz [file:function ...]   CRASH-CHECK (no spec): boundary functions called with messy JSON
 // Files in the project: .forge/forge.json (checks), .forge/approved.json (your approvals),
 // .forge/last-check.json (last verdicts).
 // LIMIT: this is a feedback loop, not a security boundary. The guard blocks Claude's
@@ -43,7 +44,12 @@ type LastCheck = {
   warnings?: string[]
   // places outside a rule that decide on its watched fields (written by `check` when a check has watchedFields)
   outside?: Record<string, unknown[]>
+  // the suggested next rule: an out-of-scope item of the decision record, and the top unproved feeder (call graph)
+  next_rule?: Record<string, { item?: string; code?: string[]; feeder?: { text: string; score: number } }>
 }
+// `forge_check.py status --json`: the one-line status. level: green ✓, yellow ⚠ (drift: a stale decision note, a
+// wrapper changed since the last approval or clean fuzz, a new unverified caller), red ✗, none (not set up / checked).
+type Status = { level: 'green' | 'yellow' | 'red' | 'none'; line: string; reasons: Array<{ kind: string; text: string }> }
 
 const DIR = '.forge'
 const CONFIG = `${DIR}/forge.json`
@@ -127,15 +133,36 @@ function scopeText(last: LastCheck | undefined, diff: LastDiff | undefined, cfg:
 }
 
 let lastStatus: string | undefined // the line last shown, so /forge can print it as the result
+async function readStatus($: Api, root: string): Promise<Status | undefined> {
+  const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'status', '--root', root, '--json'], {
+    cwd: root,
+    timeoutMs: 20_000,
+  })
+  try {
+    const st = JSON.parse(r.stdout) as Status
+    return typeof st.line === 'string' ? st : undefined
+  } catch {
+    return undefined
+  }
+}
+
 async function refreshStatus($: Api) {
   const root: string = await $.session.root()
   const cfg = await readJson<Config>($, join(root, CONFIG))
   const last = await readJson<LastCheck>($, join(root, LAST))
-  let text = summary(last, cfg?.checks.length ?? 0)
+  // The checker computes the line (the same parts CI prints); the code below is the fallback if python3 fails.
+  const st = isChecking || isDiffing ? undefined : await readStatus($, root).catch(() => undefined)
+  if (st && !isStale) {
+    lastStatus = cfg || last ? st.line : undefined
+    $.ui.status(lastStatus)
+    return
+  }
+  let text = st ? st.line : summary(last, cfg?.checks.length ?? 0)
   if (cfg && isStale) text = `forge: code changed · ${text.replace(/^forge:? ?/, '')} · /forge check`
   if (isChecking) text = 'forge: checking…'
   const diff = await readJson<LastDiff>($, join(root, '.forge/last-diff.json'))
   if (isDiffing) text += ' · fuzzing…'
+  else if (st) { /* the checker's line already holds the fuzz and scope parts */ }
   else if (diff && Object.keys(diff.checks).length) {
     const rs = Object.values(diff.checks)
     // A failing recorded answer is a disagreement too (CI counts both the same way: cli/forge_ci.py).
@@ -148,7 +175,7 @@ async function refreshStatus($: Api) {
         ? ` · fuzz ✗ ${bad} disagreement(s), /forge diff`
         : ` · fuzzed ${inputs.toLocaleString('en-US')} cases, wrapper NOT proved`
   }
-  if (!isChecking && !isDiffing) text += scopeText(last, diff, cfg)
+  if (!isChecking && !isDiffing && !st) text += scopeText(last, diff, cfg)
   lastStatus = cfg || last ? text : undefined
   $.ui.status(lastStatus)
 }
@@ -402,9 +429,12 @@ More, when you need them
   /forge spec              show the approved rules
   /forge mutate            plant small bugs in the proved code: does the proof catch them?
   /forge mutate app        plant small bugs in your shipped code: does the fuzz catch them?
+  /forge crash-fuzz        CRASH-CHECK, no rule needed: call your handlers with messy JSON and list every crash
   /forge:airlock           run Claude in a box: secret files hidden, MCP tools capped (needs Docker)
   /forge approve yes --hardware   sign the approval with a security key
-Details: README.md and docs/ in the plugin (CI Action: docs/ci.md; airlock: docs/airlock.md).`
+Set up in .forge/forge.json (ask Claude): "callers" (does every caller go through the proved code?), a "trace"
+fuzz for state machines, fuzz tiers. Details: README.md and docs/ in the plugin (callers.md, trace-fuzz.md,
+crash-fuzz.md, ci.md, airlock.md).`
 
 // Files whose change should trigger the differential fuzz: the proved code, the files that import it, the
 // adapters, and each diff entry's "watch" list (the shipped code under test).
@@ -428,6 +458,21 @@ async function fuzzedFilesChanged($: Api): Promise<boolean> {
   seenTimes = now
   if (!before) return false
   return Object.keys(now).some(f => before[f] !== now[f])
+}
+
+// CRASH-CHECK (cli/forge_crash.py): no spec, no forge.json. The exported / route / webhook / parser functions are
+// called with messy JSON; every error that escapes one is listed with a shrunk repro. A finite test, never PROVED.
+async function runCrashFuzz($: Api, args: string[]): Promise<string> {
+  const root: string = await $.session.root()
+  const targets = args.filter(a => /^[^-].*:[A-Za-z_$][\w$]*$/.test(a)).flatMap(t => ['--target', t])
+  const extra = args.includes('--include-private') ? ['--include-private'] : []
+  const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_crash.py`, '--root', root, ...targets, ...extra], {
+    cwd: root,
+    timeoutMs: 600_000,
+  })
+  const text = (r.stdout || r.stderr).trim().slice(0, 8000)
+  if (!text) return `The crash check did not run (exit ${r.exitCode}). It needs python3 (and node for JavaScript/TypeScript).`
+  return r.exitCode === 1 ? `${text}\nFor an explanation and a proposed fix per crash: /forge:crash-fuzz` : text
 }
 
 // The differential fuzz: the code under test against the compiled proved rule (cli/forge_check.py diff).
@@ -503,6 +548,7 @@ export const register: Register = on => {
       return { text: await runBuild($, /^build\s+check\b/.test(e.args.trim())) }
     }
     if (arg === 'diff') return { text: await runDiff($) }
+    if (arg === 'crash-fuzz') return { text: await runCrashFuzz($, e.args.trim().split(/\s+/).slice(1)) }
     if (arg === 'invariants') {
       const root: string = await $.session.root()
       const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'invariants', '--root', root], { cwd: root, timeoutMs: 60_000 })
@@ -533,8 +579,15 @@ export const register: Register = on => {
       const cfg = await readJson<Config>($, join(root, CONFIG))
       const diff = await readJson<LastDiff>($, join(root, '.forge/last-diff.json'))
       if (!last) return { text: 'No check has run yet. Try /forge.' }
+      const st = await readStatus($, root).catch(() => undefined)
       const extra = [...(last.warnings ?? []).map(w => `! ${w}`)]
-      return { text: `${summary(last, 0)}${scopeText(last, diff, cfg)}\nlast run ${last.at}\n${JSON.stringify(last.verdicts, null, 2)}${extra.length ? '\n' + extra.join('\n') : ''}` }
+      // The suggested next rule: what the decision record assumes, and the unproved code that feeds the decision.
+      for (const [name, n] of Object.entries(last.next_rule ?? {})) {
+        if (n.feeder) extra.push(`next rule for ${name} (call graph): prove ${n.feeder.text}`)
+        else if (n.item) extra.push(`next rule for ${name}: "${n.item}" (${(n.code ?? []).join(', ')})`)
+      }
+      const head = st ? st.line : `${summary(last, 0)}${scopeText(last, diff, cfg)}`
+      return { text: `${head}\nlast run ${last.at}\n${JSON.stringify(last.verdicts, null, 2)}${extra.length ? '\n' + extra.join('\n') : ''}` }
     }
     // Steps where Claude talks with the person are Markdown commands (/forge:scan …). A command.run hook
     // cannot start a Claude turn, so put the right command in the prompt box: the person presses Enter.

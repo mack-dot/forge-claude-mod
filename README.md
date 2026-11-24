@@ -78,9 +78,12 @@ In the desktop app: click + next to the prompt box, then Plugins, Add marketplac
 ## More (optional, when you need it)
 
 - [docs/commands.md](docs/commands.md): every command, the whole workflow, the files Forge keeps.
-- [docs/fuzz.md](docs/fuzz.md): the fuzz in detail, its languages, coverage, `mutate --app`, messy inputs.
+- [docs/fuzz.md](docs/fuzz.md): the fuzz in detail, its languages, coverage, `mutate --app`, tiers and steering, messy inputs.
 - [docs/build.md](docs/build.md): `/forge build`, the generated JavaScript module, measurements.
 - [docs/bypass.md](docs/bypass.md): `/forge:bypass`, code that decides the same thing without the proved rule.
+- [docs/callers.md](docs/callers.md): does every caller go through the proved code (`UNVERIFIED_CALLER`, the yellow drift status).
+- [docs/trace-fuzz.md](docs/trace-fuzz.md): state machines, fuzzed over many events per case.
+- [docs/crash-fuzz.md](docs/crash-fuzz.md): `/forge crash-fuzz`, a CRASH-CHECK of your handlers with messy JSON, no rule needed.
 - [docs/approvals.md](docs/approvals.md): `INVARIANTS.md`, signed approvals with a hardware key, what a green check covers.
 - [docs/airlock.md](docs/airlock.md): `/forge airlock`, an agent box with hidden paths and capped MCP tools (Docker); its honest labels and `prove_release.sh`.
 - [docs/ci.md](docs/ci.md): the GitHub Action (zero configuration) and running the checker from a shell.

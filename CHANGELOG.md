@@ -2,8 +2,155 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## Unreleased — checker and fuzzer review: fail-open paths and process lifecycle
+
+A review of the checker and the fuzzer for the class of bug the airlock's MCP client had (tests that ran one call at
+a time against well-behaved mocks). Each fix has a case in `tests/lifecycle_cases.py` that failed on main before it.
+- **Fix (soundness): `@Axiom` and `@VerifyOnly` are UNSOUND_CONSTRUCT.** Dafny 4 has an attribute syntax next to
+  `{:axiom}` / `{:only}`. Before, `@Axiom lemma L() ensures false` passed the text scan, `dafny verify` exited 0, and
+  `check` said VERIFIED for an implementation that shows every item (takedowns included).
+- **Fix (fail-open): `diff` no longer says DIFF_OK when it compared nothing.** An adapter that names no candidates
+  (a typo in `candidates`), a run where every generated input is outside `in_domain`, and a recorded decision outside
+  `in_domain` (counted as "agrees" before) are DIFF_ERROR now.
+- **Fix (fail-open): `diff` checks the emitted code against the build manifest.** Before, only the Dafny sources were
+  compared, so a hand edit of the emitted reference that agreed with a bug in the shipped code gave DIFF_OK. Now it is
+  BUILD_STALE (the same hashes `build --check` compares; Python caches are skipped as before).
+- **Fix: code under test that logs is fuzzed, not reported as broken.** The Python and JavaScript evaluators and
+  crash runners send the code's stdout to stderr (one `print` / `console.log` gave DIFF_ERROR, or a false ProcessExit
+  and "NOT judged" in CRASH-CHECK), and the runners drain stderr in a thread (after 64 KB of log the child blocked:
+  a false "hang"). The Go, Java, C# and Rust evaluators do the same (Rust on Unix: fd 1 is duplicated for the
+  protocol, fd 2 copied onto fd 1). Not covered: a print in a Go `init()`, and Rust on Windows. C# is tested in CI
+  only (`tests/run_cs_diff.py`; no dotnet on the machine where this was written).
+- **Fix: saved regression cases are written atomically** (`forge_diff.write_atomic`, also used for the `.forge/*.json`
+  files and trace cases). Before, a run killed while it saved a case left an empty `.json` (8 of 8 tries), and every
+  later run stopped on it.
+- **Fix: two diff runs at once** (the end-of-turn fuzz and a manual `diff`). Each diff entry, and the update of
+  `diff-stats.json`, now holds a file lock in `.forge/cache/` (waits up to 300 s, then DIFF_ERROR). Before, the stats
+  lost updates (152 of 300 runs counted), and a concurrent Go build crashed the other run with a traceback.
+- **Fix: `mutate` no longer counts an ERROR mutant as caught.** A mutant that does not resolve (for example `-` on a
+  sequence) or that times out is listed as "not scored"; the score counts caught and survived mutants only.
+- **New build verdict FUZZ_BUILD_FAILED:** the fuzz harness is compiled (`dafny build`) before it runs, so a compiler
+  failure is not reported as FUZZ_FAILED (a wrong result). `dafny run` exits 3 in both cases. FUZZ_BUILD_FAILED and
+  TOOLCHAIN_MISSING give way to a later finding about the code, such as STALE_BUILD (before, a failing Rust build hid
+  it); every failure is still in the notes, and each one exits 1.
+- **Fix: a hung evaluator is killed at once** instead of after a 5 s wait for it to exit (a cycle hang is reported in
+  about 2 s, not 7 s). The test's fixed 30 s limit is now the clean run's time plus 12 s, measured under the same load.
+- **Fix: `.forge/*.json` state files are written atomically** (temp file and rename): the status line read a
+  half-written `last-diff.json` while a run wrote it. **Fix: `dafny verify` of the fuzz harness has the same time
+  limit as the other Dafny calls** (before, none: a hang hung `build`).
+
+## Unreleased — recursive-rule acid test
+
+A recursive rule (a reply chain walked through a map by id, with cycles) taken through the whole Forge flow, on the
+owner's app copy and on a new synthetic fixture. Each item says what was tested and how.
+- **New fixture** `examples/thread-visibility` (synthetic, written for this repository): a thread whose replies share
+  the fate of every post above them (takedown, flag, other channel); the walk has a visited set, so a cycle ends it.
+  The Dafny model proves termination and the rule; `tests/run_tests.py` runs it with planted bugs that must be caught:
+  a cycle hang (DIFF_ERROR in seconds), a reply that ignores its parent chain (D1, D3, D4, D5 fail), a check of the
+  direct parent only (D3 fails), a Dafny walk without its visited set and a Dafny model without the ancestors
+  (FAILED). Negative control: the correct code gives DIFF_OK with 9 of 9 decisions.
+- **Fix (soundness): an approval now covers the files the spec includes.** Before, `spec/X.dfy` could include a file
+  with the rule's predicates; a change there left the spec's own hash unchanged and `check` said VERIFIED (the model
+  calls the changed predicate). Now such a file is a contract file: `SPEC_CHANGED`, shown in `/forge approve` as
+  "file the spec includes". Upgrade: a project whose spec includes files gets NOT_APPROVED once; approve again.
+- **Fix: the build manifest and `diff`'s freshness test cover included Dafny files.** Before, a changed included
+  file (for example the impl of another check that this impl includes) did not make the build stale, and `diff`
+  ran the old compiled code. Upgrade: such a project is BUILD_STALE once; run build.
+- **Fix: shrinking no longer uses up the fuzz budget.** All shrinking in one run (failing recorded decisions and new
+  disagreements) gets at most a quarter of the time budget. Before, one failing decision was shrunk with up to 300
+  evaluator calls; with a slow evaluator that was the whole 1.5 s end-of-turn budget. Measured (one machine, shared
+  with other jobs, so noisy): the fixture with a 4 ms buggy candidate searched 0, 8 and 11 fresh inputs on main (one
+  run took 3.1 s), 8, 77 and 73 with the fix (1.5 to 2.1 s). A test pins >= 25. On the owner's app copy (nested rows,
+  ~200 messy field/kind pairs) the gain was not clear under that load: main 7 to 40 inputs, fix 5 to 30 (6 seeds).
+  A cap on the messy step's share was tried and dropped: it cut messy coverage without a clear gain.
+- **Fix: the next-rule hint skips an item whose subject another check states as its rule** (in its decision record,
+  outside Out of scope and Notes). Before, a rule kept offering a function as its next rule after a second rule had proved that function.
+- `/forge:add`: a spec may import another check's abstract spec; extra includes go in the binding prefix.
+- Found, not fixed: `bypass` lists the check's own unproved wrapper (a file that imports the emitted module) as a
+  hit; `mutate` copies the whole project for each mutant (2.2 GB on the owner's app copy); `check` took 35 to 49 s
+  there (the proofs alone about 15 s; the rest is not profiled yet).
 ## Unreleased
 
+- Fixed (airlock, MCP Streamable HTTP client, reported by a user): R1, after an upstream ended the session (404),
+  only the first thread started a new session; calls that came in meanwhile went out with no session id and failed
+  (HTTP 400). Now one thread re-initializes and the others wait for it. R2, a pooled keep-alive connection that the
+  upstream closed while idle made the next call fail (RemoteDisconnected). Now a pooled connection is checked before
+  reuse (closed, or idle over FORGE_UPSTREAM_POOL_IDLE_S = 4 s: dropped), and only initialize and tools/list are
+  sent again once on a fresh connection if the close races the send; tools/call is never re-sent (a gated call must
+  not run twice). Tested: airlock/tests/mcp_client_regress.py, 8 cases; 5 fail on the old code (got 1 of 8 parallel
+  calls ok; RemoteDisconnected after an idle close), 0 on the fix (3 runs); each call ran exactly once upstream.
+
+- New: fuzz tiers. `.forge/forge.json` may set `"fuzz": {"tiers": {"local" | "ci" | "nightly": {"inputs",
+  "budget_ms", "steer"}}}`; defaults local 1,500 inputs / 1.5 s / blind (the end-of-turn run, unchanged), ci
+  100,000 / 600 s / steered, nightly 1,000,000 / 3,600 s / steered. `diff --tier ci|nightly`; the Action's new
+  `diff-tier` input. A bad tier value is a configuration error (exit 2). Code: `cli/forge_steer.py`, small hooks in
+  `run_diff`, `diff_report`, `forge_ci.py`, `action.yml`.
+- New: coverage-guided steering (`diff --steer`, py and js entries): per-input coverage from the evaluators
+  (`cli/eval/forge_py_steer.py`, `cli/eval/node_steer.mjs`), an AFL-style corpus of inputs that reached a new step,
+  small changes of kept inputs, and a dictionary of constants from the watched files' comparisons. Unreached lines
+  are named plainly (`legacy_wallet.py:3 was never reached`). The core gets one optional `steer` hook
+  (`forge_diff.run_entry`); the judgement of each input is unchanged.
+- New: `/forge crash-fuzz` and `commands/crash-fuzz.md` (`cli/forge_crash.py`, runners `cli/eval/crash_node.mjs`,
+  `cli/eval/crash_py.py`): a zero-spec CRASH-CHECK of boundary functions (HTTP/webhook handlers, parsers, entry
+  points) with messy JSON, crashes shrunk to the smallest repro; private helpers, internal exports and functions
+  that cannot be called directly are skipped with the reason said. Labelled CRASH-CHECK, never PROVED.
+- Measurement scripts (not gates): `tests/bench_tiers.py`, `tests/bench_steer.py`,
+  `tests/js_module/bench_module_vs_hand.mjs`; CI job `measure-fuzz` (continue-on-error) runs them on Linux.
+- Tested (macOS arm64, Python 3.10, Node 24.3; machine heavily loaded by other jobs): `tests/run_tests.py` 171
+  cases, 8 failed, the same 8 Go `build` cases that fail on this machine without the change (goimports missing);
+  19 new cases (`tests/crash_cases.py`): the 3 planted crashes per language found and shrunk; fail-closed handlers 0
+  crashes (negative control); private helpers not reported by default (negative control), reported with
+  `--include-private`; `--target`; blind random at 1,500 inputs misses the `amount == 7777` bug on seeds 1-3 and the
+  steered run finds it on all 3 (py and js); the plain unreached line; tier config and a bad tier value (exit 2).
+  `tests/bench_steer.py --seeds 20`: blind 0/20, steered 20/20 in both languages (README table).
+- Not tested: the `/forge crash-fuzz` subcommand inside Claude Code (only its CLI); whether
+  `commands/crash-fuzz.md` shadows it in the host; Python 3.12 `sys.monitoring` (the tracer is `sys.settrace`);
+  frameworks run for real (Express, Next.js, Flask, Django, FastAPI apps are called directly with fake request
+  objects); steering of Go, Rust, Java, C#; the `diff-tier` Action input in a hosted workflow other than this
+  repository's own jobs.
+- New (callers): a static call graph for JavaScript/TypeScript and Python (`cli/forge_callgraph.py`; standard
+  library only). A check's `"callers"` names its governed decision, the wrapper that calls the proved code and the
+  replaced logic; `check` gives `UNVERIFIED_CALLER` (exit 1) for a caller of the replaced logic (also through an
+  import alias, a re-export or a namespace import), a same-name re-implementation, an unresolved member call by the
+  decision's name, or a decision that no longer reaches its wrapper, unless it is in `"allowedCallers"`. Other
+  languages: `callers not checked`. New commands `callers` (report, `--record`) and `status` (the one-line status).
+- New (feeders): the same graph ranks the unproved functions that feed the decision's parameters (direct callers that
+  compute an argument; functions whose return values flow into one) by leverage; `next_rule` names the top one.
+- New (status line): the mod's line comes from `forge_check.py status`: green `forge ✓ model PROVED · 0 bypasses ·
+  fuzz N ok · callers N ok · records current`; yellow `forge ⚠ DRIFT: …` naming a stale decision note, a wrapper
+  changed since the last approval or clean diff run (`.forge/wrapper-hashes.json`, a `WRAPPER_CHANGED` warning in
+  `check`), or a new unverified caller; red `forge ✗` otherwise.
+- forge-ci: its own summary rows for the caller gate and for each `serviceTest` (`NOT_CALLED`), the caller part in each
+  rule's status line, the top feeder, and a new Action negative control `unverified-caller`.
+- Tested: `tests/callgraph_cases.py` (in `tests/run_tests.py`), 23 cases; see the pull request for what ran where.
+
+- New (diff): **stateful trace fuzz** (`cli/forge_trace.py`) for models of the form `Step(State, Event, now)`. A
+  `"trace"` block on a `js` or `py` diff entry gives seeded multi-event traces with the clock moving and injected
+  retries, replays, reorders and restarts (save, then load). Model and candidates run in lockstep; verdict and state
+  are compared after every step; a failing trace is shrunk by delta debugging (drop events, then simplify times and
+  fields) and printed with an `again:` command. Failing traces are saved and replay first.
+- New example `examples/subscription-machine` (Dafny model proved, py and js built) with a correct shipped step
+  function and four planted multi-event bugs.
+- Tested (`tests/run_tests.py`, 9 new cases): all four planted bugs caught and shrunk to 2, 4, 2 and 2 steps in JS and
+  Python; the correct code 0 disagreements over 50,000 traces per language; the repro command finds the same trace;
+  saved traces replay; negative controls (`max_len: 1` finds nothing; `restart: 0` hides the restart bug); an
+  unknown `trace` key is a configuration error.
+- Not tested: trace mode for the Go, Rust, Java and C# evaluators (not built); time going backwards
+  (`time_backwards`) has no test case.
+- **Bypass gate: decision reads only (AST) in TS/JS and Python.** A text hit of a watched field counts only where the
+  field is read in a decision (if/while condition, comparison, `in`, `.includes`, ternary, switch/case, `&&`/`||`
+  guard, filter/find/some/every predicate, comprehension `if`, assert, SQL `WHERE` parameter, alias). Each hit names
+  its kind. TS/JS: TypeScript 5.6.3 compiler API (downloaded once, SHA-256 pinned); Python: `ast`. Other languages
+  keep the text search ("text search, not AST"); a file that does not parse, or no parser on the machine, falls back
+  to the text search for that file and says so. `allowedBypasses` entries stay valid by line hash. Code:
+  `cli/forge_ast.py`, `cli/eval/ts_decisions.cjs`, a small hook in `run_bypass`.
+  Tested: 15 new cases in `tests/run_tests.py` (a planted read in a ternary, a switch, an `.includes`/`in` and a
+  filter predicate, in TS and in Python, each `BYPASS_FOUND`; the gate gives `UNAPPROVED_BYPASS` on a real proof; a
+  file of only types/comments/imports gives 0 hits; parse errors and a missing parser fall back to text; Go stays
+  text; old approvals stay allowed). Measured on a private app copy: 290 text lines to 76 hits (46 AST decision
+  reads, all checked by hand; 30 data-file lines by text); the three known places still found.
+  Not tested: Windows; Python older than 3.10 (`match` does not parse there and falls back to text); TS/JS syntax
+  newer than TypeScript 5.6.
 - New (diff, M1.1b): messy-input fuzz in the Go, Rust, Java and C# evaluators, as in JavaScript/TypeScript and
   Python. An adapter may name raw-value `wrappers` (or one `wrapper`) and a fail-closed answer: Go
   `json.RawMessage` (`failClosed`), Rust `serde_json::Value` (`fail_closed`), Java the evaluator's parsed value
