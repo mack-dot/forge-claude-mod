@@ -130,6 +130,17 @@ def load_policy(policy_path, role=None):
     return Policy(res["doc"], resolve=False, role=role), res["doc"]
 
 
+def same_value_names(name, pol, environ=None):
+    """The airlock-side secrets of forge.yaml (upstream ${NAMES} and the llm key) whose value in this shell is
+    the same as the value of `name`. Compared as SHA-256 digests with compare_digest; no value is printed."""
+    import hmac
+    env = os.environ if environ is None else environ
+    mine = hashlib.sha256(env.get(name, "").encode("utf-8", "surrogateescape")).digest()
+    held = list(pol.env_names) + ([pol.llm["key_env"]] if pol.llm else [])
+    return [k for k in held if k != name and env.get(k) and hmac.compare_digest(
+        mine, hashlib.sha256(env[k].encode("utf-8", "surrogateescape")).digest())]
+
+
 def role_of(a):
     """--role NAME, else $FORGE_ROLE, else None (the base policy)."""
     return getattr(a, "role", None) or os.environ.get("FORGE_ROLE") or None
@@ -315,9 +326,11 @@ def claude_args(cmd):
 
 # ---------------------------------------------------------------- sync back
 def ignored_fn(repo):
+    """True when the repository's .gitignore ignores rel. './' keeps git from reading a name that starts
+    with ':' as pathspec magic, and any git error counts as ignored (the change is refused: fail closed)."""
     def ignored(rel):
-        r = out(["git", "-C", repo, "check-ignore", "-q", "--", rel])
-        return r.returncode == 0
+        r = out(["git", "-C", repo, "check-ignore", "-q", "--", "./" + rel])
+        return r.returncode != 1
     return ignored
 
 
@@ -339,7 +352,7 @@ def sync_back(pol, run_dir, stage, repo):
     apply, rejected = sync.plan(pol, changes, os.path.join(run_dir, "export"), stage, repo, ignored_fn(repo))
     for rel, why in rejected:
         flag = "   <-- SENSITIVE (refused)" if sync.sensitive(rel) else ""
-        print(f"  not applied: {rel}: {why}{flag}")
+        print(f"  not applied: {sync.display(rel)}: {sync.display(why)}{flag}")  # no raw control character
     if not apply:
         say("no change that may be applied; your repository is unchanged")
         return 0
@@ -353,8 +366,12 @@ def sync_back(pol, run_dir, stage, repo):
     if not yes:
         say("nothing applied; your repository is unchanged")
         return 0
-    done = sync.apply_changes(apply, repo)
-    say(f"applied {len(done)} file(s); review them with git diff")
+    problems = []
+    done = sync.apply_changes(apply, repo, problems)  # all or nothing (sync.apply_changes)
+    for p in problems:
+        say(sync.display(p))
+    say(f"applied {len(done)} file(s); review them with git diff" if done else
+        "nothing applied; your repository is unchanged")
     return 0
 
 
@@ -410,6 +427,11 @@ def cmd_up(a):
         if n in pol.env_names:
             raise SystemExit(f"forge-airlock: --pass-env {n}: this is an upstream secret of forge.yaml; it stays "
                              "with the airlock (passing it to the agent would defeat the airlock)")
+        same = same_value_names(n, pol)
+        if same:  # O4: the same secret under another name; values are compared as digests and never printed
+            say(f"--pass-env {n}: its value is the same as the airlock-side secret ${same[0]} of forge.yaml; "
+                "it stays with the airlock (passing it to the agent would defeat the airlock)")
+            raise SystemExit(EXIT_POLICY)
         say(f"WARNING: --pass-env {n}: the program in the box (the agent) CAN READ this value and can send it to "
             f"any host it can reach. Use a separate, spend-capped key for it.")
     agent_image = a.agent_image or (CLAUDE_IMAGE if wants_claude else IMAGE)
@@ -422,6 +444,19 @@ def cmd_up(a):
     os.environ["FORGE_CANARY_TOKEN"] = secrets.token_hex(24)
     code = 1
     old_int = signal.getsignal(signal.SIGINT)
+    # A closed terminal (SIGHUP) or a kill (SIGTERM) must still run the cleanup below: without a handler
+    # Python ends at once, the airlock container (it holds the upstream credentials) keeps running and the
+    # run folder with the staged repository stays. The first signal raises SystemExit; later ones are
+    # ignored until the cleanup is done.
+    old_term = {sg: signal.getsignal(sg) for sg in (signal.SIGTERM, signal.SIGHUP)}
+
+    def stop(signum, _frame):
+        for sg in old_term:
+            signal.signal(sg, signal.SIG_IGN)
+        say(f"signal {signum}: stopping the box and cleaning up")
+        raise SystemExit(128 + signum)
+    for sg in old_term:
+        signal.signal(sg, stop)
     wsvol = None
     try:
         if vm:  # the workspace folder that the airlock builds and the VM shares (virtio-fs)
@@ -501,7 +536,9 @@ def cmd_up(a):
         code = rc
         return code
     finally:
-        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGINT, old_int)  # Ctrl-C can still stop a cleanup that hangs
+        for sg in old_term:
+            signal.signal(sg, signal.SIG_IGN)  # a second TERM or HUP does not cut the cleanup short
         run(dc + ["--profile", "export", "down", "-v", "--remove-orphans"], stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)
         if wsvol:
@@ -510,6 +547,8 @@ def cmd_up(a):
             say(f"kept {run_dir}")
         else:
             shutil.rmtree(run_dir, ignore_errors=True)
+        for sg, h in old_term.items():
+            signal.signal(sg, h)
 
 
 def run_in_vm(dc, doc, pol, run_dir, ws, services, box, tty):

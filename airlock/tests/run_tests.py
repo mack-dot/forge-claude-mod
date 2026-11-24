@@ -569,8 +569,8 @@ M22_MUTANTS = [
     ("listen-side session check removed", "gateway.py", "elif sid is not None and not A.touch_session(sid):",
      "elif False:", "wrong Mcp-Session-Id is refused 404"),
     ("upstream body size check removed (oversized body)", "mcp_client.py",
-     "                raw = r.read(MAX_RESPONSE + 1)\n                if len(raw) > MAX_RESPONSE:\n",
-     "                raw = r.read()\n                if False:\n", "planted fault oversize"),
+     "            raw = r.read(MAX_RESPONSE + 1)\n            if len(raw) > MAX_RESPONSE:\n",
+     "            raw = r.read()\n            if False:\n", "planted fault oversize"),
     ("upstream session id check removed (wrong session id)", "mcp_client.py",
      "            elif sid is not None and sid != sent_session:\n", "            elif False:\n",
      "planted fault wrong_session"),
@@ -760,10 +760,53 @@ def test_names():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_mcp_client():
+    """HttpUpstream regressions R1 (parallel calls after a 404) and R2 (idle pooled connection closed)."""
+    sys.path.insert(0, HERE)
+    import mcp_client_regress
+    for name, ok, *detail in mcp_client_regress.cases():
+        case(name, bool(ok), detail[0] if detail else "")
+
+
+def test_concurrency():
+    """Review findings C1 to C4 and S1 to S5 (tests/concurrency_regress.py)."""
+    sys.path.insert(0, HERE)
+    import concurrency_regress
+    for name, ok, *detail in concurrency_regress.cases():
+        case(name, bool(ok), detail[0] if detail else "")
+
+
+def test_rest():
+    """Review findings V1 to V6: sync review display, held-call display, .gitignore check, conflict check,
+    export of special files, signal cleanup of forge up (tests/rest_regress.py)."""
+    sys.path.insert(0, HERE)
+    import rest_regress
+    for name, ok, *detail in rest_regress.cases():
+        case(name, bool(ok), detail[0] if detail else "")
+
+
+def test_observations():
+    """Review observations O1 to O6 fixed on the owner's request (tests/observations_regress.py)."""
+    sys.path.insert(0, HERE)
+    import observations_regress
+    for name, ok, *detail in observations_regress.cases():
+        case(name, bool(ok), detail[0] if detail else "")
+
+
+def test_policy_cli_isolated():
+    """The image runs `python3 -I /forge/airlock/policy.py check`: -I drops the script folder from sys.path.
+    A local import in policy.py must still work (regression: the O6 fold import broke every forge up)."""
+    pol = os.path.join(HERE, "..", "proof", "policies", "codebase.yaml")
+    r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "..", "engine", "policy.py"), "check", pol],
+                       capture_output=True, text=True)
+    case("policy CLI: `python3 -I policy.py check` runs (as in the image)", r.returncode == 0,
+         (r.returncode, r.stderr[-300:]))
+
+
 def main():
     for t in (test_policy, test_paths, test_sync, test_sync_aliases, test_verifier, test_draft, test_llm, test_static,
               test_redteam, test_human_approval, test_isolation, test_vfkit, test_names, test_m22, test_m22_controls,
-              test_inbox):
+              test_inbox, test_mcp_client, test_concurrency, test_policy_cli_isolated, test_rest, test_observations):
         try:
             t()
         except Exception as e:  # noqa: BLE001

@@ -38,9 +38,14 @@ MAX_BODY = 1 << 20
 READ_TIMEOUT_S = float(os.environ.get("FORGE_READ_TIMEOUT_S", "30"))  # F1: per socket read
 MAX_CONN = int(os.environ.get("FORGE_MAX_CONN", "256"))  # F1: concurrent connections (threads)
 TOKEN_HEADER = "x-forge-canary-token"  # F7
-MAX_SESSIONS = int(os.environ.get("FORGE_MAX_SESSIONS", "256"))  # listen side, least recently used dropped
+MAX_SESSIONS = int(os.environ.get("FORGE_MAX_SESSIONS", "256"))  # listen side, least recently used idle one dropped
+SESSION_IDLE_S = float(os.environ.get("FORGE_SESSION_IDLE_S", "1800"))  # S5: idle sessions end (404) after this
 SESSIONS_LOCK = threading.Lock()
 ALLOWED_ORIGINS = [x for x in os.environ.get("FORGE_ALLOWED_ORIGINS", "").split(",") if x]
+# DNS rebinding: a request must name the airlock itself in Host (its service name or loopback), with no port or
+# the port it listens on. FORGE_ALLOWED_HOSTS adds names (comma-separated), never a wildcard.
+ALLOWED_HOSTS = {"airlock", "localhost", "127.0.0.1", "[::1]"} | {
+    x.strip().lower() for x in os.environ.get("FORGE_ALLOWED_HOSTS", "").split(",") if x.strip()}
 
 
 def die(msg):
@@ -364,22 +369,47 @@ class Airlock:
         with SESSIONS_LOCK:
             return self.__dict__.setdefault("sessions", {})
 
+    # S5: sid -> [last use (monotonic), requests in flight]. A session idle for SESSION_IDLE_S ends (the
+    # client gets 404 and initializes again). When the table is full, the least recently used session with
+    # no request in flight is dropped; if every session has a request in flight, no new session is made.
+    def _expire(self, sess, now):
+        for k in [k for k, (t, n) in sess.items() if n == 0 and now - t > SESSION_IDLE_S]:
+            del sess[k]
+
     def new_session(self):
         sid = secrets.token_urlsafe(24)
         sess = self._sessions()
         with SESSIONS_LOCK:
-            if len(sess) >= MAX_SESSIONS:  # drop the least recently used
-                del sess[min(sess, key=sess.get)]
-            sess[sid] = time.monotonic()
+            now = time.monotonic()
+            self._expire(sess, now)
+            if len(sess) >= MAX_SESSIONS:
+                idle = [k for k, (t, n) in sess.items() if n == 0]
+                if not idle:
+                    return None
+                del sess[min(idle, key=lambda k: sess[k][0])]
+            sess[sid] = [now, 0]
         return sid
 
     def touch_session(self, sid):
+        """True if sid is a live session; then one request is in flight on it until release_session(sid)."""
         sess = self._sessions()
         with SESSIONS_LOCK:
-            if sid not in sess:
+            now = time.monotonic()
+            e = sess.get(sid)
+            if e is None:
                 return False
-            sess[sid] = time.monotonic()
+            if e[1] == 0 and now - e[0] > SESSION_IDLE_S:
+                del sess[sid]
+                return False
+            e[0], e[1] = now, e[1] + 1
             return True
+
+    def release_session(self, sid):
+        sess = self._sessions()
+        with SESSIONS_LOCK:
+            e = sess.get(sid)
+            if e is not None:
+                e[0], e[1] = time.monotonic(), max(0, e[1] - 1)
 
     def end_session(self, sid):
         sess = self._sessions()
@@ -472,6 +502,28 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, RecursionError):
             raise BodyError(400, "parse error") from None
 
+    def _host_refused(self):
+        """DNS rebinding (O2): exactly one Host header, naming the airlock (ALLOWED_HOSTS) with no port or this
+        server's port. Anything else gets 421 and the connection closes. Returns True when it refused."""
+        hosts = self.headers.get_all("host") or []
+        ok = False
+        if len(hosts) == 1:
+            h = hosts[0].strip().lower()
+            name, port = h, None
+            if h.startswith("["):
+                end = h.find("]")
+                name, rest = h[:end + 1], h[end + 1:]
+                if rest:
+                    port = rest[1:] if rest.startswith(":") else "bad"
+            elif ":" in h:
+                name, port = h.rsplit(":", 1)
+            ok = name in ALLOWED_HOSTS and (port is None or port == str(self.server.server_address[1]))
+        if not ok:
+            self.close_connection = True
+            self._send(421, {"error": "Host is not this airlock (DNS rebinding protection)"})
+            return True
+        return False
+
     def _token_ok(self):
         got = self.headers.get(TOKEN_HEADER) or ""
         return hmac.compare_digest(got.encode("utf-8", "replace"), self.A.canary_token.encode())
@@ -492,6 +544,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         A = self.A
+        if self._host_refused():
+            return
         if self.path == "/healthz":
             return self._send(200, {"ok": True, "canary": A.canary, "ws_mount": A.ws_mount,
                                     "role": A.policy.role})
@@ -521,13 +575,14 @@ class Handler(BaseHTTPRequestHandler):
         """MCP Streamable HTTP checks before a POST or DELETE /mcp is handled. Returns None
         when the request may go on, else sends the refusal and returns True.
         - Origin (DNS rebinding): a request that carries Origin is refused (403) unless the
-          origin is listed in FORGE_ALLOWED_ORIGINS. Programs in the box send no Origin.
+          origin is listed in FORGE_ALLOWED_ORIGINS. Programs in the box send no Origin. More than one
+          Origin header is refused (403). The Host check (_host_refused) runs before this.
         - MCP-Protocol-Version: when present it must be a supported version (400).
         - Mcp-Session-Id: when present it must be a live session of this airlock (404, the
           client then starts a new session with initialize). A request without it is served
           (sessionless clients); sessions carry no authority here: every gate is global."""
-        origin = self.headers.get("origin")
-        if origin is not None and origin not in ALLOWED_ORIGINS:
+        origins = self.headers.get_all("origin") or []
+        if len(origins) > 1 or (origins and origins[0] not in ALLOWED_ORIGINS):  # O1: two Origin headers: refused
             self.close_connection = True
             self._send(403, {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32600,
                                                                        "message": "origin not allowed"}})
@@ -540,6 +595,8 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def do_DELETE(self):  # MCP Streamable HTTP: end a session
+        if self._host_refused():
+            return
         if self.path.split("?")[0] != "/mcp":
             return self._send(404, {"error": "not found"})
         if self._mcp_refusal():
@@ -553,6 +610,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         A = self.A
+        if self._host_refused():
+            return
         if self.path == "/forge/canary/report":
             if not self._token_ok():
                 return self._send(403, {"error": "canary token required"})
@@ -580,13 +639,27 @@ class Handler(BaseHTTPRequestHandler):
                                     "error": {"code": -32600, "message": "batches are not supported"}})
         mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
         pname = clip(params.get("name")) if isinstance(params, dict) else clip(type(params).__name__)
-        sid, hdrs = self.headers.get("mcp-session-id"), {}
+        sid, hdrs, held = self.headers.get("mcp-session-id"), {}, None
         if method == "initialize" and mid is not None:
-            hdrs["mcp-session-id"] = A.new_session()
+            new = A.new_session()
+            if new is None:
+                return self._send(503, {"jsonrpc": "2.0", "id": mid if isinstance(mid, (int, str)) else None,
+                                        "error": {"code": -32001, "message": "every session has a request in "
+                                                  "flight; try again"}})
+            hdrs["mcp-session-id"] = new
         elif sid is not None and not A.touch_session(sid):
             return self._send(404, {"jsonrpc": "2.0", "id": mid if isinstance(mid, (int, str)) else None,
                                     "error": {"code": -32001, "message": "unknown or ended Mcp-Session-Id; "
                                               "send initialize for a new session"}})
+        else:
+            held = sid
+        try:
+            return self._mcp(A, msg, mid, method, params, pname, hdrs)
+        finally:
+            if held is not None:
+                A.release_session(held)
+
+    def _mcp(self, A, msg, mid, method, params, pname, hdrs):
         if mid is None or "method" not in msg:  # notification, or a client response: accepted
             return self._empty(202)
         try:

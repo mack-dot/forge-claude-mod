@@ -68,6 +68,9 @@ def handle(c):
             return c.close()
         host, port = target.rsplit(":", 1)
         up = socket.create_connection((host, int(port)), timeout=10)
+        early = head.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in head else b""
+        if early:  # bytes the client sent right after the CONNECT head (e.g. a TLS ClientHello) belong upstream
+            up.sendall(early)
         c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
         c.settimeout(None)
         up.settimeout(None)
