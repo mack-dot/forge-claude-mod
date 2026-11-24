@@ -98,14 +98,26 @@ def make_repo(tmp):
     return repo
 
 
-def up(repo, answer, extra=(), env_extra=None):
+SCRIPT_LINKS = r"""
+set -u
+ln -s /etc/passwd src/l_abs.ts
+ln -s "$HOST_SECRET" src/l_host.ts
+ln -s "../../../../../../../../../../../..$HOST_SECRET" src/l_rel.ts
+for l in l_abs l_host l_rel; do
+  python3 -I /forge/agent/mcp_cli.py call read_text_file "{\"path\":\"src/$l.ts\"}" 2>&1 | head -c 300; echo
+done
+echo "BOX-LINKS-$((1+1))-DONE"
+"""
+
+
+def up(repo, answer, extra=(), env_extra=None, script=None):
     """Run forge up under a pseudo-terminal; type `answer` at the y/N prompt."""
     env = dict(os.environ, FORGE_E2E_TOKEN=FAKE, **(env_extra or {}))
     iso = os.environ.get("FORGE_E2E_ISOLATION")
     if iso and "--isolation" not in extra:
         extra = ["--isolation", iso] + list(extra)
     argv = [sys.executable, os.path.join(PKG, "forge_airlock.py"), "up", "--repo", repo] + list(extra) + \
-        ["--", "sh", "-c", SCRIPT]
+        ["--", "sh", "-c", script or SCRIPT]
     pid, fd = pty.fork()
     if pid == 0:
         os.execve(sys.executable, argv, env)
@@ -135,6 +147,26 @@ def leftovers(repo):
     return len(c.split()) + len(n.split()) + len(v)
 
 
+def vfkit_controls(repo, tmp):
+    """macOS microvm (vfkit) negative controls: each must fail closed and never run the command."""
+    before = tree_hash(repo)
+    empty = tempfile.mkdtemp(prefix="forge-e2e-nocache-")
+    for name, env, want, why in [
+        ("vfkit missing", {"FORGE_VFKIT": os.path.join(tmp, "no-such-vfkit")}, 2, "vfkit is not installed"),
+        ("image missing", {"FORGE_VFKIT_CACHE": empty}, 2, "image is not built"),
+        ("no hardware virtualization", {"FORGE_VFKIT_TEST_NO_HV": "1"}, 2, "hardware virtualization is not available"),
+        ("fake vfkit that runs the box in a Docker container (same kernel as the airlock)",
+         {"FORGE_VFKIT": os.path.join(HERE, "fake_vfkit_docker.py")}, 10, "is not in effect in the agent"),
+        ("planted network breach: a NAT network device in the VM", {"FORGE_VFKIT_PLANT_NAT_BREACH": "1"}, 10, "BREACH"),
+    ]:
+        code, log = up(repo, "n", env_extra=env)
+        open(os.path.join(tmp, "run-vfkit-" + name.split()[0] + ".log"), "w").write(log)
+        case(f"up: microvm (vfkit) negative control: {name} -> exit {want}, command not run, repo unchanged",
+             code == want and why in log and "BOX-2-DONE" not in log and tree_hash(repo) == before,
+             f"exit {code}: {log[-1200:]}")
+    os.rmdir(empty)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="forge-e2e-")
     repo = make_repo(tmp)
@@ -143,7 +175,7 @@ def main():
         sys.path.insert(0, PKG)
         import backends as B
         have = B.docker_runtimes() or set()
-        missing = [n for n in ("gvisor", "microvm") if not any(rt in have for rt in B.RUNTIMES[n])]
+        missing = [n for n in ("gvisor", "microvm") if not B.available(n, have)]
         for n in missing:  # negative control: never a silent fall back to docker
             before0 = tree_hash(repo)
             code, log = up(repo, "n", extra=["--isolation", n])
@@ -182,6 +214,26 @@ def main():
              and "viaMcp" in open(os.path.join(repo, "src/new_by_mcp.ts")).read())
         case("up: hidden files, read-only files and forge.yaml are untouched",
              all(before[k] == after.get(k) for k in (".env", "src/proprietary/core.ts", "tests/ui.test.ts", "forge.yaml")))
+        # planted symlinks (absolute, host path, relative escape to a host path): neither the airlock
+        # (MCP read) nor the export / sync-back may follow them; nothing of the host file may arrive
+        secret_path = os.path.join(os.path.realpath(tmp), "host-secret.txt")
+        secret = "HOST_SECRET_" + hashlib.sha256(os.urandom(16)).hexdigest()[:16]
+        open(secret_path, "w").write(secret + "\n")
+        before_links = tree_hash(repo)
+        code, log = up(repo, "y", env_extra={"HOST_SECRET": secret_path}, extra=["--pass-env", "HOST_SECRET"],
+                       script=SCRIPT_LINKS)
+        open(os.path.join(tmp, "run-links.log"), "w").write(log)
+        after = tree_hash(repo)
+        case("up: planted symlinks -> MCP reads refused, links not applied, host file never read, repo unchanged",
+             code == 0 and "BOX-LINKS-2-DONE" in log and secret not in log
+             and all(f"not applied: src/{n}.ts" in log for n in ("l_abs", "l_host", "l_rel"))
+             and after == before_links and not any(secret in open(os.path.join(d, f), errors="replace").read()
+                                                   for d, _, fs in os.walk(repo) if ".git" not in d for f in fs
+                                                   if not os.path.islink(os.path.join(d, f))),
+             f"exit {code} {log[-2500:]}")
+        if iso == "microvm" and B.microvm_impl() == "vfkit":
+            vfkit_controls(repo, tmp)
+            after = tree_hash(repo)
         # an upstream secret's VALUE under another name: refused before anything starts (O4; the value is never
         # printed). The canary's own env check is still tested by the planted breach control-env-secret (G4).
         code, log = up(repo, "n", extra=["--pass-env", "LEAK"], env_extra={"LEAK": FAKE})

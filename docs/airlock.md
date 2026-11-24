@@ -44,6 +44,9 @@ Each of these is optional and has its own section, honest labels and test list i
 - Streamable HTTP MCP servers, several upstreams in one box, and roles that only narrow what a box may see and call.
 - Held calls that wait for a person (`require_human_approval: hardware`).
 - Isolation backends (`--isolation`): `docker` (the container tier: shares the host kernel), `gvisor` and `microvm`
-  (a Kata VM per agent container), both on Linux hosts only and run on CI only. On macOS a vfkit microVM boot check
-  exists as the positive control of that design; running the agent itself in such a VM is NOT built.
+  (Linux: a Kata VM per agent container; CI runs gvisor and Kata). On macOS, `microvm` runs the agent in a vfkit VM
+  (Apple Virtualization.framework, its own guest kernel; `brew install vfkit`, no sudo): the battery passes 37/37 on
+  an Apple-silicon Mac (FINITE TEST, run by hand: GitHub's macOS runners have no nested virtualization, so CI builds
+  the image and runs the unit cases only). NOT built: Claude Code inside the VM (the image has no Node), and
+  `--agent-image` with vfkit.
 - Protocol hardening and the in-box red team (probes run inside the box); every finding has a regression test.

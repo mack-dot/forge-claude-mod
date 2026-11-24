@@ -6,9 +6,13 @@ name: isolation
 #   microvm  Kata Containers (pinned static release, QEMU) registered with Docker; needs /dev/kvm
 # plus a minimal Firecracker boot (pinned release) on the same runner. Startup overhead per runtime
 # is measured on the runner (airlock/proof/startup_bench.py) and printed in the log.
+# Job vfkit-macos: the macOS microvm backend (vfkit). GitHub's macOS runners are VMs without nested
+# virtualization, so no VM can boot there: the job builds the image from the pinned hashes, runs the
+# host-side unit cases, and SKIPS the VM battery with a warning that says why. It never reports
+# a VM result it did not get.
 on:
   push:
-    branches: ["feat/M4-**"]
+    branches: ["feat/M4-**", "feat/M4b-**"]
     paths: ["airlock/**", ".github/workflows/isolation.yml"]
   pull_request:
     paths: ["airlock/**", ".github/workflows/isolation.yml"]
@@ -159,3 +163,31 @@ jobs:
             ${{ runner.temp }}/validate-console.txt
             ${{ runner.temp }}/startup-*.json
           if-no-files-found: warn
+
+  vfkit-macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: host facts
+        run: |
+          uname -a; sw_vers; sysctl -n machdep.cpu.brand_string || true
+          echo "kern.hv_support=$(sysctl -n kern.hv_support 2>/dev/null || echo unset)"
+      - name: install vfkit (Homebrew, no sudo)
+        run: brew install vfkit && vfkit --version
+      - name: build the agent VM image from the pinned hashes (reproducible; prints its hashes)
+        run: python3 -I airlock/backends/vfkit_image.py build
+      - name: host-side unit cases (compose -> VM translation, refusals, deterministic initrd)
+        run: python3 airlock/tests/run_tests.py
+      - name: VM battery (needs hardware virtualization)
+        run: |
+          ok=0
+          python3 -I -c 'import sys; sys.path.insert(0, "airlock/backends"); import vfkit_vm; vfkit_vm.preflight()' 2>pre.err && ok=1
+          docker info >/dev/null 2>&1 || { echo "no Docker daemon on this runner (the airlock needs one)" >>pre.err; ok=0; }
+          if [ "$ok" = 1 ]; then
+            echo "this runner can boot VMs: run the vfkit e2e"
+            FORGE_E2E_ISOLATION=microvm python3 airlock/tests/run_up_e2e.py
+          else
+            echo "::warning title=vfkit VM battery SKIPPED::$(tr "\n" " " < pre.err)- not run, not passed"
+            echo "SKIPPED (not passed): $(tr "\n" " " < pre.err)"
+          fi

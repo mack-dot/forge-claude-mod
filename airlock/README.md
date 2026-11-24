@@ -286,10 +286,66 @@ Fail closed, never a silent fall back to docker:
   namespace). For these backends `up` writes the airlock's (and egress proxy's) address into the
   agent's `/etc/hosts`; the canary still treats any other resolvable name as a breach.
 
-macOS: Docker Desktop has no runsc and no Kata runtime, so `gvisor` and `microvm` are refused there
-(tested). The macOS microvm design is Apple Virtualization.framework: `backends/vz_boot_check.sh`
-boots a minimal Linux microVM through vfkit (pinned, SHA-256 checked, no sudo) as the positive
-control of that design. Running the agent itself in such a VM is NOT built (see "Not tested").
+macOS: Docker Desktop has no runsc and no Kata runtime, so `gvisor` is refused there (tested). On
+macOS `microvm` is built differently: the agent is not a container but a vfkit VM (Apple
+Virtualization.framework), with its own guest kernel, while the airlock, egress proxy and exporter
+stay in Docker Desktop (code: `backends/vfkit_*.py`, `backends/guest/`):
+
+```
+brew install vfkit                                     # no sudo
+python3 -I airlock/backends/vfkit_image.py build      # pinned Alpine packages -> ~/Library/Caches/forge-airlock/vfkit
+./forge-airlock up --isolation microvm -- sh -c '...'  # Claude Code is NOT in the VM image yet (refused, exit 2)
+```
+
+| | how |
+| --- | --- |
+| kernel and root | Alpine `linux-virt` 6.12.118 and an initramfs with python3, git, busybox (31 packages); every input pinned by SHA-256 in `backends/vfkit.lock.json`; the initramfs is built deterministically (same lock -> same bytes). No network driver is in the image. |
+| workspace | the airlock builds it in a host folder of the run (instead of a Docker volume) and reads it through its `nosymfollow` bind as before; the VM sees the folder as a virtio-fs share (`nosuid,nodev`) |
+| read-only paths | read-only binds in the guest AND the macOS immutable flag (`chflags uchg`) on the host: the host file system is case-insensitive, and a guest write to `RO.TXT` reached a read-only `ro.txt` past its bind (tested); an immutable file cannot be written, chmod-ed, renamed or deleted through any name |
+| network | ONE vsock connection per VM (`guest/vsockmux.py`); in the guest, `airlock:8700` (and `:8701` with `llm`, `egress:3128` with an egress allowlist) are local listeners whose streams the host relay connects ONLY to the airlock's (egress proxy's) port, published on the host's 127.0.0.1. Any other port is refused; the guest has no network device. Per-connection vsock (vfkit's own proxy) lost 6-8 of 2000 sequential HTTP requests here; the single tunnel lost 0 of 3900 (sequential, EOF-delimited and 20 concurrent). |
+| keys | as with Docker: the VM gets `ANTHROPIC_BASE_URL=http://airlock:8701` and a dummy token; the model key stays with the airlock |
+| the job | command, environment and canary token reach the guest's PID 1 through a control share that it unmounts before the command starts |
+
+Fail closed (exit 2, nothing runs, no fall back to docker): vfkit missing, the image not built (or
+not matching its manifest), no hardware virtualization (`kern.hv_support`), `--agent-image`, or
+`claude` as the command. The in-box probe is the same as for Kata: the agent's `/proc/version` must
+differ from the airlock's (Docker Desktop's kernel).
+
+Tests on this Mac (Apple M1 Pro, macOS 27, Docker Desktop 28.5.1, vfkit 0.6.4; FINITE TEST):
+- `FORGE_E2E_ISOLATION=microvm tests/run_up_e2e.py`: 18 of 18. New cases: planted symlinks (absolute,
+  to a host file, relative escape to a host file): MCP reads refused, links not applied, the host file
+  never read (also 12 of 12 with docker); and 5 vfkit negative controls: vfkit missing, image missing,
+  no hardware virtualization -> exit 2; a fake vfkit that runs the box in a Docker container (same
+  kernel as the airlock) -> the probe refuses, exit 10; a NAT network device planted in the VM ->
+  the canary reports BREACH (public DNS resolved), exit 10.
+- `FORGE_ISOLATION=microvm proof/validate.sh`: every agent-side service (agent, the 4 planted-breach
+  controls, phase 2/3 agents, the detached crash agent) runs in a VM: 37 of 37 ok. The extra cases: the
+  probe (positive, and runc as negative control) and "guest root with the read-only protection on ->
+  canary PASS" (guest root cannot write read-only entries: guest binds, host immutable flag and the
+  airlock's 0444/0555 modes, which macOS enforces on the vfkit process). So the planted breach
+  `control-root-writes` is, in a VM, "root AND the host protection removed": canary BREACH. The
+  not-gated control "symlink swap WITHOUT nosymfollow" did not win in the VM setup (exit 0; it wins
+  in a container): the race does not land through two virtio-fs layers here, which shows nothing
+  about nosymfollow itself.
+- Measured on this Mac while other agents loaded it (load average 60-150; FINITE TEST, one run each):
+
+  | | docker (runc in Docker Desktop) | microvm (vfkit VM) |
+  | --- | --- | --- |
+  | validate.sh | 34 of 34 ok, 396 s | 37 of 37 ok, 603 s |
+  | `run_up_e2e.py` | 12 of 12 ok | 18 of 18 ok |
+  | `up` wall time, one run (answer n) | 35.9 s | 26.4 s |
+  | canary in the box | 8,700 checks, 15.8 s | 865 checks, 12.3 s |
+  | start of `python3 -I -c pass`, first / warm median of 10 / min (`proof/vfkit_startup_bench.py`) | 1426 / 1466 / 613 ms | 1297 / 1352 / 637 ms |
+
+  Under that load a VM start costs about the same as a container start here. Without other load
+  (earlier the same day, not with the final code) a VM run of `true` took about 0.7 s end to end
+  (guest kernel to command: 0.16 s); the first boots took 1.4-4.4 s until the guest seeded its random
+  pool from virtio-rng (fixed: `guest/init` loads it first). A cold start after a reboot is not measured.
+- CI (`isolation.yml`, job `vfkit-macos`): GitHub's macOS runners are VMs without nested
+  virtualization, so the job builds the image and runs the host-side unit cases, and SKIPS the VM
+  battery with a warning; it is not counted as passed.
+The canary in the VM scans about 715 text files (the container: about 8,500, mostly Node in the image):
+the same checks, a smaller root file system.
 
 Tests: `tests/run_tests.py` (choice and refusal rules, compose output, probe negative control),
 `tests/run_up_e2e.py` (missing backend refused; runc posing as gvisor caught by the probe; with
@@ -493,10 +549,13 @@ waits for a later process to appear, timing side channels.
   host); Kata with Cloud Hypervisor or Firecracker as its hypervisor (only QEMU, the default); a
   non-terminal `up` under Kata (the battery needed `run --interactive=false`; `up` was run under a
   pseudo-terminal only); G5-G8 of `prove_release.sh` under a non-docker backend; an attack on gVisor or
-  Kata themselves. BLOCKED_NEEDS_HUMAN: `microvm` on macOS needs the agent's image as a VM root
-  file system, a virtio-fs share of the filtered workspace with the `nosymfollow` guarantee, and a
-  network path from the VM to the airlock that keeps the agent network internal; Docker Desktop
-  offers none of these, so it is a design decision (vfkit or Apple's `container` tool, which
-  installs with admin rights), not a missing package. Only the VM boot itself is tested.
+  Kata themselves.
+- macOS `microvm` (vfkit): Claude Code in the VM (the image has no Node; `claude` is refused);
+  `--agent-image`; an interactive terminal session beyond `up` under a pseudo-terminal; G5-G8 of
+  `prove_release.sh`; an Intel Mac; a cold start after a reboot (no page-cache drop without sudo);
+  an attack on Apple's hypervisor, its virtio-fs server or vfkit; a guest root escalation (it would
+  get the guest's view only: read-only binds could be removed, the host immutable flag would still
+  hold); egress through the egress proxy and the `/llm` path were wired like the airlock port but
+  not run end to end in a VM.
 - Everything else listed under "Not tested" in the #97 README still applies, except the symlink
   swap and the mid-call crash, which are now tested (FINITE TEST).

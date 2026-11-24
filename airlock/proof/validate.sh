@@ -28,7 +28,33 @@ rec() {  # rec <check> <actual> <expected> <seconds>
 }
 
 ISO="${FORGE_ISOLATION:-docker}"
-RT=$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import backends as B; print(B.runtime_for(sys.argv[2], B.docker_runtimes()) or "")' .. "$ISO") \
+# macOS microvm = vfkit: the agent side runs in vfkit VMs (backends/vfkit_compose.py), not containers
+VFK=""
+if [ "$ISO" = microvm ] && [ "$(uname -s)" = Darwin ] && [ -z "${FORGE_AIRLOCK_MICROVM_RUNTIME:-}" ]; then VFK=1; fi
+if [ -n "$VFK" ]; then
+  python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import vfkit_vm; vfkit_vm.preflight()' ../backends \
+    2>"$OUT/vfkit-preflight.log" \
+    || { echo "VALIDATE: isolation microvm (vfkit) not available on this Mac (fail closed): $(tail -1 "$OUT/vfkit-preflight.log")" | tee -a "$OUT/summary.txt"; exit 2; }
+  VMWS="$(cd "$OUT" && pwd)/vmws"; mkdir -p "$VMWS"; : > "$OUT/vm.pids"
+  VFK_OVR="$OUT/compose.vfkit.yml"
+  # Docker publishes no port of a container that is only on internal networks: airlock and mock-http
+  # also join "vmhost" (a plain bridge) so that their ports reach the host's 127.0.0.1, where the VM's
+  # vsock relay connects. The agent side is a VM and is on no Docker network at all.
+  { echo "networks:"
+    echo "  vmhost: {}"
+    echo "services:"
+    echo "  airlock:"
+    echo "    networks: [agentnet, upstream, vmhost]"
+    echo "    ports: [\"127.0.0.1::8700\"]"
+    echo "    volumes: !override [\"./policies/\${FORGE_DOMAIN:-codebase}.yaml:/forge/forge.yaml:ro\", \"./fixtures:/forge-fixtures:ro\", \"logs:/data\", \"state:/state\", \"$VMWS:/ws-raw\"]"
+    echo "  mock-http: {networks: [upstream, vmhost], ports: [\"127.0.0.1::9100\"]}"
+    echo "  bench-direct: {volumes: !override [\"$VMWS:/ws:ro\"]}"; } >"$VFK_OVR"
+  { echo "services:"
+    echo "  airlock:"
+    echo "    environment: {FORGE_WS_RAW: \"\"}"
+    echo "    volumes: !override [\"./policies/\${FORGE_DOMAIN:-codebase}.yaml:/forge/forge.yaml:ro\", \"./fixtures:/forge-fixtures:ro\", \"logs:/data\", \"state:/state\", \"$VMWS:/ws\"]"; } >"$OUT/compose.vfkit-nosym.yml"
+fi
+RT=$([ -n "$VFK" ] || python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import backends as B; print(B.runtime_for(sys.argv[2], B.docker_runtimes()) or "")' .. "$ISO") \
   || { echo "VALIDATE: isolation $ISO not available on this Docker host (fail closed)" | tee -a "$OUT/summary.txt"; exit 2; }
 RT_OVR=""
 if [ -n "$RT" ]; then  # the agent side only; airlock, mock-http, bench-direct stay on runc
@@ -54,11 +80,64 @@ if [ -n "$RT" ]; then  # the agent side only; airlock, mock-http, bench-direct s
   printf 'services:\n  airlock: {networks: !override [upstream]}\n' >"$OUT/compose.second-airlock.yml"
 fi
 echo "== run $FORGEAIR_RUN" | tee -a "$OUT/summary.txt"
-echo "== isolation $ISO (agent runtime: ${RT:-runc})" | tee -a "$OUT/summary.txt"
+echo "== isolation $ISO (agent runtime: ${RT:-runc}$([ -n "$VFK" ] && echo '; vfkit VM, not a container'))" | tee -a "$OUT/summary.txt"
 
+dc_raw() {  # vfkit: the no-nosymfollow control needs its workspace mount on the shared host folder too (last file wins)
+  local nosym=""; [ -n "$VFK" ] && [ "${OVR:-}" = control-nosymfollow-off.yml ] && nosym="$OUT/compose.vfkit-nosym.yml"
+  docker compose -p "forgeair-$FORGEAIR_RUN-$DOM" -f docker-compose.yml ${OVR:+-f "$OVR"} ${RT_OVR:+-f "$RT_OVR"} ${VFK_OVR:+-f "$VFK_OVR"} ${nosym:+-f "$nosym"} ${XOVR:+-f "$XOVR"} "$@"; }
 dc() {  # under a runtime override, `run` without --interactive: under Kata a `run -T` never ended in CI (run 45115365474); stdin is the suspect
   if [ -n "$RT" ] && [ "$1" = run ]; then shift; set -- run --interactive=false "$@"; fi
-  docker compose -p "forgeair-$FORGEAIR_RUN-$DOM" -f docker-compose.yml ${OVR:+-f "$OVR"} ${RT_OVR:+-f "$RT_OVR"} ${XOVR:+-f "$XOVR"} "$@"; }
+  if [ -n "$VFK" ]; then vfk_dc "$@"; return; fi
+  dc_raw "$@"; }
+
+AGENT_SIDE=" agent control-env-secret control-hidden-mount control-egress control-root-writes agent-bench "
+vfk_stop_vms() {  # the VMs of `run -d`, then the shared workspace folder (flags first: read-only entries are immutable)
+  local p; for p in $(cat "$OUT/vm.pids" 2>/dev/null); do pkill -TERM -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; done; : > "$OUT/vm.pids"
+  python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import vfkit_vm; vfkit_vm.unlock_tree(sys.argv[2])' ../backends "$VMWS"
+  rm -rf "${VMWS:?}"; mkdir -p "$VMWS"; }
+vfk_vm() {  # vfk_vm [run options] <agent-side service> [command...]: the service in a vfkit VM
+  local detach="" nodeps="" envs=() a svc p_air p_mock
+  while [ $# -gt 0 ]; do case "$1" in
+    --rm|-T|--interactive=false) shift;; --no-deps) nodeps=1; shift;; -d) detach=1; shift;;
+    -e) envs+=(-e "$2"); shift 2;; *) break;; esac; done
+  svc=$1; shift
+  [ -n "$nodeps" ] || dc_raw up -d --wait airlock >/dev/null 2>&1 || { echo "vfk: airlock did not start" >&2; return 2; }
+  dc_raw --profile controls --profile bench config --format json >"$OUT/vm-config.json" 2>/dev/null || return 2
+  p_air=$(dc_raw port airlock 8700 2>/dev/null | head -1 | sed 's/.*://')
+  p_mock=$(dc_raw port mock-http 9100 2>/dev/null | head -1 | sed 's/.*://')
+  [ -n "$p_air" ] || { echo "vfk: the airlock's port is not published (fail closed)" >&2; return 2; }
+  dc_raw exec -T airlock python3 -I -c "import json; d=json.load(open('/state/workspace.json')); print(json.dumps({'closed_dirs': d.get('closed_dirs', []), 'readonly_files': d.get('readonly_files', [])}))" >"$OUT/vm-ro.json" 2>/dev/null \
+    || { echo "vfk: no read-only list from the airlock (fail closed)" >&2; return 2; }
+  a=(--config "$OUT/vm-config.json" --service "$svc" --volume "ws=$VMWS" --net "agentnet=8700:127.0.0.1:${p_air:-0}:airlock")
+  # control-root-writes in a VM: guest root alone cannot write read-only entries (guest read-only binds,
+  # the host immutable flag and the airlock's 0444/0555 modes, enforced by macOS on the vfkit process;
+  # the canary PASSES as guest root: checked as its own case below). The planted breach for the VM is
+  # therefore "root AND the host protection removed"; the canary must report it.
+  a+=(--ro-list "$OUT/vm-ro.json")
+  if [ "$svc" = control-root-writes ] && [ -z "${VFK_ROOT_PROTECTED:-}" ]; then a+=(--plant-unprotected); else a+=(--lock); fi
+  [ -n "$p_mock" ] && a+=(--net "upstream=9100:127.0.0.1:$p_mock:mock-http")
+  if [ -n "$detach" ]; then
+    python3 -I ../backends/vfkit_compose.py "${a[@]}" ${envs[@]+"${envs[@]}"} -- "$@" >/dev/null 2>&1 &
+    echo $! >>"$OUT/vm.pids"; echo $! >>"$OUT/vm.allpids"; return 0
+  fi
+  python3 -I ../backends/vfkit_compose.py "${a[@]}" ${envs[@]+"${envs[@]}"} -- "$@"; }
+vfk_dc() {
+  local a svc="" skip="" rc
+  case "$1" in
+    run)
+      for a in "${@:2}"; do
+        if [ -n "$skip" ]; then skip=""; continue; fi
+        case "$a" in -e|-v|--entrypoint|-u|-w) skip=1;; -*) ;; *) svc=$a; break;; esac
+      done
+      case "$AGENT_SIDE" in *" $svc "*) shift; vfk_vm "$@"; return;; esac;;
+    up)
+      case " $* " in *" --exit-code-from agent "*)  # = start airlock (+ mock-http), run the agent, stop all
+        dc_raw up -d --wait airlock mock-http >/dev/null 2>&1 || return 1
+        vfk_vm --no-deps agent; rc=$?; dc_raw stop >/dev/null 2>&1; return $rc;; esac;;
+    down|--profile)
+      case " $* " in *" down "*) vfk_stop_vms; dc_raw "$@"; rc=$?; vfk_stop_vms; return $rc;; esac;;
+  esac
+  dc_raw "$@"; }
 
 json_check() {  # json_check <file> <python expression over d>
   python3 -c "import json,sys; d=json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]); sys.exit(0 if ($2) else 1)" "$1"
@@ -113,6 +192,11 @@ for DOM in ${DOMAINS:-codebase visible quota concurrency crash}; do
     echo "info $DOM: CONTROL swap attack WITHOUT nosymfollow (not gated): exit=$? (20 = the attack won)" | tee -a "$OUT/summary.txt"
     grep -E "^\[swap\]" "$OUT/$DOM-swap-control.log" | head -3 | cut -c1-240 | sed 's/^/     /'
     dc stop airlock >/dev/null 2>&1; OVR=$OVR_SAVE; dc up -d --wait airlock >/dev/null 2>&1
+    if [ -n "$VFK" ]; then  # vfkit: guest root with the read-only protection in place must NOT get through
+      t=$SECONDS; restart_airlock
+      VFK_ROOT_PROTECTED=1 dc run --rm control-root-writes >"$OUT/$DOM-vm-root-protected.log" 2>&1
+      rec "$DOM: vfkit: guest root, read-only protection on -> canary PASS (cannot write)" $? 0 $((SECONDS-t))
+    fi
     for c in control-env-secret control-hidden-mount control-root-writes; do
       t=$SECONDS; restart_airlock
       dc run --rm "$c" >"$OUT/$DOM-$c.log" 2>&1
@@ -212,5 +296,10 @@ echo "== total $((SECONDS-T_ALL))s" | tee -a "$OUT/summary.txt"
 left=$(docker ps -a --filter "name=forgeair-$FORGEAIR_RUN-" -q | wc -l | tr -d ' ')
 vols=$(docker volume ls -q --filter "name=forgeair-$FORGEAIR_RUN-" | wc -l | tr -d ' ')
 [ "$left" = 0 ] && [ "$vols" = 0 ]; rec "cleanup: 0 containers and 0 volumes left (c=$left v=$vols)" $? 0 0
+if [ -n "$VFK" ]; then
+  vfk_stop_vms; rmdir "$VMWS" 2>/dev/null
+  n=0; for p in $(cat "$OUT/vm.allpids" 2>/dev/null); do kill -0 "$p" 2>/dev/null && n=$((n+1)); done  # only VMs of this run
+  [ "$n" = 0 ]; rec "cleanup: 0 vfkit VMs of this run left (n=$n)" $? 0 0
+fi
 [ "$FAIL" = 0 ] && echo "VALIDATE: PASS" | tee -a "$OUT/summary.txt" || echo "VALIDATE: FAIL" | tee -a "$OUT/summary.txt"
 exit "$FAIL"
