@@ -491,49 +491,49 @@ def bypass_cases():
         cases.append(('bypass: git list: an untracked new file is found; ignored and node_modules files are not',
                       code == 1 and [h['file'] for h in hits(out)] == ['new_spender.py']))
 
-    # chronicle-shaped: a decision says body.for counts only on Companion's rows; a second gate function trusts it
+    # app-shaped: a decision says body.owner counts only on agent rows; a second policy function trusts it
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, 'c')
         for rel, text in {
             'spec/GateSpec.dfy': 'abstract module GateSpec { }\n', 'impl/Gate.dfy': 'module Gate { }\n',
-            'src/gate.ts': ('import { mayReadProved } from "./gate-mayread.ts"\n\n'
-                            'export function mayRead(actor: string, row: Row): boolean {\n'
-                            '  return mayReadProved(actor, row)\n}\n\n'
-                            'export const mayRetract = (actorId: string, target: Row): boolean =>\n'
-                            '  target.authorId === actorId || target.body.for === actorId\n\n'
-                            'class Store {\n  forget(input: Input) {\n    for (const e of this.rows) {\n'
-                            '      if (e.authorId !== input.parentId && e.body.for !== input.parentId) continue\n'
+            'src/policy.ts': ('import { canViewProved } from "./policy-proved.ts"\n\n'
+                            'export function canView(actor: string, row: Row): boolean {\n'
+                            '  return canViewProved(actor, row)\n}\n\n'
+                            'export const canCancel = (actorId: string, target: Row): boolean =>\n'
+                            '  target.authorId === actorId || target.body.owner === actorId\n\n'
+                            'class Store {\n  archive(input: Input) {\n    for (const e of this.rows) {\n'
+                            '      if (e.authorId !== input.ownerId && e.body.owner !== input.ownerId) continue\n'
                             '    }\n  }\n}\n'),
-            'src/Svc.java': ('class Svc {\n    public static boolean retract(Row target, String by)\n    {\n'
-                             '        return target.body.for.equals(by);\n    }\n}\n'),
-            'src/svc.go': 'package svc\n\nfunc (s *S) Retract(t Row, by string) bool {\n\treturn t.body.for == by\n}\n',
-            'src/svc.rs': 'pub fn retract(t: &Row, by: &str) -> bool {\n    t.body.for == by\n}\n',
-            'docs/decisions.md': 'D9: body.for counts only on Companion rows.\n',
+            'src/Svc.java': ('class Svc {\n    public static boolean cancel(Row target, String by)\n    {\n'
+                             '        return target.body.owner.equals(by);\n    }\n}\n'),
+            'src/svc.go': 'package svc\n\nfunc (s *S) Cancel(t Row, by string) bool {\n\treturn t.body.owner == by\n}\n',
+            'src/svc.rs': 'pub fn cancel(t: &Row, by: &str) -> bool {\n    t.body.owner == by\n}\n',
+            'docs/decisions.md': 'D4: body.owner counts only on agent rows.\n',
         }.items():
             os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
             open(os.path.join(root, rel), 'w').write(text)
         os.makedirs(os.path.join(root, '.forge'))
-        json.dump({'version': 1, 'checks': [{'name': 'gate-mayread', 'spec': 'spec/GateSpec.dfy', 'files': ['impl/Gate.dfy'],
-                                             'watchedFields': ['body.for']}]}, open(os.path.join(root, CONFIG), 'w'))
+        json.dump({'version': 1, 'checks': [{'name': 'policy-view', 'spec': 'spec/GateSpec.dfy', 'files': ['impl/Gate.dfy'],
+                                             'watchedFields': ['body.owner']}]}, open(os.path.join(root, CONFIG), 'w'))
         code, out = run(root, '--json')
         got = sorted((h['file'], h['function']) for h in hits(out))
-        cases.append(('bypass: chronicle-shaped: mayRetract and forget (TS), retract in Java/Go/Rust named; docs skipped',
-                      code == 1 and got == [('src/Svc.java', 'retract'), ('src/gate.ts', 'forget'), ('src/gate.ts', 'mayRetract'),
-                                            ('src/svc.go', 'Retract'), ('src/svc.rs', 'retract')]))
+        cases.append(('bypass: app-shaped: canCancel and archive (TS), cancel in Java/Go/Rust named; docs skipped',
+                      code == 1 and got == [('src/Svc.java', 'cancel'), ('src/policy.ts', 'archive'), ('src/policy.ts', 'canCancel'),
+                                            ('src/svc.go', 'Cancel'), ('src/svc.rs', 'cancel')]))
         before = open(os.path.join(root, CONFIG)).read()
-        rc = subprocess.run([sys.executable, CLI, 'bypass', '--root', root, '--count', '--json', '--rule', 'gate-mayread',
-                             '--set-terms', '.body.for', 'not_in_this_project'], stdout=subprocess.PIPE, universal_newlines=True)
+        rc = subprocess.run([sys.executable, CLI, 'bypass', '--root', root, '--count', '--json', '--rule', 'policy-view',
+                             '--set-terms', '.body.owner', 'not_in_this_project'], stdout=subprocess.PIPE, universal_newlines=True)
         try:
-            pv = json.loads(rc.stdout).get('gate-mayread', {})
+            pv = json.loads(rc.stdout).get('policy-view', {})
         except ValueError:
             pv = {}
         cases.append(('bypass: --count previews other terms (lines per term) and writes nothing',
-                      rc.returncode == 0 and pv.get('per_term') == {'.body.for': 5, 'not_in_this_project': 0}
+                      rc.returncode == 0 and pv.get('per_term') == {'.body.owner': 5, 'not_in_this_project': 0}
                       and open(os.path.join(root, CONFIG)).read() == before))
         txt = subprocess.run([sys.executable, CLI, 'check', '--root', root, '--no-write'], stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, universal_newlines=True).stdout
-        cases.append(('bypass: check text names the places ("N places decide with body.for outside gate-mayread")',
-                      '5 places decide with body.for outside gate-mayread: ' in txt and 'src/gate.ts:8 mayRetract' in txt))
+        cases.append(('bypass: check text names the places ("N places decide with body.owner outside policy-view")',
+                      '5 places decide with body.owner outside policy-view: ' in txt and 'src/policy.ts:8 canCancel' in txt))
     return cases
 
 
@@ -873,7 +873,7 @@ def main():
         extra += 1
         print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
     # Messy inputs: the unproved wrapper that turns raw app/JSON values into Dafny values must fail closed, never throw
-    # (owner feedback: a real app's wrapper threw on `householdId: undefined`, and the plain fuzz never sent one).
+    # (owner feedback: a real app's wrapper threw on an `undefined` id field, and the plain fuzz never sent one).
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, 'p')
         shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
