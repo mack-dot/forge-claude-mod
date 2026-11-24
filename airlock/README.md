@@ -416,6 +416,35 @@ exactly the allowed files; a passed upstream secret gives canary BREACH, exit 10
 Tests: `tests/redteam_regress.py` (part of `run_tests.py`; `FORGE_ENGINE_DIR=<old engine>` runs it
 against other code) and `agent/protocol_regress.py` in `validate.sh` (domain concurrency).
 
+## In-box red team (M2.3: findings IB1 to IB3)
+
+`agent/inbox_probe.py` runs as the boxed command of the real `forge up` (after the canary and
+`unset FORGE_CANARY_TOKEN`) and dumps what an agent can reach through `/proc` (cmdline, environ,
+status, cwd/exe/root, mountinfo of every pid), git (refs, reflog, stash, `log -p` of every ref,
+`cat-file --batch-all-objects`, raw loose objects, pack streams, alternates, fsck), fds (every fd of
+every pid and its content, `/proc/net`, a TCP scan of the airlock and egress hosts, Docker sockets),
+the environment and temp places. The host harness (`tests/inbox_probes/`) searches that output for
+the hidden content of every history version, hidden names, the commit-message marker, the per-run
+canary token, the upstream key and host paths. The box never sees those needles.
+
+- **IB1 (canary leftovers).** The canary left `/tmp/forge-canary/link<n>` symlinks whose targets name
+  every hidden path of the history (also deleted and side-branch files). It now removes them.
+- **IB2 (host paths in mountinfo).** The agent's `/forge-run` was a bind mount of the host run folder
+  (and `/forge/agent` of the plugin folder with `--agent-image`); `/proc/self/mountinfo` showed those
+  host paths. `forge up` now fills a project volume (`agentrun`) from a tar stream and mounts it
+  read-only; the agent has no bind mount of a host folder.
+- **IB3 (special files in the export).** A FIFO in the workspace made the export block forever (the
+  sync-back prompt never came); a socket made it crash. The export now refuses FIFOs, sockets and
+  devices ("not exported") and reads files with `O_NONBLOCK | O_NOFOLLOW`.
+
+Each probe family has a planted breach that it must detect (a hidden line in a process argv, a
+dangling hidden blob in `.git/objects`, an inherited fd 7, the token and a hidden line in the env, a
+hidden line and a hidden-path symlink in `/tmp`). `tests/inbox_probes/run_alias_e2e.py` writes case,
+NFD and trailing dot/space aliases, a case-only rename, a FIFO and a socket in the box, answers y, and
+requires that only the one allowed file changes on the host. Gate G9 of `prove_release.sh`.
+Not tested: other kernels and Docker engines (only Docker Desktop on macOS here), an agent that
+waits for a later process to appear, timing side channels.
+
 ## Honest labels
 
 | Part | Label |

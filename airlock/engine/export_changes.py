@@ -12,6 +12,7 @@
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 
@@ -27,6 +28,35 @@ def git(gd, *args, inp=None):
                           capture_output=True, check=True, env={"PATH": "/usr/bin:/bin:/usr/local/bin",
                                                                  "GIT_CONFIG_NOSYSTEM": "1", "HOME": "/nonexistent"}
                           ).stdout
+
+
+def special_kind(full):
+    """None for a regular file or a symlink; else what it is (M2.3: a FIFO in the workspace made
+    the export block forever on open(); a socket made it crash)."""
+    m = os.lstat(full).st_mode
+    if stat.S_ISREG(m) or stat.S_ISLNK(m):
+        return None
+    return {stat.S_IFIFO: "a FIFO", stat.S_IFSOCK: "a socket", stat.S_IFCHR: "a character device",
+            stat.S_IFBLK: "a block device"}.get(stat.S_IFMT(m), "not a regular file")
+
+
+def read_regular(full):
+    """(data, mode) of a regular file; never blocks and never follows a symlink. Raises OSError
+    if the path is not (or no longer) a regular file."""
+    fd = os.open(full, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("not a regular file")
+        chunks = []
+        while True:
+            b = os.read(fd, 1 << 20)
+            if not b:
+                break
+            chunks.append(b)
+        return b"".join(chunks), ("100755" if st.st_mode & 0o111 else "100644")
+    finally:
+        os.close(fd)
 
 
 def base_tree(gd):
@@ -73,12 +103,18 @@ def main():
                 data = os.readlink(full).encode("utf-8", "surrogateescape")
                 mode = "120000"
             else:
-                if os.path.getsize(full) > MAX_FILE:
+                kind = special_kind(full)
+                if kind is None and os.path.getsize(full) > MAX_FILE:
+                    kind = "larger than 20 MiB"
+                if kind is None:
+                    try:
+                        data, mode = read_regular(full)
+                    except OSError:
+                        kind = "not a regular file"
+                if kind is not None:
                     changes.append({"path": rel, "status": "modified" if rel in base else "added",
-                                    "refused": "larger than 20 MiB; not exported"})
+                                    "refused": f"{kind}; not exported"})
                     continue
-                data = open(full, "rb").read()
-                mode = "100755" if os.stat(full).st_mode & 0o111 else "100644"
             sha = git(gd, "hash-object", "--stdin", inp=data).decode().strip()
             if rel in base and base[rel] == (mode, sha):
                 continue
