@@ -79,6 +79,9 @@ jobs:
       - name: registered runtimes
         run: docker info --format '{{json .Runtimes}}' | python3 -c 'import json,sys; print(sorted(json.load(sys.stdin)))'
       - name: startup overhead (cold and warm container start, this runner)
+        # a measurement only: it restarts Docker for cold starts, and a restart that does not come back in time
+        # (seen several times on hosted runners) must not fail the battery below; the next step waits for Docker
+        continue-on-error: true
         timeout-minutes: 15
         run: |
           timeout 600 docker compose -p forgeair-build -f airlock/proof/docker-compose.yml build -q
@@ -93,6 +96,12 @@ jobs:
             timeout 300 python3 airlock/proof/startup_bench.py forge-airlock-proof:local "$rt" 10 > "$RUNNER_TEMP/startup-$rt.json"
           done
           cat "$RUNNER_TEMP"/startup-*.json
+      - name: Docker is up again after the startup measurement
+        run: |
+          for i in $(seq 1 60); do docker info >/dev/null 2>&1 && exit 0; sleep 5; done
+          sudo systemctl restart docker
+          for i in $(seq 1 60); do docker info >/dev/null 2>&1 && exit 0; sleep 5; done
+          echo "Docker did not come back"; exit 1
       - name: Docker battery (validate.sh = G2-G4) with the agent under ${{ matrix.backend }}
         run: |
           s=$SECONDS

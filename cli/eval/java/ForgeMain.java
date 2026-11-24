@@ -153,6 +153,9 @@ public class ForgeMain {
         Map<String, Function<Object, Object>> wraps = wrappers();
         Function<Object, Object> failClosed = failClosed();
         PrintStream out = new PrintStream(new FileOutputStream(FileDescriptor.out), false, "UTF-8");
+        // The protocol owns the real stdout. Code under test that prints (System.out) writes to stderr instead:
+        // before this, one println in the shipped code broke the line protocol (DIFF_ERROR).
+        System.setOut(System.err);
         List<String> all = new ArrayList<>(cands.keySet());
         all.addAll(wraps.keySet());
         Map<String, Object> hello = new LinkedHashMap<>();

@@ -98,6 +98,9 @@ public static class ForgeMain {
     public static void Main() {
         var cands = new SortedDictionary<string, Func<Dictionary<string, object>, object>>(ForgeAdapter.Candidates(), StringComparer.Ordinal);
         var stdout = new System.IO.StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = false };
+        // The protocol owns the real stdout. Code under test that prints (Console.WriteLine) writes to stderr instead:
+        // before this, one print in the shipped code broke the line protocol (DIFF_ERROR).
+        Console.SetOut(Console.Error);
         var wraps = Wrappers();
         var failClosed = FailClosed();
         var hello = new StringBuilder();

@@ -162,6 +162,7 @@ class TraceEvaluator(Evaluator):
         self.p.stdin.flush()
         out = self._read(forge_diff.CALL_TIMEOUT_S + 0.005 * n)
         if out is None:
+            self.hung = True
             raise EvaluatorError('no answer for %d traces within the time limit (a hang?); first trace: %s'
                                  % (len(traces), canon(wire(traces[0]))[:200]))
         if not isinstance(out.get('results'), list) or len(out['results']) != len(traces):
@@ -312,11 +313,10 @@ def run_trace_entry(cmd, cwd, env, events_path, seed, block, reg_dir, count=None
             entry.update(meta)
             if is_new and not os.path.exists(path):
                 os.makedirs(reg_dir, exist_ok=True)
-                with open(path, 'w', encoding='utf-8') as f:
-                    f.write(json.dumps(dict({k: entry[k] for k in ('candidate', 'trace', 'step', 'reference', 'got',
-                                                                    'group')}, seed=seed, **meta,
-                                            found_at=datetime.datetime.now(datetime.timezone.utc).isoformat(
-                                                timespec='seconds')), indent=2, ensure_ascii=False) + '\n')
+                forge_diff.write_atomic(path, json.dumps(dict(
+                    {k: entry[k] for k in ('candidate', 'trace', 'step', 'reference', 'got', 'group')}, seed=seed,
+                    **meta, found_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')),
+                    indent=2, ensure_ascii=False) + '\n')
             result['disagreements'].append(entry)
 
         # 1. Saved failing traces run first.
