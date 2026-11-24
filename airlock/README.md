@@ -166,6 +166,62 @@ agent:
 
 `forge.yaml` is always read-only in the box and is never synced back.
 
+## Streamable HTTP, several upstreams, roles (M2.2)
+
+```yaml
+namespace: true                  # the agent sees <upstream>__<tool>; the upstream gets <tool>
+upstreams:
+  - name: fs
+    command: [node, /opt/fs/index.js, /ws]          # command -> stdio
+  - name: pay
+    url: https://pay.example.invalid/mcp            # url -> MCP Streamable HTTP
+    headers: {authorization: "Bearer ${PAY_KEY}"}   # NAME only; the airlock adds the value
+tools:
+  allow: [{tool: fs__read_file, path_args: {path: read}}]
+  deny: [pay__refund_all]
+  gate: [{tool: pay__charge, unit: value, value_field: amount, cap: 50000, expires_in_s: 86400}]
+roles:                            # optional; select with `forge up --role junior` or FORGE_ROLE=junior
+  junior: {tools: [fs__read_file, pay__charge], cap: {pay__charge: 1000}, hidden_paths: ["src/billing/**"]}
+  contractor: {tools: [fs__read_file], visible_paths: ["src/ui/**"]}
+```
+
+- **Transport.** An upstream with `url` (or `transport: http`) is an MCP Streamable HTTP server
+  (spec 2025-03-26 and 2025-06-18): one POST per message, the answer is `application/json` or a
+  `text/event-stream` read until the response with our id (other events are skipped). The
+  `Mcp-Session-Id` from `initialize` is sent on every later request; a 404 for it fails that call
+  (it is not retried; a gate step stays spent) and the next call opens a new session; the session
+  is ended with DELETE at exit. Fail closed: a body over 8 MiB (`FORGE_UPSTREAM_MAX_BODY`), an SSE
+  event that is not JSON, a response with another id, a changed session id, another content type.
+  No redirect is followed and no proxy variable is read, so a credential header goes only to the
+  configured host. Only `http://` and `https://` URLs without `user:pass@` load.
+- **Listen side.** The airlock's own `/mcp` is Streamable HTTP too: `initialize` returns an
+  `Mcp-Session-Id`; an unknown or ended id gets 404, DELETE ends a session, GET is 405 (no server
+  stream), an unsupported `MCP-Protocol-Version` gets 400, a request with an `Origin` header gets 403
+  unless `FORGE_ALLOWED_ORIGINS` lists it. Sessions carry no authority (every gate is global), so a
+  client without a session is still served.
+- **One gate implementation.** Every transport goes through the same `Policy.check_call` and
+  `Airlock.tools_call`: default deny, `arg_rules`, strict arguments, path rules, the #91 gate logs,
+  the canary (it probes the unlisted tools by their namespaced names and treats every HTTP
+  upstream host:port as a target the box must not reach).
+- **Composition.** With `namespace: true` a tool name is `<upstream>__<tool>`; at load an upstream
+  name with `__` or a trailing `_` (it would make `a__b__c` ambiguous), two upstream names that
+  differ only in case, and a tool or deny entry with an unknown prefix are errors. At the start an
+  upstream that lists one name twice, or (without `namespace`) a listed tool that two upstreams
+  offer and `upstream:` does not pin, stops the airlock. After the start each upstream fails alone:
+  a stdio upstream that dies is started again for its next call, an HTTP upstream that is down
+  fails its own calls only. An upstream that is down at the START stops the start (fail closed).
+- **Roles narrow only.** A role can keep a subset of the base tools, add `hidden_paths`, restrict
+  `visible_paths` and lower caps. Load errors (also for a role that is not selected): a tool the base
+  does not allow or gate, a denied tool, a cap above the base cap or on an ungated tool, a
+  `visible_paths` pattern not inside a base `visible_paths` pattern (conservative test: equal, or
+  below a base `dir/**`), unknown keys. An unknown role fails closed. A role cap is a second, smaller
+  gate log (`<log>.role-<role>`) in front of the base log: a call needs ACCEPT from both, so the
+  base cap still bounds the sum over all roles.
+- Tests: `tests/m22_regress.py` (in `tests/run_tests.py`: unit, e2e on localhost with real
+  processes, planted faults, a 400-role property test, and negative controls that remove one check
+  from a copy of the engine and require the matching case to FAIL). Latency per transport:
+  `tests/bench_transport.py` (FINITE TEST; numbers in the M2.2 pull request).
+
 ## Held calls: `require_human_approval: hardware`
 
 A tool with `require_human_approval: hardware` (in `tools.allow` or `tools.gate`) is held in the airlock until a
@@ -392,6 +448,11 @@ against other code) and `agent/protocol_regress.py` in `validate.sh` (domain con
   Windows is not supported (no `pty`, POSIX paths).
 - Real upstream servers other than server-filesystem 2.2.0 and the mocks (for example
   `npx -y @modelcontextprotocol/server-github`), real credentials, `forge tools` against them.
+- M2.2 (Streamable HTTP, composition, roles): only against the stdlib mock
+  (`mocks/mock_streamable_http.py`) on localhost, not against a real remote MCP server, TLS
+  (`https://` upstreams), OAuth, the optional GET server stream, resumable SSE (Last-Event-ID),
+  server-to-client requests, or `forge up --role` in Docker end to end (the role path is tested
+  in-process; `up` passes `FORGE_ROLE` to the airlock container).
 - Large repositories (thousands of commits), merges (first parent only), submodules (dropped),
   LFS, binary hidden files; a cold Docker cache on a new machine.
 - The `/forge:airlock` conversation itself (it is a prompt to Claude; its quality is not
