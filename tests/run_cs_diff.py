@@ -72,7 +72,21 @@ def main():
                                len(res2.get('disagreements', [])) - len(rest)))
         if rest:
             print(json.dumps(rest)[:800])
-        failed = (0 if ok else 1) + (0 if ok2 else 1)
+        # Shipped C# code that prints on every call: the protocol keeps its own stdout (Console.SetOut(Console.Error)
+        # in ForgeMain.cs); before, the first Console.WriteLine broke it (DIFF_ERROR).
+        with open(os.path.join(root, 'legacycs', 'LegacyWallet.cs'), 'w') as f:
+            f.write('namespace LegacyCs { public static class LegacyWallet { public static (bool, long) Spend(long cap, long spent, long amount)'
+                    ' { System.Console.WriteLine("spend called"); if (amount > 0 && amount <= cap - spent) return (true, spent + amount);'
+                    ' return (false, spent); } } }\n')
+        r3 = subprocess.run([sys.executable, CLI, 'diff', '--root', root, '--json', '--seed', '8', '--no-write'],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        res3 = json.loads(r3.stdout)['checks']['wallet-cap']
+        ok3 = res3.get('verdict') in ('DIFF_OK', 'DISAGREE') and not res3.get('error') and res3['decisions']['agree'] == 4
+        print('%s  diff: C# shipped code that prints to stdout is fuzzed (verdict %s, decisions %s of %s agree)' % (
+            'ok  ' if ok3 else 'FAIL', res3.get('verdict'), res3['decisions']['agree'], res3['decisions']['total']))
+        if not ok3:
+            print(json.dumps(res3)[:800])
+        failed = (0 if ok else 1) + (0 if ok2 else 1) + (0 if ok3 else 1)
 
         def run(*extra):
             t0 = time.time()

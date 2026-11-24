@@ -164,6 +164,7 @@ edit of emitted code gives `STALE_BUILD`. Commit the emitted code and run `build
 | `FUZZ_FAILED` | A target failed a runtime `expect`, crashed or timed out |
 | `TARGETS_DIFFER` | Two targets printed different results |
 | `TOOLCHAIN_MISSING` | A listed target's tools are not on PATH |
+| `FUZZ_BUILD_FAILED` | A target's compiler failed on the fuzz harness (a toolchain problem, not a wrong result). This verdict and `TOOLCHAIN_MISSING` give way to a later finding about the code, such as `STALE_BUILD`; every failure is listed in the notes |
 | `EMIT_FAILED` | Dafny could not emit a target |
 | `STALE_BUILD` | The emitted code on disk differs from a fresh build |
 | `NOT_WIRED` | A `usedBy` file does not contain its import text |

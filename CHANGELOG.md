@@ -18,8 +18,23 @@ a time against well-behaved mocks). Each fix has a case in `tests/lifecycle_case
 - **Fix: code under test that logs is fuzzed, not reported as broken.** The Python and JavaScript evaluators and
   crash runners send the code's stdout to stderr (one `print` / `console.log` gave DIFF_ERROR, or a false ProcessExit
   and "NOT judged" in CRASH-CHECK), and the runners drain stderr in a thread (after 64 KB of log the child blocked:
-  a false "hang"). Not changed: the Go, Rust, Java and C# evaluators (a candidate that prints there still breaks the
-  protocol, as a DIFF_ERROR).
+  a false "hang"). The Go, Java, C# and Rust evaluators do the same (Rust on Unix: fd 1 is duplicated for the
+  protocol, fd 2 copied onto fd 1). Not covered: a print in a Go `init()`, and Rust on Windows. C# is tested in CI
+  only (`tests/run_cs_diff.py`; no dotnet on the machine where this was written).
+- **Fix: saved regression cases are written atomically** (`forge_diff.write_atomic`, also used for the `.forge/*.json`
+  files and trace cases). Before, a run killed while it saved a case left an empty `.json` (8 of 8 tries), and every
+  later run stopped on it.
+- **Fix: two diff runs at once** (the end-of-turn fuzz and a manual `diff`). Each diff entry, and the update of
+  `diff-stats.json`, now holds a file lock in `.forge/cache/` (waits up to 300 s, then DIFF_ERROR). Before, the stats
+  lost updates (152 of 300 runs counted), and a concurrent Go build crashed the other run with a traceback.
+- **Fix: `mutate` no longer counts an ERROR mutant as caught.** A mutant that does not resolve (for example `-` on a
+  sequence) or that times out is listed as "not scored"; the score counts caught and survived mutants only.
+- **New build verdict FUZZ_BUILD_FAILED:** the fuzz harness is compiled (`dafny build`) before it runs, so a compiler
+  failure is not reported as FUZZ_FAILED (a wrong result). `dafny run` exits 3 in both cases. FUZZ_BUILD_FAILED and
+  TOOLCHAIN_MISSING give way to a later finding about the code, such as STALE_BUILD (before, a failing Rust build hid
+  it); every failure is still in the notes, and each one exits 1.
+- **Fix: a hung evaluator is killed at once** instead of after a 5 s wait for it to exit (a cycle hang is reported in
+  about 2 s, not 7 s). The test's fixed 30 s limit is now the clean run's time plus 12 s, measured under the same load.
 - **Fix: `.forge/*.json` state files are written atomically** (temp file and rename): the status line read a
   half-written `last-diff.json` while a run wrote it. **Fix: `dafny verify` of the fuzz harness has the same time
   limit as the other Dafny calls** (before, none: a hang hung `build`).

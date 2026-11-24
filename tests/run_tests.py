@@ -797,7 +797,9 @@ def thread_visibility_cases():
         code, out = run(root, 'check')
         cases.append(('thread: the recursive model with cycles is proved (VERIFIED)',
                       code == 0 and list(out.get('verdicts', {}).values()) == ['VERIFIED']))
+        t_base = time.time()
         code, res = diff(root)
+        t_base = time.time() - t_base  # the same run without a hang, under the machine's load right now
         cases.append(('thread: negative control, the correct shipped code and wrapper agree (DIFF_OK, 9 of 9 decisions)',
                       code == 0 and res.get('verdict') == 'DIFF_OK' and (res.get('decisions') or {}).get('agree') == 9
                       and (res.get('messy') or {}).get('inputs', 0) > 50 and res.get('inputs', 0) >= 20))
@@ -815,8 +817,10 @@ def thread_visibility_cases():
             t0 = time.time()
             code, res = diff(root)
             if want is None:
+                # Reported, not waited on: at most the clean run's time (same load) plus the 2 s call limit and 10 s
+                # of slack. A fixed 30 s limit failed once on a shared machine (load average 9 to 12).
                 ok = code == 1 and res.get('verdict') == 'DIFF_ERROR' and 'no answer within' in res.get('error', '') \
-                    and time.time() - t0 < 30
+                    and time.time() - t0 < t_base + 12
             else:
                 ok = code == 1 and res.get('verdict') == 'DISAGREE' and failing(res) == want
             cases.append(('thread: planted bug caught by the fuzz: %s' % name, ok))
