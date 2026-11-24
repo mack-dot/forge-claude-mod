@@ -312,6 +312,100 @@ diff run per mutant: on the example 150–220 ms (Python), 210–430 ms (TypeScr
 warm cargo cache) and 1.4 s (Java) per mutant. Labels: both measures are test tooling (not proved); a mutation
 score is a FINITE TEST of the fuzz, not of the code.
 
+### Fuzz tiers and coverage-guided steering
+
+The end-of-turn fuzz must stay fast; big volume belongs in CI. Three tiers, set in `.forge/forge.json` (all optional;
+these are the defaults):
+
+```json
+"fuzz": {"tiers": {"local":   {"inputs": 1500,    "budget_ms": 1500,    "steer": false},
+                   "ci":      {"inputs": 100000,  "budget_ms": 600000,  "steer": true},
+                   "nightly": {"inputs": 1000000, "budget_ms": 3600000, "steer": true}}}
+```
+
+`diff` runs the local tier (a diff entry's own `inputs_per_run` / `budget_ms` still win there); `diff --tier ci` and
+`diff --tier nightly` run the others; `--inputs` / `--budget-ms` win over every tier; `--steer` / `--no-steer` win
+over the tier's steering. In the Action: `diff-tier: ci` (or `nightly` in a scheduled workflow).
+
+**Steering** (`--steer`; py and js entries). Blind random inputs reach a narrow branch only by luck. A steered run
+gets per-input coverage from the evaluator itself (Python: a tracer around the candidate calls only; JS/TS: V8
+block coverage through `node:inspector`, read once per 16 inputs and per input only when the batch found something
+new), keeps every input that reaches a new step of the shipped code as a seed and mostly tries small changes of the
+seeds (an AFL-style corpus loop), and puts in constants read from the watched files' comparisons (`amount == 7777`
+gives `amount` the values 7776, 7777, 7778: a dictionary). Steering changes which inputs are tried, never how they
+are judged. It also names every line no input reached, plainly: `legacy_wallet.py:3 was never reached`. Go, Rust,
+Java, C# and cmd entries are not steered (no per-input coverage) and say so.
+
+Measured (`tests/bench_steer.py --seeds 20`, macOS arm64, Python 3.10, Node 24.3): the example with the shipped
+code fixed and ONE bug planted behind `amount == 7777`, 1,500 inputs per run, seeds 1 to 20, the same input count
+for every mode:
+
+| Mode | Python: bug found | Python: `legacy_wallet.py` branches reached (median) | TS: bug found | TS: `legacy_wallet.ts` code lines reached (median) |
+| --- | --- | --- | --- | --- |
+| blind random (`--no-steer`) | 0 of 20 | 3 of 4 | 0 of 20 | 4 of 5 |
+| corpus only (kept seeds, no constants) | 1 of 20 | 3 of 4 | 1 of 20 | 4 of 5 |
+| dictionary only (constants, no seeds) | 20 of 20 | 4 of 4 | 20 of 20 | 5 of 5 |
+| steered (`--steer`: both) | 20 of 20 | 4 of 4 | 20 of 20 | 5 of 5 |
+
+On this bug the constants from the code do the work; the corpus alone adds little (1 of 20). A narrow branch
+whose value is computed, not written in the code, is not reached this way.
+
+Labels: tiers and steering are test tooling (not proved); every run is a FINITE TEST.
+
+## CRASH-CHECK: `/forge crash-fuzz` (no spec)
+
+`/forge crash-fuzz` (or `python3 cli/forge_crash.py --root .`) needs no spec and no `forge.json`. It finds the
+functions where outside data enters your code, calls each with messy JSON, and lists every error that escapes one,
+with the smallest input that still gives it:
+
+```
+CRASH-CHECK: 3 handlers crash with unhandled errors: SyntaxError on a missing value (undefined), empty text; TypeError on a missing value (undefined), null
+  4 boundary function(s), 199 calls, seed 1, 973 ms. CRASH-CHECK only: it shows crashes; it proves nothing, and 0 crashes is not a proof of no crash.
+  ✗ js/handlers.ts:8 createOrder (express): 1 crash(es) in 34 calls
+      CRASH TypeError at js/handlers.ts:9 on item = undefined: Cannot read properties of undefined (reading 'quantity')
+        same crash also on: item = null, item = removed, whole input = undefined, whole input = null, whole input = empty-text, whole input = not-json-text
+        repro: {"item": {"__undefined__": true}}
+  ✗ js/handlers.ts:14 POST (fetch): 4 crash(es) in 33 calls
+      CRASH TypeError at js/handlers.ts:17 on user = null: Cannot read properties of null (reading 'name')
+        same crash also on: user = number, user = boolean, user = empty-text, user = lone-surrogate, user = long-text, user = array
+        repro: {"user": null}
+      CRASH SyntaxError at js/handlers.ts:15 on whole input = undefined: Unexpected end of JSON input
+        repro: {"__undefined__": true}
+  ...
+  ✓ js/handlers.ts:27 updateLimit (express): 0 crashes in 120 calls
+  skipped 1 function(s):
+    js/handlers.ts:35 normalizeName: private helper: not exported, so no caller outside its module can pass it data; a crash there shows up through the boundary function that calls it
+```
+
+- **Which functions.** JS/TS: exported functions that look like a boundary: request/response or event parameters
+  (Express/Fastify `(req, res)`, fetch-style `(request)` and `GET`/`POST` route handlers, Lambda `(event, context)`),
+  handler/webhook/parse-like names, package entry points (`main`/`exports`/`bin`), files under `routes/`, `api/`,
+  `handlers/`, `webhooks/`. Python: route/view decorators (`@app.route`, `@router.post`, `@api_view`,
+  `@csrf_exempt`, ...), `__all__`, handler/webhook/parse-like names, a first parameter `request` or `event`.
+  **Skipped, with the reason said:** private helpers (not exported, or `_name`: only a boundary function can pass
+  them data, and the boundary function is what is called), other exports (internal module code), and functions that
+  cannot be called directly: route handlers that are not exported, factories (`createHandler(deps)`), Flask views
+  with no parameters, FastAPI handlers with typed parameters (the framework validates first).
+  `--target FILE:FUNCTION` (or `.forge/crash-fuzz.json` `{"targets": [...]}`) checks exactly the functions you name;
+  `--include-private` adds private Python helpers.
+- **Which inputs.** The input shape is inferred from the fields the function reads (`req.body.item.quantity`,
+  `payload["user"]`, destructuring, `JSON.parse(raw)`); then every field, and the whole input, gets each messy
+  kind: undefined (JS), null, NaN, a number, a boolean, `""`, very long text, a lone surrogate, `[]`, `{}`, the
+  number as text, text that is not JSON, removed; then random pairs. 120 calls per function by default
+  (`--inputs`).
+- **What counts.** A runtime error that escapes (TypeError, SyntaxError, KeyError, AttributeError, ...; a rejected
+  promise or an unhandled rejection too) is a CRASH; a call with no answer in 1 s is a HANG. An error the code throws
+  on purpose (`throw`/`raise` on that line, or a non-built-in error class) is listed apart: check that your
+  framework answers 4xx for it. If the inferred input itself crashes, the shape guess is probably wrong: the
+  function is NOT judged and none of its results count.
+- Exit 1 when something crashed, 0 when not. **CRASH-CHECK, never PROVED:** 0 crashes is a finite test, not a proof.
+
+Measured on `tests/crash_fixture/` (seed 1): per language, the three planted crashes (a missing field, a null
+deref, `JSON.parse` / `json.loads` of a value that is not text) are found and shrunk (`{"item": undefined}`,
+`{"user": null}`, `{"payload": {"user": null}}`); the fail-closed handlers have 0 crashes in 120 calls each; the
+private helpers that throw on undefined / None are not reported (with `--include-private` the Python one is, so
+the skip is a choice, not a blind spot). About 1 s for 8 functions.
+
 ## Bypass: code that goes around a proved rule
 
 A proof is only as strong as the guarantee that nothing goes around it. On a real app, a proved read rule decided that
@@ -561,7 +655,8 @@ workflow run uses the same seed. On an event without a base (for example `workfl
 
 Inputs, all optional: `root`, `base` (a git ref, or `none` only for repositories whose approvals are test
 fixtures), `build`/`diff` (`auto` or `false`), `invariants` (`true` or `false`), `diff-inputs`,
-`diff-budget-seconds`, `diff-seed`, `dafny-version`, `node-version`, `go-version`. Outputs: `result` (`pass` or
+`diff-budget-seconds`, `diff-seed`, `diff-tier` (`ci` or `nightly`: input count, budget and steering from the
+tier in `forge.json`), `dafny-version`, `node-version`, `go-version`. Outputs: `result` (`pass` or
 `fail`) and `report` (a JSON file with every verdict). More in [docs/ci.md](docs/ci.md).
 
 `APPROVAL_CHANGED` means a person with the right to approve specs must review the change. To make this a lock,

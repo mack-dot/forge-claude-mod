@@ -33,6 +33,10 @@ inputs:
     description: "Time budget per diff entry, in seconds. The sweep stops at the input count or the budget, whichever comes first; the summary says when the budget cut it short."
     required: false
     default: "600"
+  diff-tier:
+    description: "\"ci\" or \"nightly\": take the sweep's input count, time budget and coverage-guided steering from the tier in .forge/forge.json \"fuzz.tiers\" (defaults: ci 100,000 inputs / 600 s, nightly 1,000,000 inputs / 3,600 s, both steered); diff-inputs and diff-budget-seconds are then ignored. Empty (default): diff-inputs and diff-budget-seconds, not steered."
+    required: false
+    default: ""
   diff-seed:
     description: "Seed for the sweep. Empty (default): the workflow run ID, so a re-run uses the same inputs. Printed in the summary."
     required: false
@@ -93,9 +97,10 @@ runs:
         FORGE_DIFF_INPUTS: ${{ inputs.diff-inputs }}
         FORGE_DIFF_BUDGET: ${{ inputs.diff-budget-seconds }}
         FORGE_DIFF_SEED: ${{ inputs.diff-seed }}
+        FORGE_DIFF_TIER: ${{ inputs.diff-tier }}
       run: |
         build="$FORGE_BUILD"; [ "$build" = "true" ] && build=auto
         diff="$FORGE_DIFF"; [ "$diff" = "true" ] && diff=auto
         python3 "$GITHUB_ACTION_PATH/cli/forge_ci.py" run --root "$FORGE_ROOT" --base "$FORGE_BASE" \
           --build "$build" --invariants "$FORGE_INVARIANTS" --diff "$diff" \
-          --inputs "$FORGE_DIFF_INPUTS" --budget-s "$FORGE_DIFF_BUDGET" --seed "$FORGE_DIFF_SEED"
+          --inputs "$FORGE_DIFF_INPUTS" --budget-s "$FORGE_DIFF_BUDGET" --seed "$FORGE_DIFF_SEED" --tier "$FORGE_DIFF_TIER"
