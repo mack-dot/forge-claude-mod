@@ -1595,7 +1595,7 @@ def project_files(root):
 
 
 def described_files(root, c):
-    """Code a decision record talks about: file paths it names (`gate.ts`, `src/x.py:47`) and functions it names in
+    """Code a decision record talks about: file paths it names (`policy.ts`, `src/x.py:47`) and functions it names in
     backticks, found by a definition (function / def / func / fn / class / const …). The check's own contract and
     proved files are left out. A heuristic: it finds what the record names, not what it means."""
     rel = c.get('decisions')
@@ -1697,7 +1697,7 @@ def write_json(root, rel, value):
 # A proof covers the proved function only. Code elsewhere that decides the same question itself (reads the same
 # field, repeats the same comparison) goes AROUND the rule. `bypass` searches the project for the check's
 # "watchedFields" outside the rule's own files and reports every place the person has not reviewed yet.
-# LIMIT: a text search per line, not a data-flow analysis. It misses aliases (`const f = body.for`), dynamic
+# LIMIT: a text search per line, not a data-flow analysis. It misses aliases (`const f = body.owner`), dynamic
 # access (`body[key]`), terms split over lines, and code that decides the same question under other names.
 
 LAST_BYPASS = DIR + '/last-bypass.json'
