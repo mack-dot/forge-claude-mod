@@ -8,6 +8,10 @@
       connection open with the body unread: the body bytes were parsed as the next request.
   C4  The model endpoint had no socket read timeout and no connection cap (the MCP endpoint has both, F1):
       idle or slow connections held one thread each without bound, in the process that also runs the gates.
+  S1  stdio reader: no line-length limit (HTTP has MAX_RESPONSE). S2  stdio: a failed stdin write left its
+      waiting slot. S3  HTTP: a failed notifications/initialized left the new session open upstream.
+  S4  LLMGate.settle: an OSError on the session log skipped the day log. S5  listen-side sessions: no idle
+      expiry, and LRU eviction could drop a session with a request in flight.
 
 In-process servers only (stdlib). Run: python3 airlock/tests/concurrency_regress.py"""
 import http.server
@@ -250,9 +254,190 @@ def case_c4():
     return out
 
 
+# ---------------------------------------------------------------- S1 to S5 (the review's suspicions, now tested)
+STDIO_UP = r"""
+import json, sys
+big = int(sys.argv[1])
+for line in sys.stdin:
+    m = json.loads(line)
+    if "id" not in m:
+        continue
+    if m["method"] == "initialize":
+        r = {"protocolVersion": "2025-06-18"}
+    elif m["method"] == "tools/list":
+        r = {"tools": []}
+    elif m["params"]["arguments"].get("big"):
+        r = {"content": [{"type": "text", "text": "x" * big}]}
+    else:
+        r = {"content": []}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r}) + "\n")
+    sys.stdout.flush()
+"""
+
+
+def _stdio(tmp, big):
+    path = os.path.join(tmp, "stdio_up.py")
+    with open(path, "w") as f:
+        f.write(STDIO_UP)
+    up, _ = M.connect({"transport": "stdio", "name": "s", "command": [sys.executable, "-I", path, str(big)],
+                       "timeout_s": 5})
+    return up
+
+
+def case_s1():
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    old = M.MAX_RESPONSE
+    M.MAX_RESPONSE = 1 << 16  # 64 KiB for the test; the default is 8 MiB
+    try:
+        up = _stdio(tmp, 1 << 18)  # a 256 KiB answer line
+        got = _err(lambda: up.request("tools/call", {"name": "x", "arguments": {"big": True}}))
+        time.sleep(0.3)
+        dead = up.proc.poll() is not None
+        up.kill()
+        return [("S1 stdio client: an answer line over MAX_RESPONSE is an UpstreamError and the upstream is "
+                 "stopped (restarted by the next call, like a crash)", got.startswith("UpstreamError") and dead,
+                 (got, dead))]
+    finally:
+        M.MAX_RESPONSE = old
+
+
+def case_s2():
+    import tempfile
+    up = _stdio(tempfile.mkdtemp(), 10)
+    up.kill()
+    time.sleep(0.2)
+    got = [_err(lambda: up.request("tools/call", {"name": "x", "arguments": {}})) for _ in range(20)]
+    with up._plock:
+        left = len(up._pending)
+    return [("S2 stdio client: 20 failed writes to a dead upstream are UpstreamErrors and leave no waiting slot",
+             left == 0 and all(g.startswith("UpstreamError") for g in got), (left, got[0]))]
+
+
+class InitUp:
+    """MCP upstream that answers initialize with a session, rejects notifications/initialized (500) and records
+    every DELETE."""
+
+    def __init__(self):
+        self.deletes, self.inits = [], 0
+        up = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, obj=None, headers=None):
+                body = b"" if obj is None else json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                for k, v in (headers or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_DELETE(self):
+                up.deletes.append(self.headers.get("mcp-session-id"))
+                self._send(200)
+
+            def do_POST(self):
+                msg = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))))
+                if msg.get("method") == "initialize":
+                    up.inits += 1
+                    return self._send(200, {"jsonrpc": "2.0", "id": msg["id"], "result": {
+                        "protocolVersion": "2025-06-18"}}, {"mcp-session-id": "s%d" % up.inits})
+                return self._send(500, {"error": "no"})
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.srv.daemon_threads = True
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.url = "http://127.0.0.1:%d/mcp" % self.srv.server_address[1]
+
+
+def case_s3():
+    up = InitUp()
+    try:
+        c = M.HttpUpstream("t", up.url, timeout_s=2)
+        first = _err(lambda: c.request("initialize", INIT))
+        return [("S3 http client: a failed notifications/initialized ends the new session (DELETE) and leaves "
+                 "no session id set", first.startswith("UpstreamError") and up.deletes == ["s1"]
+                 and c.session is None, (first, up.deletes, c.session))]
+    finally:
+        up.srv.shutdown()
+        up.srv.server_close()
+
+
+def case_s4():
+    import tempfile
+    d = tempfile.mkdtemp()
+    g = L.LLMGate({"session_cap": 1000, "daily_cap": 1000, "unit": "tokens"}, d, "s4")
+    rid = os.urandom(16)
+    logs, why = g.reserve(rid, 100, {})
+    day = logs[1]
+
+    def broken(*a, **k):
+        raise OSError("injected: disk full")
+
+    g.session.settle = broken
+    try:
+        st = g.settle(logs, rid, 10, "usage")
+        raised = None
+    except OSError as e:
+        st, raised = None, str(e)
+    del g.session.settle
+    day_open, sess_open = rid.hex() in day.open, rid.hex() in g.session.open
+    g2 = L.LLMGate({"session_cap": 1000, "daily_cap": 1000, "unit": "tokens"}, d, "s4")  # restart
+    return [("S4 llm gate: an OSError while settling the session log still settles the day log; the session "
+             "reservation stays counted", not day_open and sess_open and day.gross() == 10, (st, raised, day_open,
+                                                                                            day.gross())),
+            ("S4 llm gate: after a restart the session reservation is settled as spent (never undercounted)",
+             g2.session.gross() == 100 and not g2.session.open, g2.session.gross())]
+
+
+def case_s5():
+    import gateway as G
+    out = []
+    old = (G.MAX_SESSIONS, getattr(G, "SESSION_IDLE_S", None))
+    try:
+        A = G.Airlock.__new__(G.Airlock)
+        G.SESSION_IDLE_S = 0.3
+        s = A.new_session()
+        time.sleep(0.5)
+        out.append(("S5 listen sessions: a session idle past FORGE_SESSION_IDLE_S is ended (404)",
+                    not A.touch_session(s)))
+        G.SESSION_IDLE_S = 3600
+        rel = getattr(A, "release_session", lambda sid: None)
+        A = G.Airlock.__new__(G.Airlock)
+        G.MAX_SESSIONS = 2
+        s1 = A.new_session()
+        s2 = A.new_session()
+        A.touch_session(s1)              # a long request on s1 starts (in flight) ...
+        time.sleep(0.01)
+        A.touch_session(s2)
+        rel(s2)                          # ... s2 is used and done, so s1 is the least recently used
+        A.new_session()                  # the table is full: one must go
+        alive = A.touch_session(s1)
+        out.append(("S5 listen sessions: eviction never drops a session with a request in flight", alive))
+        rel(s1)
+        rel(s1)
+        A = G.Airlock.__new__(G.Airlock)
+        a, b = A.new_session(), A.new_session()
+        A.touch_session(a)
+        A.touch_session(b)
+        out.append(("S5 listen sessions: when every session is in flight, a new session is refused (None)",
+                    A.new_session() is None))
+    finally:
+        G.MAX_SESSIONS = old[0]
+        if old[1] is not None:
+            G.SESSION_IDLE_S = old[1]
+    return out
+
+
 def cases():
     out = []
-    for f in (case_c1, case_c2, case_c3, case_c4):
+    for f in (case_c1, case_c2, case_c3, case_c4, case_s1, case_s2, case_s3, case_s4, case_s5):
         try:
             out.extend(f())
         except Exception as e:  # noqa: BLE001

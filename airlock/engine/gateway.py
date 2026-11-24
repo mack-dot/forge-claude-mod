@@ -38,7 +38,8 @@ MAX_BODY = 1 << 20
 READ_TIMEOUT_S = float(os.environ.get("FORGE_READ_TIMEOUT_S", "30"))  # F1: per socket read
 MAX_CONN = int(os.environ.get("FORGE_MAX_CONN", "256"))  # F1: concurrent connections (threads)
 TOKEN_HEADER = "x-forge-canary-token"  # F7
-MAX_SESSIONS = int(os.environ.get("FORGE_MAX_SESSIONS", "256"))  # listen side, least recently used dropped
+MAX_SESSIONS = int(os.environ.get("FORGE_MAX_SESSIONS", "256"))  # listen side, least recently used idle one dropped
+SESSION_IDLE_S = float(os.environ.get("FORGE_SESSION_IDLE_S", "1800"))  # S5: idle sessions end (404) after this
 SESSIONS_LOCK = threading.Lock()
 ALLOWED_ORIGINS = [x for x in os.environ.get("FORGE_ALLOWED_ORIGINS", "").split(",") if x]
 
@@ -364,22 +365,47 @@ class Airlock:
         with SESSIONS_LOCK:
             return self.__dict__.setdefault("sessions", {})
 
+    # S5: sid -> [last use (monotonic), requests in flight]. A session idle for SESSION_IDLE_S ends (the
+    # client gets 404 and initializes again). When the table is full, the least recently used session with
+    # no request in flight is dropped; if every session has a request in flight, no new session is made.
+    def _expire(self, sess, now):
+        for k in [k for k, (t, n) in sess.items() if n == 0 and now - t > SESSION_IDLE_S]:
+            del sess[k]
+
     def new_session(self):
         sid = secrets.token_urlsafe(24)
         sess = self._sessions()
         with SESSIONS_LOCK:
-            if len(sess) >= MAX_SESSIONS:  # drop the least recently used
-                del sess[min(sess, key=sess.get)]
-            sess[sid] = time.monotonic()
+            now = time.monotonic()
+            self._expire(sess, now)
+            if len(sess) >= MAX_SESSIONS:
+                idle = [k for k, (t, n) in sess.items() if n == 0]
+                if not idle:
+                    return None
+                del sess[min(idle, key=lambda k: sess[k][0])]
+            sess[sid] = [now, 0]
         return sid
 
     def touch_session(self, sid):
+        """True if sid is a live session; then one request is in flight on it until release_session(sid)."""
         sess = self._sessions()
         with SESSIONS_LOCK:
-            if sid not in sess:
+            now = time.monotonic()
+            e = sess.get(sid)
+            if e is None:
                 return False
-            sess[sid] = time.monotonic()
+            if e[1] == 0 and now - e[0] > SESSION_IDLE_S:
+                del sess[sid]
+                return False
+            e[0], e[1] = now, e[1] + 1
             return True
+
+    def release_session(self, sid):
+        sess = self._sessions()
+        with SESSIONS_LOCK:
+            e = sess.get(sid)
+            if e is not None:
+                e[0], e[1] = time.monotonic(), max(0, e[1] - 1)
 
     def end_session(self, sid):
         sess = self._sessions()
@@ -580,13 +606,27 @@ class Handler(BaseHTTPRequestHandler):
                                     "error": {"code": -32600, "message": "batches are not supported"}})
         mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
         pname = clip(params.get("name")) if isinstance(params, dict) else clip(type(params).__name__)
-        sid, hdrs = self.headers.get("mcp-session-id"), {}
+        sid, hdrs, held = self.headers.get("mcp-session-id"), {}, None
         if method == "initialize" and mid is not None:
-            hdrs["mcp-session-id"] = A.new_session()
+            new = A.new_session()
+            if new is None:
+                return self._send(503, {"jsonrpc": "2.0", "id": mid if isinstance(mid, (int, str)) else None,
+                                        "error": {"code": -32001, "message": "every session has a request in "
+                                                  "flight; try again"}})
+            hdrs["mcp-session-id"] = new
         elif sid is not None and not A.touch_session(sid):
             return self._send(404, {"jsonrpc": "2.0", "id": mid if isinstance(mid, (int, str)) else None,
                                     "error": {"code": -32001, "message": "unknown or ended Mcp-Session-Id; "
                                               "send initialize for a new session"}})
+        else:
+            held = sid
+        try:
+            return self._mcp(A, msg, mid, method, params, pname, hdrs)
+        finally:
+            if held is not None:
+                A.release_session(held)
+
+    def _mcp(self, A, msg, mid, method, params, pname, hdrs):
         if mid is None or "method" not in msg:  # notification, or a client response: accepted
             return self._empty(202)
         try:

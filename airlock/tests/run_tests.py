@@ -662,7 +662,7 @@ def test_mcp_client():
 
 
 def test_concurrency():
-    """Review findings C1 to C4: session id read once, body read errors, llm endpoint framing / timeout / cap."""
+    """Review findings C1 to C4 and S1 to S5 (tests/concurrency_regress.py)."""
     sys.path.insert(0, HERE)
     import concurrency_regress
     for name, ok, *detail in concurrency_regress.cases():

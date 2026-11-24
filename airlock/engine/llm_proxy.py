@@ -278,7 +278,20 @@ class LLMGate:
         return done, None
 
     def settle(self, logs, rid, actual, note):
-        return [lg.settle(rid, actual, note) for lg in logs]
+        """S4: each log is settled on its own. An OSError in one log (disk full, I/O error) does not stop the
+        others. Fail closed, never undercounted: the failing log keeps the reservation open and counted in
+        memory (if the step reached the log before the error, it is counted twice until the restart), and its
+        .llm.jsonl still says PENDING, so the restart settles it (_recover: COMMITTED if the step is in the
+        log, else the FULL reservation as spent)."""
+        out = []
+        for lg in logs:
+            try:
+                out.append(lg.settle(rid, actual, note))
+            except OSError as e:
+                print(f"[airlock] llm log {lg.name}: settle failed ({type(e).__name__}: {str(e)[:120]}); "
+                      "the reservation stays counted and is settled as spent at restart", flush=True)
+                out.append("SETTLE_ERROR")
+        return out
 
     def status(self):
         out = {"unit": self.cfg["unit"], "session": self.session.status()}

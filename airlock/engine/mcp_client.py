@@ -43,7 +43,17 @@ class StdioUpstream:
     def _reader(self):
         # F6: a line that is not a JSON object with a usable id (a log line, a batch, a bare
         # number, NaN) is skipped; the reader never dies while the process lives.
-        for line in self.proc.stdout:
+        # S1: a line longer than MAX_RESPONSE (the HTTP limit) is not read on: the upstream is stopped
+        # like a crash (every waiter gets an UpstreamError; _live_upstream restarts it for the next call).
+        why = "upstream exited"
+        while True:
+            line = self.proc.stdout.readline(MAX_RESPONSE + 1)
+            if not line:
+                break
+            if len(line) > MAX_RESPONSE:
+                why = f"upstream answer line over {MAX_RESPONSE} bytes; upstream stopped"
+                self.kill()
+                break
             try:
                 msg = strict_loads(line)
             except (ValueError, RecursionError):
@@ -60,7 +70,7 @@ class StdioUpstream:
                 slot[0].set()
         with self._plock:  # upstream exited: wake every waiter with an error
             for slot in self._pending.values():
-                slot[1] = {"error": {"code": -32000, "message": "upstream exited"}}
+                slot[1] = {"error": {"code": -32000, "message": why}}
                 slot[0].set()
             self._pending.clear()
 
@@ -81,6 +91,8 @@ class StdioUpstream:
                                                   "params": params or {}}, allow_nan=False) + "\n")
                 self.proc.stdin.flush()
         except (OSError, ValueError) as e:
+            with self._plock:  # S2: no slot is left waiting for an answer that cannot come
+                self._pending.pop(mid, None)
             raise UpstreamError(f"{self.name}: write failed: {e}") from None
         if not slot[0].wait(timeout or self.timeout):
             with self._plock:
@@ -307,12 +319,20 @@ class HttpUpstream:
     # -- MCP
     def _initialize(self, params, timeout):
         msg = self._post({"jsonrpc": "2.0", "id": next(self._ids), "method": "initialize", "params": params}, timeout)
-        res = _result(self.name, msg or {"error": {"message": "empty initialize response"}})
-        v = res.get("protocolVersion") if isinstance(res, dict) else None
-        if v not in SUPPORTED:
-            raise UpstreamError(f"{self.name}: upstream protocol version {str(v)[:30]!r} is not one of {SUPPORTED}")
-        self.version = v
-        self._post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, timeout)
+        try:
+            res = _result(self.name, msg or {"error": {"message": "empty initialize response"}})
+            v = res.get("protocolVersion") if isinstance(res, dict) else None
+            if v not in SUPPORTED:
+                raise UpstreamError(f"{self.name}: upstream protocol version {str(v)[:30]!r} is not one of {SUPPORTED}")
+            self.version = v
+            self._post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, timeout)
+        except BaseException:
+            # S3: the session this initialize opened is not usable; end it (best effort) so that a retry does
+            # not leave it open on the upstream. the next call initializes again.
+            with self._lock:
+                opened, self.session, self._need_init = self.session, None, True
+            self._delete(opened)
+            raise
         with self._lock:
             self._need_init = False
         return res
@@ -342,16 +362,19 @@ class HttpUpstream:
 
     def close(self):
         """End the session (DELETE). Errors are ignored (405 = the server keeps no sessions)."""
-        if self.session is None:
+        self._delete(self.session)
+        self.session = None
+
+    def _delete(self, session):
+        if session is None:
             return
         try:
             c = self._fresh(2)
-            c.request("DELETE", self._path, headers=self._headers())
+            c.request("DELETE", self._path, headers=self._headers(session))
             _drain(c.getresponse())
             c.close()
         except (OSError, http.client.HTTPException):
             pass
-        self.session = None
 
 
 def _readable(sock):
