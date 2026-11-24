@@ -72,6 +72,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -234,6 +235,13 @@ def load_config(root):
             inside(root, df['inputs'])
             if df.get('adapter'):
                 inside(root, df['adapter'])
+            if df.get('trace') is not None:
+                sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                import forge_trace
+                try:
+                    forge_trace.options(df['trace'])
+                except ValueError as e:
+                    raise ConfigError('check %s: %s' % (c['name'], e))
     return cfg
 
 
@@ -248,8 +256,35 @@ def contract_extras(c):
     return [c[k] for k in ('examples', 'decisions') if c.get(k)]
 
 
-def contract_files(c):
-    return [c['spec']] + contract_extras(c)
+def spec_includes(root, c):
+    """The Dafny files the spec includes, directly or not (project-relative, without the spec). They are part of
+    what the spec means, so an approval covers them too (before 0.13.1 a change in an included file left the
+    approved spec's hash unchanged and gave no SPEC_CHANGED)."""
+    try:
+        return sorted(f for f in include_closure(root, [c['spec']]) if os.path.normpath(f) != os.path.normpath(c['spec']))
+    except ConfigError:
+        return []
+
+
+def contract_files(c, root=None):
+    """What an approval of this check covers: the spec, the files the spec includes (when root is given), and the
+    person's answers."""
+    return [c['spec']] + (spec_includes(root, c) if root else []) + contract_extras(c)
+
+
+def build_sources(root, c):
+    """The files whose hashes the build manifest records: the spec, the check's Dafny files and every file they
+    include (an unlisted included file changes the emitted code too)."""
+    try:
+        extra = include_closure(root, [c['spec']] + c['files'])
+    except ConfigError:
+        extra = []
+    seen = []
+    for f in [c['spec']] + c['files'] + sorted(extra):
+        f = os.path.normpath(f).replace(os.sep, '/')
+        if f not in seen:
+            seen.append(f)
+    return seen
 
 
 def cache_dir():
@@ -446,8 +481,8 @@ def trust_anchor(root, base, signers_arg):
                   'FORGE_ALLOWED_SIGNERS, or run with --base GIT_REF (CI)')
 
 
-def covered_files(cfg):
-    keys = [CONFIG] + sorted({f for c in cfg['checks'] for f in contract_files(c)})
+def covered_files(cfg, root=None):
+    keys = [CONFIG] + sorted({f for c in cfg['checks'] for f in contract_files(c, root)})
     return keys + [r for r in signed_extras(cfg) if r not in keys]
 
 
@@ -473,7 +508,7 @@ def signature_problem(root, cfg, base, signers_arg):
     if allowed and ktype not in allowed:
         return 'the approval is signed with a %s key; forge.json allows only %s' % (ktype, ', '.join(allowed))
     bad = []
-    for rel in covered_files(cfg):
+    for rel in covered_files(cfg, root):
         p = inside(root, rel)
         if not os.path.isfile(p):
             bad.append(rel + ' (missing)')
@@ -540,7 +575,7 @@ def run_checks(root, base=None, signers_arg=None, signed=True):
     config_ok = approved.get(CONFIG) == sha256(os.path.join(root, CONFIG))
     approval_changed = []
     if base:
-        protected = [CONFIG, APPROVED] + sorted({f for c in cfg['checks'] for f in contract_files(c)})
+        protected = [CONFIG, APPROVED] + sorted({f for c in cfg['checks'] for f in contract_files(c, root)})
         if signed and signing_required(root, cfg, base, signers_arg):
             protected += [SIG] + [r for r in signed_extras(cfg) if r not in protected]
         approval_changed = changed_since(root, base, protected)
@@ -570,15 +605,15 @@ def run_checks(root, base=None, signers_arg=None, signed=True):
         if not os.path.isfile(spec_path):
             put('ERROR', 'spec file %s is missing' % spec)
             continue
-        missing_contract = [f for f in contract_files(c) if not os.path.isfile(inside(root, f))]
+        missing_contract = [f for f in contract_files(c, root) if not os.path.isfile(inside(root, f))]
         if missing_contract:
             put('ERROR', 'missing contract file(s): ' + ', '.join(missing_contract))
             continue
-        unapproved = [f for f in contract_files(c) if f not in approved]
+        unapproved = [f for f in contract_files(c, root) if f not in approved]
         if unapproved:
             put('NOT_APPROVED', '%s never approved. Read and approve.' % ', '.join(unapproved))
             continue
-        changed = [f for f in contract_files(c) if not approved_matches(approved, f, inside(root, f))]
+        changed = [f for f in contract_files(c, root) if not approved_matches(approved, f, inside(root, f))]
         if changed:
             put('SPEC_CHANGED', '%s changed after approval. Read the new version and approve it.'
                 % ', '.join(changed))
@@ -1042,7 +1077,7 @@ def run_build(root, check_only):
                     'check': c['name'],
                     'labels': 'Dafny model: PROVED. This emitted code: NATIVE CHECK (unverified compiler). '
                               'Fuzz run: FINITE TEST.',
-                    'sources': {f: sha256(inside(root, f)) for f in [c['spec']] + c['files']},
+                    'sources': {f: sha256(inside(root, f)) for f in build_sources(root, c)},
                     'targets': b['targets'],
                 }
                 dest = os.path.join(inside(root, c['build']['out']), c['name'])
@@ -1158,7 +1193,7 @@ def build_is_fresh(root, c):
     if not os.path.isfile(manifest):
         return False
     sources = (read_json(manifest, {}) or {}).get('sources', {})
-    want = [c['spec']] + c['files']
+    want = build_sources(root, c)
     return sorted(sources) == sorted(want) and all(sources[f] == sha256(inside(root, f)) for f in want)
 
 
@@ -1236,9 +1271,16 @@ def run_diff(root, inputs=None, budget_ms=None, seed=None, coverage=False, only=
             import forge_coverage
             cov = forge_coverage.Session(df['lang'], root, df.get('watch'))
             cmd, env = cov.wrap(cmd, env)
-        data = forge_diff.run_entry(cmd, root, env, inside(root, df['inputs']), s, n, ms,
-                                    os.path.join(root, REGRESSIONS, key.replace(':', '-')),
-                                    messy=df.get('messy', True) is not False)
+        if df.get('trace') is not None:
+            import forge_trace
+            data = forge_trace.run_trace_entry(cmd, root, env, inside(root, df['inputs']), s, df['trace'],
+                                               os.path.join(root, REGRESSIONS, key.replace(':', '-')),
+                                               count=inputs, budget_ms=budget_ms)
+        else:
+            data = forge_diff.run_entry(cmd, root, env, inside(root, df['inputs']), s, n, ms,
+                                        os.path.join(root, REGRESSIONS, key.replace(':', '-')),
+                                        messy=df.get('messy', True) is not False)
+        data['repro'] = [sys.executable, os.path.abspath(__file__), 'diff', '--root', root, '--seed', str(s)]
         res.update(data)
         if cov:
             res['coverage'] = cov.collect()
@@ -1302,6 +1344,11 @@ def diff_report(out):
     lines = []
     for name, r in out['checks'].items():
         v = r['verdict']
+        if r.get('mode') == 'trace' and v in ('DIFF_OK', 'DISAGREE'):
+            import forge_trace
+            base = ' '.join(shlex.quote(x) for x in r.get('repro') or [])
+            lines += forge_trace.report_lines(name, r, lambda k: '%s --inputs %d' % (base, k))
+            continue
         dec = r.get('decisions') or {}
         dec_line = ('  your recorded decisions: %d of %d agree%s' % (
             dec['agree'], dec['total'], '; failing: ' + ', '.join('%s (%s)' % (f['id'], ', '.join(f['candidates']))
@@ -1383,7 +1430,7 @@ def invariants_text(root):
     rows, sections = [], []
     for c in cfg['checks']:
         name = c['name']
-        files = contract_files(c)
+        files = contract_files(c, root)
         state = []
         for f in files:
             p = inside(root, f)
@@ -1513,6 +1560,11 @@ def config_digest(cfg):
     return '\n'.join(lines)
 
 
+def contract_kind(c, rel):
+    return ('spec' if rel == c['spec'] else 'your answers' if rel == c.get('examples')
+            else 'decision record' if rel == c.get('decisions') else 'file the spec includes')
+
+
 def show_specs(root, full=False):
     """Text of what an approval covers, and the hashes of exactly the files it covers. By default a digest for
     reading (every spec clause complete, every answer, the whole decision record); full=True prints every file."""
@@ -1529,7 +1581,7 @@ def show_specs(root, full=False):
     parts = ['=== which code is checked against which spec: %s (%s) ===\n%s'
              % (CONFIG, state(CONFIG), json.dumps(cfg, indent=2) if full else config_digest(cfg))]
     for c in cfg['checks']:
-        for rel in contract_files(c):
+        for rel in contract_files(c, root):
             if rel in hashes:
                 continue
             hashes[rel] = contract_hash(inside(root, rel))
@@ -1539,8 +1591,7 @@ def show_specs(root, full=False):
             if not full and state(rel) == 'approved':
                 # Already approved and unchanged: one line, so the screen shows only what is new.
                 parts.append('=== %s %s: %s (approved, unchanged, sha256 %s…) ===' % (
-                    c['name'], 'spec' if rel == c['spec'] else 'your answers' if rel == c.get('examples')
-                    else 'decision record', rel, hashes[rel][:12]))
+                    c['name'], contract_kind(c, rel), rel, hashes[rel][:12]))
                 continue
             if not full and rel == c['spec']:
                 body = spec_digest(body)
@@ -1549,7 +1600,7 @@ def show_specs(root, full=False):
                 body = ('%d answers written as Dafny asserts (%s); each must follow from the spec, or check fails with '
                         'EXAMPLES_FAILED.' % (len(set(ids)), ', '.join(sorted(set(ids), key=lambda x: (len(x), x))))
                         if ids else body)
-            kind = 'spec' if rel == c['spec'] else 'your answers' if rel == c.get('examples') else 'decision record'
+            kind = contract_kind(c, rel)
             parts.append('=== %s %s: %s (%s, sha256 %s…) ===\n%s'
                          % (c['name'], kind, rel, state(rel), hashes[rel][:12], body))
     if cfg.get('require_signed_approval'):
@@ -1605,7 +1656,7 @@ def described_files(root, c):
 
 
 def refs_in_text(root, c, text):
-    own = set(contract_files(c) + [c['spec']] + c['files'] + [CONFIG])
+    own = set(contract_files(c, root) + [c['spec']] + c['files'] + [CONFIG])
     out_dir = (c.get('build') or {}).get('out')
     found = set()
     for m in _PATHLIKE.finditer(text):
@@ -1671,6 +1722,14 @@ def next_rules(root, cfg):
     path), as the suggested next rule. The record lists what the rule assumes; proving one of those assumptions
     closes a gap the proof depends on. A heuristic over the person's own words."""
     out = {}
+    # A name that another check's record states as its subject (outside its Out of scope and Notes) is covered by
+    # that check: once a second rule proves `walk_thread()`, the first rule no longer offers it as the next rule.
+    covered = {}
+    for c in cfg['checks']:
+        rel = c.get('decisions')
+        if rel and os.path.isfile(inside(root, rel)):
+            for m in _IDENT.finditer(normative_text(read_text(inside(root, rel)))):
+                covered.setdefault(m.group(1), set()).add(c['name'])
     for c in cfg['checks']:
         rel = c.get('decisions')
         if not rel or not os.path.isfile(inside(root, rel)):
@@ -1678,6 +1737,9 @@ def next_rules(root, cfg):
         for line in _section(read_text(inside(root, rel)), 'Out of scope').split('\n'):
             item = line.strip().lstrip('-*').strip()
             if not item:
+                continue
+            subject = _IDENT.search(item)
+            if subject and covered.get(subject.group(1), set()) - {c['name']}:
                 continue
             refs = sorted(refs_in_text(root, c, item))
             if refs:
@@ -1697,8 +1759,10 @@ def write_json(root, rel, value):
 # A proof covers the proved function only. Code elsewhere that decides the same question itself (reads the same
 # field, repeats the same comparison) goes AROUND the rule. `bypass` searches the project for the check's
 # "watchedFields" outside the rule's own files and reports every place the person has not reviewed yet.
-# LIMIT: a text search per line, not a data-flow analysis. It misses aliases (`const f = body.owner`), dynamic
-# access (`body[key]`), terms split over lines, and code that decides the same question under other names.
+# In TS/JS and Python files a hit counts only where the field is READ in a decision (cli/forge_ast.py: an AST
+# search); other languages, and files that do not parse, keep the text search per line (fail closed).
+# LIMIT: not a data-flow analysis. It misses values passed to another function or returned, dynamic access
+# (`body[key]`), terms split over lines, and code that decides the same question under other names.
 
 LAST_BYPASS = DIR + '/last-bypass.json'
 BYPASS_SKIP_DIRS = {'.git', 'node_modules', 'dist', 'build', 'verified', DIR, 'vendor', 'third_party',
@@ -1837,7 +1901,7 @@ def scope_matchers(c):
 
 def rule_own_files(root, cfg, c):
     """Project-relative files (and folders, ending in /) that belong to the rule itself: never reported."""
-    files = set(contract_files(c)) | set(c['files'])
+    files = set(contract_files(c, root)) | set(c['files'])
     bd = c.get('build') or {}
     if bd.get('fuzz'):
         files.add(bd['fuzz'])
@@ -1872,39 +1936,72 @@ def run_bypass(root, override=None):
     out['no_terms'] = [c['name'] for c in cfg['checks'] if not c.get('watchedFields')]
     files = project_files(root) if with_terms else []
     cache = {}
+    decisions = _decisions_for(root, cfg, with_terms, files, cache)
     for c in with_terms:
         matchers = scope_matchers(c)
         own = rule_own_files(root, cfg, c)
         watched = {w for d in diff_entries(c) for w in d.get('watch') or []}
         reviewed = c.get('allowedBypasses') or []
         res = out['checks'][c['name']] = {'terms': [t for t, _ in matchers], 'hits': [], 'reviewed': 0,
-                                          'outdated_reviews': [], 'files_searched': 0}
+                                          'outdated_reviews': [], 'files_searched': 0, 'not_decisions': []}
+        searched = []
         used = set()
         for rel in files:
             if rel in own or any(o.endswith('/') and rel.startswith(o) for o in own):
                 continue
             res['files_searched'] += 1
-            if rel not in cache:
-                cache[rel] = read_text(os.path.join(root, rel)).replace('\r\n', '\n').split('\n')
-            lines = cache[rel]
+            searched.append(rel)
+            lines = _lines(root, rel, cache)
+            start = 0
             for i, text in enumerate(lines):
+                line_start, start = start, start + len(text) + 1
                 terms = [t for t, rx in matchers if rx.search(text)]
                 if not terms:
                     continue
                 h = line_sha(text)
                 match = [k for k, e in enumerate(reviewed) if e['file'] == rel and e['line_text_sha256'] == h]
-                if match:
+                if match:  # an approved line stays allowed, whether or not it is a decision read
                     used.update(match)
                     res['reviewed'] += 1
                     continue
-                res['hits'].append({'file': rel, 'line': i + 1, 'terms': terms, 'text': text.strip()[:200],
-                                    'function': enclosing_function(lines, i, rel), 'line_text_sha256': h,
-                                    'fuzzed_file': rel in watched})
+                hit, kind, method, reason = decisions.classify(rel, line_start, text,
+                                                               [rx for t, rx in matchers if t in terms])
+                entry = {'file': rel, 'line': i + 1, 'terms': terms, 'text': text.strip()[:200]}
+                if not hit:  # in a TS/JS/Python file that parsed, the field is not read in a decision here
+                    res['not_decisions'].append(entry)
+                    continue
+                entry.update({'function': enclosing_function(lines, i, rel), 'line_text_sha256': h,
+                              'fuzzed_file': rel in watched, 'decision': kind, 'method': method})
+                if reason:
+                    entry['fallback'] = reason
+                res['hits'].append(entry)
         res['outdated_reviews'] = [e for k, e in enumerate(reviewed) if k not in used]
+        res['search'] = decisions.summary(searched)
     k = sum(len(r['hits']) for r in out['checks'].values())
     out['unreviewed'] = k
     out['verdict'] = 'NO_SCOPE_TERMS' if not with_terms else 'BYPASS_FOUND' if k else 'BYPASS_CLEAR'
     return out
+
+
+def _lines(root, rel, cache):
+    if rel not in cache:
+        cache[rel] = read_text(os.path.join(root, rel)).replace('\r\n', '\n').split('\n')
+    return cache[rel]
+
+
+def _decisions_for(root, cfg, checks, files, cache):
+    """Parses (cli/forge_ast.py) every TS/JS/Python file with a text hit of any watched field, once per run."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import forge_ast
+    rxs = [rx for c in checks for _, rx in scope_matchers(c)]
+    texts = {}
+    for rel in files:
+        lines = _lines(root, rel, cache)
+        if any(rx.search(t) for t in lines for rx in rxs):
+            texts[rel] = '\n'.join(lines)
+    d = forge_ast.Decisions()
+    d.prime(texts)
+    return d
 
 
 def outside_of(root):
@@ -1914,7 +2011,8 @@ def outside_of(root):
     except Exception as e:  # the search must never crash `check`; checks with watchedFields fail closed (main)
         return {}, '%s: %s' % (type(e).__name__, e)
     return ({name: [{'file': h['file'], 'line': h['line'], 'function': h['function'], 'term': h['terms'][0],
-                     'text': h['text']} for h in r['hits']] for name, r in out['checks'].items()}, None)
+                     'text': h['text'], 'decision': h['decision'] or 'text search, not AST'} for h in r['hits']]
+             for name, r in out['checks'].items()}, None)
 
 
 def outside_lines(outside):
@@ -1955,9 +2053,10 @@ def gate_bypass(result, outside, error):
             result['detail'][name] = ('the proof passed, but %d place(s) outside the rule use its watchedFields and are '
                                       'not in its approved allowedBypasses:\n%s\nRoute each through the proved rule, '
                                       'or allow it (/forge:bypass) and approve forge.json again.' % (
-                                          len(hits), '\n'.join('  %s:%d%s  [%s]  %s' % (
+                                          len(hits), '\n'.join('  %s:%d%s  [%s]  (%s)  %s' % (
                                               h['file'], h['line'], '  in ' + h['function'] if h['function'] else '',
-                                              h['term'], h['text']) for h in hits[:40])
+                                              h['term'], h.get('decision') or 'text search, not AST', h['text'])
+                                              for h in hits[:40])
                                           + ('\n  … and %d more (forge_check.py bypass)' % (len(hits) - 40) if len(hits) > 40 else '')))
 
 
@@ -1971,10 +2070,16 @@ def bypass_report(out):
     for name, r in out['checks'].items():
         lines.append('  %s: %d file(s) searched for %s; %d hit(s), %d allowed (allowedBypasses)' % (
             name, r['files_searched'], ', '.join(r['terms']), len(r['hits']) + r['reviewed'], r['reviewed']))
+        se = r.get('search') or {}
+        lines.append('    with a term: %d file(s) parsed (AST: TS/JS, Python), %d file(s) by text search, not AST '
+                     '(other languages, or a fallback below); %d text hit(s) are not decision reads (bypass --json '
+                     'lists them under "not_decisions")' % (se.get('ast', 0), se.get('text', 0), len(r['not_decisions'])))
+        for f in se.get('fallback') or []:
+            lines.append('    FALLBACK to text search, not AST: %s: %s' % (f['file'], f['reason']))
         for h in r['hits']:
-            lines.append('    %s:%d  %s[%s]%s  %s' % (h['file'], h['line'], 'in %s  ' % h['function'] if h['function'] else '',
-                                                    ', '.join(h['terms']), '  (a fuzzed file)' if h['fuzzed_file'] else '',
-                                                    h['text']))
+            lines.append('    %s:%d  %s[%s]  (%s)%s  %s' % (
+                h['file'], h['line'], 'in %s  ' % h['function'] if h['function'] else '', ', '.join(h['terms']),
+                h['decision'] or 'text search, not AST', '  (a fuzzed file)' if h['fuzzed_file'] else '', h['text']))
         for e in r['outdated_reviews']:
             lines.append('    outdated allowed bypass (the line changed or is gone): %s: %s' % (e['file'], e.get('note', '')))
     if out['no_terms']:
@@ -1985,8 +2090,10 @@ def bypass_report(out):
     if k:
         lines.append('Each place may decide the same question as the proved rule without going through it. '
                      '/forge:bypass explains each one and records your answer.')
-    lines.append('A text search (FINITE TEST of the listed terms): it misses aliases, dynamic field access and '
-                 'other names for the same question.')
+    lines.append('A syntactic search (FINITE TEST of the listed terms): in TS/JS and Python only decision reads count '
+                 '(conditions, comparisons, includes/in, ternary, switch/case, &&/|| guards, predicates, aliases); other '
+                 'files are a text search, not AST. It misses values passed to another function or returned, dynamic '
+                 'field access and other names for the same question.')
     return '\n'.join(lines)
 
 
@@ -2034,7 +2141,8 @@ def main(argv=None):
     p.add_argument('--hashes', help='approve: the hashes that `spec --json` printed; refused if any '
                                     'file changed since')
     p.add_argument('--max', type=int, default=40, help='mutate: at most this many mutants')
-    p.add_argument('--inputs', type=int, help='diff: at most this many random inputs (default from forge.json, 1500)')
+    p.add_argument('--inputs', type=int, help='diff: at most this many random inputs, or traces for a "trace" entry '
+                                             '(default from forge.json: 1500 inputs, 2000 traces)')
     p.add_argument('--budget-ms', type=int, help='diff: time budget per check in ms (default 1500)')
     p.add_argument('--seed', type=int, help='diff: random seed (default: a fresh one each run)')
     p.add_argument('--coverage', action='store_true', help='diff: also report the lines and branches of the watched '
