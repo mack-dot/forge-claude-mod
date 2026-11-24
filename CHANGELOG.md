@@ -2,6 +2,36 @@
 
 Each entry says what was tested and how. "Not tested" items are listed, not hidden.
 
+## Unreleased — recursive-rule acid test
+
+A recursive rule (a reply chain walked through a map by id, with cycles) taken through the whole Forge flow, on the
+owner's app copy and on a new synthetic fixture. Each item says what was tested and how.
+- **New fixture** `examples/thread-visibility` (synthetic, written for this repository): a thread whose replies share
+  the fate of every post above them (takedown, flag, other channel); the walk has a visited set, so a cycle ends it.
+  The Dafny model proves termination and the rule; `tests/run_tests.py` runs it with planted bugs that must be caught:
+  a cycle hang (DIFF_ERROR in seconds), a reply that ignores its parent chain (D1, D3, D4, D5 fail), a check of the
+  direct parent only (D3 fails), a Dafny walk without its visited set and a Dafny model without the ancestors
+  (FAILED). Negative control: the correct code gives DIFF_OK with 9 of 9 decisions.
+- **Fix (soundness): an approval now covers the files the spec includes.** Before, `spec/X.dfy` could include a file
+  with the rule's predicates; a change there left the spec's own hash unchanged and `check` said VERIFIED (the model
+  calls the changed predicate). Now such a file is a contract file: `SPEC_CHANGED`, shown in `/forge approve` as
+  "file the spec includes". Upgrade: a project whose spec includes files gets NOT_APPROVED once; approve again.
+- **Fix: the build manifest and `diff`'s freshness test cover included Dafny files.** Before, a changed included
+  file (for example the impl of another check that this impl includes) did not make the build stale, and `diff`
+  ran the old compiled code. Upgrade: such a project is BUILD_STALE once; run build.
+- **Fix: shrinking no longer uses up the fuzz budget.** All shrinking in one run (failing recorded decisions and new
+  disagreements) gets at most a quarter of the time budget. Before, one failing decision was shrunk with up to 300
+  evaluator calls; with a slow evaluator that was the whole 1.5 s end-of-turn budget. Measured (one machine, shared
+  with other jobs, so noisy): the fixture with a 4 ms buggy candidate searched 0, 8 and 11 fresh inputs on main (one
+  run took 3.1 s), 8, 77 and 73 with the fix (1.5 to 2.1 s). A test pins >= 25. On the owner's app copy (nested rows,
+  ~200 messy field/kind pairs) the gain was not clear under that load: main 7 to 40 inputs, fix 5 to 30 (6 seeds).
+  A cap on the messy step's share was tried and dropped: it cut messy coverage without a clear gain.
+- **Fix: the next-rule hint skips an item whose subject another check states as its rule** (in its decision record,
+  outside Out of scope and Notes). Before, a rule kept offering a function as its next rule after a second rule had proved that function.
+- `/forge:add`: a spec may import another check's abstract spec; extra includes go in the binding prefix.
+- Found, not fixed: `bypass` lists the check's own unproved wrapper (a file that imports the emitted module) as a
+  hit; `mutate` copies the whole project for each mutant (2.2 GB on the owner's app copy); `check` took 35 to 49 s
+  there (the proofs alone about 15 s; the rest is not profiled yet).
 ## Unreleased
 
 - New: fuzz tiers. `.forge/forge.json` may set `"fuzz": {"tiers": {"local" | "ci" | "nightly": {"inputs",
@@ -32,6 +62,33 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
   frameworks run for real (Express, Next.js, Flask, Django, FastAPI apps are called directly with fake request
   objects); steering of Go, Rust, Java, C#; the `diff-tier` Action input in a hosted workflow other than this
   repository's own jobs.
+- New (diff): **stateful trace fuzz** (`cli/forge_trace.py`) for models of the form `Step(State, Event, now)`. A
+  `"trace"` block on a `js` or `py` diff entry gives seeded multi-event traces with the clock moving and injected
+  retries, replays, reorders and restarts (save, then load). Model and candidates run in lockstep; verdict and state
+  are compared after every step; a failing trace is shrunk by delta debugging (drop events, then simplify times and
+  fields) and printed with an `again:` command. Failing traces are saved and replay first.
+- New example `examples/subscription-machine` (Dafny model proved, py and js built) with a correct shipped step
+  function and four planted multi-event bugs.
+- Tested (`tests/run_tests.py`, 9 new cases): all four planted bugs caught and shrunk to 2, 4, 2 and 2 steps in JS and
+  Python; the correct code 0 disagreements over 50,000 traces per language; the repro command finds the same trace;
+  saved traces replay; negative controls (`max_len: 1` finds nothing; `restart: 0` hides the restart bug); an
+  unknown `trace` key is a configuration error.
+- Not tested: trace mode for the Go, Rust, Java and C# evaluators (not built); time going backwards
+  (`time_backwards`) has no test case.
+- **Bypass gate: decision reads only (AST) in TS/JS and Python.** A text hit of a watched field counts only where the
+  field is read in a decision (if/while condition, comparison, `in`, `.includes`, ternary, switch/case, `&&`/`||`
+  guard, filter/find/some/every predicate, comprehension `if`, assert, SQL `WHERE` parameter, alias). Each hit names
+  its kind. TS/JS: TypeScript 5.6.3 compiler API (downloaded once, SHA-256 pinned); Python: `ast`. Other languages
+  keep the text search ("text search, not AST"); a file that does not parse, or no parser on the machine, falls back
+  to the text search for that file and says so. `allowedBypasses` entries stay valid by line hash. Code:
+  `cli/forge_ast.py`, `cli/eval/ts_decisions.cjs`, a small hook in `run_bypass`.
+  Tested: 15 new cases in `tests/run_tests.py` (a planted read in a ternary, a switch, an `.includes`/`in` and a
+  filter predicate, in TS and in Python, each `BYPASS_FOUND`; the gate gives `UNAPPROVED_BYPASS` on a real proof; a
+  file of only types/comments/imports gives 0 hits; parse errors and a missing parser fall back to text; Go stays
+  text; old approvals stay allowed). Measured on a private app copy: 290 text lines to 76 hits (46 AST decision
+  reads, all checked by hand; 30 data-file lines by text); the three known places still found.
+  Not tested: Windows; Python older than 3.10 (`match` does not parse there and falls back to text); TS/JS syntax
+  newer than TypeScript 5.6.
 - New (diff, M1.1b): messy-input fuzz in the Go, Rust, Java and C# evaluators, as in JavaScript/TypeScript and
   Python. An adapter may name raw-value `wrappers` (or one `wrapper`) and a fail-closed answer: Go
   `json.RawMessage` (`failClosed`), Rust `serde_json::Value` (`fail_closed`), Java the evaluator's parsed value
@@ -133,7 +190,7 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
 
 ## 0.13.0 — 2026-11-23
 
-One release with the owner's chronicle feedback and the airlock:
+One release with the owner's feedback from a real app and the airlock:
 - **Bypass gate** (`watchedFields`, `UNAPPROVED_BYPASS`, `/forge:bypass`): code outside a proved rule that decides on its fields fails `check` until it is routed through the rule or allowed by a person.
 - **Messy-input fuzz** of the unproved wrapper (`THROWS_ON_MESSY_INPUT`).
 - **Scope-honest status**, `DECISION_NOTE_STALE`, notes edits without re-approval, next-rule suggestion, build syntax step over app files and their importers (`APP_SYNTAX_ERROR`), short approval digest (`--full` for every file).
@@ -144,7 +201,7 @@ One release with the owner's chronicle feedback and the airlock:
 - New (`js` target): `build` also writes `<name>.mjs` and `<name>.d.mts` next to the emitted `<name>.js`: one ES
   module with real exports, a private pinned copy of bignumber.js 9.3.1 (SHA-256 checked) and helpers
   (`toDafnyString`/`fromDafnyString` with a bounded cache of frozen seqs, `toDafnyInt`/`fromDafnyInt`, seq and set
-  helpers). No `new Function`, no `eval`, no file reading, no npm install in the app (owner feedback #6: chronicle
+  helpers). No `new Function`, no `eval`, no file reading, no npm install in the app (owner feedback #6: a real app
   needed a `new Function` loader, bignumber.js and string conversions on every call). The runtime's string literals
   use the same cache. Code: `cli/js_wrapper.py`, two small hooks in `cli/forge_check.py`.
 - New (build): the js fuzz harness also runs through its own generated module under
@@ -156,10 +213,10 @@ One release with the owner's chronicle feedback and the airlock:
   `NOT_CALLED` (the command passed, no call traced) and `SERVICE_TEST_FAILED`; the number of calling processes is
   recorded. Only the js module is traced (not the py target, not an app's own loader of the `.js` file).
 - Measured (one machine, Node 24.3.0, warm, medians of 5 passes, 3 runs): wallet `Spend` 2,000 x 10 calls: old
-  loader 6.34–6.42 ms, module 6.48–6.73 ms (no gain: ints use bignumber.js in both); a chronicle rule, 2,000 calls
-  with 10 limits each, on a copy of chronicle: old wrapper 62.6–81.9 ms, module 26.7–41.3 ms, 0 of 8,000 decisions
-  differ. Chronicle's test suite on the copy with gate.ts on the module: 228 pass, 1 skipped, 1 fail (a folder left
-  out of the copy), the same as with the old wrapper. Its `test/service.test.ts` as serviceTest: `NOT_CALLED` with
+  loader 6.34–6.42 ms, module 6.48–6.73 ms (no gain: ints use bignumber.js in both); a rule of a real app, 2,000 calls
+  with 10 limits each, on a copy of the app: old wrapper 62.6–81.9 ms, module 26.7–41.3 ms, no decision differs.
+  The app's test suite on the copy with its rule file on the module: the same results as with the old wrapper. Its
+  service test as serviceTest: `NOT_CALLED` with
   the old `new Function` wrapper (not traced), `BUILT` with 1 calling process on the module wrapper.
 - Tested: 62 cases (12 new): the module imports under `--disallow-code-generation-from-strings` and a copy that
   calls `new Function` does not; the generator is deterministic and refuses `new Function`, `eval` and other
@@ -177,9 +234,9 @@ One release with the owner's chronicle feedback and the airlock:
 - Next-rule suggestion from the Out-of-scope items that name code.
 - `build`: `APP_SYNTAX_ERROR` when an app file a check touches, or any JS/TS file that imports one, does not parse; optional `typecheck` command (`TYPECHECK_FAILED`). `check` warns on the same.
 - `/forge approve` shows a digest; `--full` prints every file; approved, unchanged files collapse to one line.
-- Measured on a copy of a real app (2 rules): stale note flagged on the changed `turbopufferFilter`; the note fixed without re-approval; a missing brace in a file three imports away flagged; `visibleTo()` suggested as the next rule; approval screen 26,214 → 1,404 characters with both rules already approved.
+- Measured on a copy of a real app (2 rules): stale note flagged on a changed function; the note fixed without re-approval; a missing brace in a file three imports away flagged; another function suggested as the next rule; approval screen 26,214 → 1,404 characters with both rules already approved.
 - Added (fuzzer): messy inputs for the unproved wrapper that turns app/JSON values into proved-code values (owner
-  feedback: chronicle's gate-mayread wrapper threw on `householdId: undefined`, and the fuzz never sent one). An
+  feedback: a real app's wrapper threw on an id field set to `undefined`, and the fuzz never sent one). An
   adapter may export `wrapper` / `wrappers` (the app's real wrapper, called with raw values) and `failClosed` /
   `fail_closed`. Each field is in turn made undefined (JavaScript), null, a number, a boolean, "", a lone surrogate,
   a long text, [], {}, the number as text, or removed. A throw is always `THROWS_ON_MESSY_INPUT`; any other answer
@@ -194,8 +251,8 @@ One release with the owner's chronicle feedback and the airlock:
   undefined/null is found as THROWS_ON_MESSY_INPUT and shrunk to {cap 0, spent 0, amount undefined}; the Python one
   that raises on None, only on that field; the wrappers that turn "5" into 5, in both languages; the fail-closed
   wrapper has no messy disagreement (negative control); every kind is tried and judged; saved messy cases replay).
-  On a copy of chronicle (gate-mayread, the app's real gate-mayread.ts, an adapter written for the test): the
-  `householdId: undefined` throw is found, with 23 other throwing fields/kinds (ids that are not text, `limits` that
+  On a copy of that app (its real wrapper file, an adapter written for the test): the throw on the
+  `undefined` id field is found, with 23 other throwing fields/kinds (ids that are not text, `limits` that
   is not a list, `entry` or `viewer` that is not an object); with a fail-closed patch of the wrapper, 2,776 messy
   inputs give 0 disagreements. Not tested: messy inputs for Go, Rust, Java, C# and "cmd" evaluators (the protocol
   allows them; no evaluator announces messy candidates yet).
@@ -217,24 +274,23 @@ One release with the owner's chronicle feedback and the airlock:
   the fuzz compares). forge.json re-approved, INVARIANTS.md regenerated. The planted second spender
   (`gift_card.py`, `can_send_gift`) lives in the tests, so the example stays VERIFIED under the gate.
 - Fixed (found in CI): `check` crashed where git is not installed; the search now walks the folder.
-- Measured: on a copy of the real app that motivated it (205 files searched, about 0.3 s): bare `body.for` and
-  `householdId` match 290 lines in 25 files; the specific set `.body.for`, `/\bhouseholdId\s*(===|!==|==|!=)/`,
-  `/(===|!==|==|!=)\s*[\w.]*\bhouseholdId\b/` matches 19 lines in 10 files and still names the three places found
-  by hand (`gate.ts:83 mayRetract`, `companion.ts:186 retract`, `companion.ts:224 forget`).
+- Measured: on a copy of the real app that motivated it (205 files searched, about 0.3 s): the two bare field
+  names match 290 lines in 25 files; the specific set (a property access with its dot, and a comparison on the id
+  field from each side) matches 19 lines in 10 files and still names the three places found by hand.
 - Tested: 18 new cases (found; own files never reported; UNAPPROVED_BYPASS for a new reader; allowed and re-approved
   → VERIFIED; edited allowed line → UNAPPROVED_BYPASS again; a failed proof still FAILED; negative control without
   watchedFields → VERIFIED; no other use → clear; no terms; bad regex; review of a non-hit refused; no git on PATH;
-  git untracked/ignored/node_modules; `--count` preview; a chronicle-shaped TS/Java/Go/Rust project). Not tested:
+  git untracked/ignored/node_modules; `--count` preview; an app-shaped TS/Java/Go/Rust project). Not tested:
   the `/forge:bypass` conversation and the register.ts wiring inside Claude Code.
 
 ## 0.12.2 — 2026-11-22
 - Fixed (fuzzer): different bugs that give the same wrong answer were reported as one. The fuzzer kept one example
-  per kind of wrong answer and stopped at 5 per candidate, so on chronicle's original code three real fail-open bugs
-  (an unknown visibility treated as shared; consent limits whose child or area is not text covering nothing) stayed
+  per kind of wrong answer and stopped at 5 per candidate, so on a real app's original code three real fail-open bugs
+  (an unknown visibility treated as shared; limits whose key fields are not text covering nothing) stayed
   hidden behind already-known ones until they were masked by hand. Now each kind of wrong answer keeps up to 3
   examples of different input shape (empty, zero, null, unknown text, list sizes), up to 40 per candidate, grouped in
-  the report. Re-run on chronicle at 9550d43 without masking: the two gate bugs appear in the random search and the
-  visibility bug as failing decision D5.
+  the report. Re-run on the same app code without masking: the two limit bugs appear in the random search and the
+  visibility bug as a failing decision.
 - Fixed: the JavaScript evaluator split input lines at U+2028 and U+2029 (Node's readline); it now splits at "\n" only.
 - Tested: 50 cases (1 new: two bugs with the same wrong answer, zero and empty text, are both reported).
 
@@ -260,7 +316,7 @@ One release with the owner's chronicle feedback and the airlock:
 ## 0.12.1 — 2026-11-22
 - Fixed: `/forge approve` (and bare `/forge`, `/forge spec`) showed each spec shortened to its clause lines, so some
   multi-line clauses were cut off, while the approval covers the complete file by hash. It now shows every file in
-  full. Found when the owner approved two real chronicle rules.
+  full. Found when the owner approved two rules of a real app.
 
 ## 0.12.0 — 2026-11-22
 - Changed: bare `/forge` runs whatever comes next, so a beginner needs one command: nothing set up → the read-only
@@ -306,7 +362,7 @@ One release with the owner's chronicle feedback and the airlock:
 - Changed: `/forge:scan` ranking, from a second blind evaluation of the v0.9.1 instructions: blind recall of 8
   known bugs rose from 3 to 6 in the top 5 (7 in the top 7), but the top-5 hit rate fell from 96 % to 92 %, scans
   took about twice as long, and 14 of 15 top-3 rows were ranked on a suspected bug rather than on stakes (one
-  high-stakes chronicle rule dropped out of the top 7). Now: rank by stakes first, a suspected bug only breaks
+  high-stakes rule of the owner's app dropped out of the top 7). Now: rank by stakes first, a suspected bug only breaks
   ties; work quickly (search first, read only the functions being ranked); general wording instead of a
   test-specific example. n = 8 is small; each scan ran once.
 - Not tested: these changes; the evaluation should be run again.
@@ -323,7 +379,7 @@ One release with the owner's chronicle feedback and the airlock:
   planted zero-amount bug (D3) and the long wraparound to be found.
 
 ## 0.9.1 — 2026-11-22
-- Changed: `/forge:scan` instructions, from a blind evaluation (13 headless scans of chronicle and 4 public
+- Changed: `/forge:scan` instructions, from a blind evaluation (13 headless scans of the owner's app and 4 public
   repositories: golang/time, casl, node-rate-limiter-flexible, transitions). Top-5 hit rate was 96 % (24 of 25), but
   blind recall of 8 known past bugs was 3 of 8 in the top 5. The scan now: includes error and fallback branches
   that decide allow/deny (one missed bug was there, and the scan had called it glue); includes the code that
@@ -348,7 +404,7 @@ One release with the owner's chronicle feedback and the airlock:
 - Not tested: Windows; Go modules with dependencies that need a download; Rust crates used through "rust_deps".
 
 ## 0.8.0 — 2026-11-22
-Released on the owner's word before the first real-project test (chronicle). Treat the differential fuzz as
+Released on the owner's word before the first real-project test (the owner's app). Treat the differential fuzz as
 early: report what it misses or gets wrong.
 
 - Added: the differential fuzz: the person's real code (the shipped function, the wrapper) against the compiled
@@ -372,7 +428,7 @@ early: report what it misses or gets wrong.
   detected; a `"cmd"` evaluator works through the protocol alone; a hanging function is reported within seconds.
   A run takes under a second for both languages. Headless Claude Code sessions (before the core refactor):
   `/forge diff`, an Edit-tool edit and a shell edit each trigger the automatic run; a turn without change does not.
-- Not tested: a real project (chronicle is next); evaluators for Go, Rust, Java and C#; TypeScript syntax Node
+- Not tested: a real project (the owner's app is next); evaluators for Go, Rust, Java and C#; TypeScript syntax Node
   cannot strip; Windows (the core uses `select` on pipes, which Windows does not support for pipes).
 
 ## 0.7.2 — 2026-11-22

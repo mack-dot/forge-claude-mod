@@ -14,25 +14,25 @@ Set up `build` for the checks in `.forge/forge.json` that have no "build" entry.
    /** THIS FILE IS NOT PROVED: it only converts values, and it never throws on them. The rule runs in the module
     *  that `/forge build` writes. */
    import * as P from "../verified/<check>/js/<name>.mjs";
-   const FAIL_CLOSED: Decision = { effect: "forbid", rule: "other_household" };
+   const FAIL_CLOSED: Decision = { effect: "forbid", rule: "other_group" };
    const text = (x: unknown): x is string => typeof x === "string";
-   export function provedMayRead(viewer: unknown, entry: unknown): Decision {
+   export function provedCanView(viewer: unknown, entry: unknown): Decision {
      const v = (viewer ?? {}) as Record<string, unknown>, e = (entry ?? {}) as Record<string, unknown>;
-     if (!text(v.actorId) || !text(v.householdId) || !text(e.householdId)) return FAIL_CLOSED;
-     try { return fromDafny(P.MayRead(toViewer(v), toEntry(e))); } // toViewer/toEntry use P.toDafnyString etc.
+     if (!text(v.actorId) || !text(v.groupId) || !text(e.groupId)) return FAIL_CLOSED;
+     try { return fromDafny(P.CanView(toViewer(v), toEntry(e))); } // toViewer/toEntry use P.toDafnyString etc.
      catch { return FAIL_CLOSED; } // last line of defence: a crash becomes a refusal, never a permit
    }
    ```
    For Python:
    ```python
    # THIS FILE IS NOT PROVED. It converts raw values; it never raises on them.
-   FAIL_CLOSED = {'effect': 'forbid', 'rule': 'other_household'}
-   def proved_may_read(viewer, entry):
+   FAIL_CLOSED = {'effect': 'forbid', 'rule': 'other_group'}
+   def proved_can_view(viewer, entry):
        v = viewer if isinstance(viewer, dict) else {}
        e = entry if isinstance(entry, dict) else {}
-       if not all(isinstance(x, str) for x in (v.get('actorId'), v.get('householdId'), e.get('householdId'))):
+       if not all(isinstance(x, str) for x in (v.get('actorId'), v.get('groupId'), e.get('groupId'))):
            return dict(FAIL_CLOSED)
-       return from_dafny(G.default__.MayRead(to_viewer(v), to_entry(e)))
+       return from_dafny(G.default__.CanView(to_viewer(v), to_entry(e)))
    # whole numbers: type(x) is int (bool is not one); never int("5")
    ```
 

@@ -57,6 +57,69 @@ const steer = process.env.FORGE_STEER_FILES
   : null
 let seq = 0
 const adapter = await import(pathToFileURL(adapterPath).href)
+
+// Trace mode (cli/forge_trace.py): the adapter exports trace = { reference: machine, candidates: { name: machine } },
+// machine = { init(), step(state, event, now) -> { ok: state } | { reject: reason }, view(state) -> JSON,
+// save(state)?, load(saved)? }. A rejected step keeps the state object it got (so a step that changes it before it
+// rejects shows up). "restart" runs load(save(state)) through JSON text; without save/load it changes nothing.
+if (adapter.trace) {
+  const machines = { reference: adapter.trace.reference, ...(adapter.trace.candidates || {}) }
+  const tnames = Object.keys(adapter.trace.candidates || {})
+  const errName = e => (e && e.name ? e.name : String(e))
+  const run = (m, steps) => {
+    const out = []
+    let s
+    try {
+      s = m.init()
+    } catch (e) {
+      return [{ __throws__: errName(e) }]
+    }
+    for (const st of steps) {
+      try {
+        let v
+        if (st.restart) {
+          if (m.save && m.load) s = m.load(parse(write(m.save(s))))
+          v = 'restart'
+        } else {
+          const r = m.step(s, parse(write(st.event)), st.now)
+          if (r && typeof r === 'object' && 'ok' in r) {
+            s = r.ok
+            v = 'ok'
+          } else if (r && typeof r === 'object' && 'reject' in r) {
+            v = 'reject:' + String(r.reject)
+          } else {
+            throw new TypeError('step returned neither { ok } nor { reject }')
+          }
+        }
+        out.push({ v, s: parse(write(m.view(s))) })
+      } catch (e) {
+        out.push({ __throws__: errName(e) })
+        break
+      }
+    }
+    return out
+  }
+  process.stdout.write(JSON.stringify({ candidates: tnames, trace: true }) + '\n')
+  process.stdin.setEncoding('utf8')
+  let buf = ''
+  for await (const chunk of process.stdin) {
+    buf += chunk
+    let i
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i)
+      buf = buf.slice(i + 1)
+      if (!line.trim()) continue
+      const { traces } = parse(line)
+      const results = traces.map(steps => {
+        const candidates = {}
+        for (const n of tnames) candidates[n] = run(machines[n], steps)
+        return { reference: run(machines.reference, steps), candidates }
+      })
+      process.stdout.write(write({ results }) + '\n')
+    }
+  }
+  process.exit(0)
+}
 const wrappers = adapter.wrappers ? { ...adapter.wrappers } : adapter.wrapper ? { wrapper: adapter.wrapper } : {}
 const all = { ...(adapter.candidates || {}), ...wrappers }
 const names = Object.keys(all)
