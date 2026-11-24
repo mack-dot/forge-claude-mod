@@ -182,11 +182,18 @@ def main():
              and "viaMcp" in open(os.path.join(repo, "src/new_by_mcp.ts")).read())
         case("up: hidden files, read-only files and forge.yaml are untouched",
              all(before[k] == after.get(k) for k in (".env", "src/proprietary/core.ts", "tests/ui.test.ts", "forge.yaml")))
+        # an upstream secret's VALUE under another name: refused before anything starts (O4; the value is never
+        # printed). The canary's own env check is still tested by the planted breach control-env-secret (G4).
         code, log = up(repo, "n", extra=["--pass-env", "LEAK"], env_extra={"LEAK": FAKE})
         open(os.path.join(tmp, "run-breach.log"), "w").write(log)
-        case("up: --pass-env prints the warning that the agent can read the value", "CAN READ this value" in log)
-        case("up: an upstream secret passed to the agent -> canary BREACH, exit 10, command not run, nothing synced",
-             code == 10 and "BREACH" in log and "BOX-2-DONE" not in log and tree_hash(repo) == after, f"exit {code} {log[-1500:]}")
+        case("up: --pass-env of an upstream secret's value -> refused at start (exit 2), named, value not printed, "
+             "command not run, nothing synced",
+             code == 2 and "--pass-env LEAK" in log and FAKE not in log and "BOX-2-DONE" not in log
+             and tree_hash(repo) == after, f"exit {code} {log[-1500:]}")
+        code, log = up(repo, "n", extra=["--pass-env", "HARMLESS"], env_extra={"HARMLESS": "just-a-setting"})
+        open(os.path.join(tmp, "run-passenv.log"), "w").write(log)
+        case("up: --pass-env of another value prints the warning that the agent can read it, and the run goes on",
+             "CAN READ this value" in log and tree_hash(repo) == after, f"exit {code} {log[-800:]}")
         case("up: no container, network or run volume left behind", leftovers(repo) == 0, leftovers(repo))
     finally:
         subprocess.run(["docker", "volume", "rm", "-f", f"forge-airlock-logs-{key}"], capture_output=True)

@@ -30,6 +30,7 @@ GIT = ["git", "-c", "safe.directory=*"]
 
 
 SALT = [b""]  # F7: per-build salt from the plan
+PROXY_TIMEOUT_S = 5  # O3: the egress proxy must refuse a CONNECT with 403 within this time, else BREACH
 
 
 def fp(b):
@@ -234,21 +235,30 @@ def main():
                 pass
 
     # 6b. the egress proxy (only when the box has one): a host that forge.yaml does not
-    #     allow must be refused with 403
+    #     allow must be refused with an explicit 403 within PROXY_TIMEOUT_S. O3: a timeout, a closed
+    #     connection, a connection error or any other answer means the refusal could not be verified:
+    #     that is a BREACH (fail closed), never a pass.
     proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or plan.get("egress_proxy")
     if proxy:
         phost, pport = proxy.split("//", 1)[-1].rstrip("/").rsplit(":", 1)
         for hp in plan.get("egress_proxy_refuse", []):
             check()
             try:
-                s = socket.create_connection((phost, int(pport)), timeout=5)
+                s = socket.create_connection((phost, int(pport)), timeout=PROXY_TIMEOUT_S)
+                s.settimeout(PROXY_TIMEOUT_S)
                 s.sendall(f"CONNECT {hp} HTTP/1.1\r\nHost: {hp}\r\n\r\n".encode())
                 status = s.recv(64).split(b"\r\n", 1)[0]
                 s.close()
-                if b" 200 " in status + b" ":
-                    breach(f"egress proxy opened a tunnel to a host not in agent.egress_allow: {hp}")
-            except OSError:
-                pass
+            except OSError as e:
+                status, err = None, f"{type(e).__name__}: {e}"
+            else:
+                err = "the proxy closed the connection without an answer" if not status else None
+            parts = (status or b"").split()
+            if len(parts) >= 2 and parts[1] == b"200":
+                breach(f"egress proxy opened a tunnel to a host not in agent.egress_allow: {hp}")
+            elif not (len(parts) >= 2 and parts[1] == b"403"):
+                breach(f"egress proxy: could not verify that CONNECT {hp} is refused (no 403 within "
+                       f"{PROXY_TIMEOUT_S} s: {err or status[:40]!r}); fail closed")
 
     # 7. MCP: denied / unlisted tools, hidden reads, read-only writes
     listed = mcpc.tool_names()

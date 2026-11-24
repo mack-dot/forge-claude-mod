@@ -71,6 +71,15 @@ owner's app copy and on a new synthetic fixture. Each item says what was tested 
   there (the proofs alone about 15 s; the rest is not profiled yet).
 ## Unreleased
 
+- Fixed (airlock, MCP Streamable HTTP client, reported by a user): R1, after an upstream ended the session (404),
+  only the first thread started a new session; calls that came in meanwhile went out with no session id and failed
+  (HTTP 400). Now one thread re-initializes and the others wait for it. R2, a pooled keep-alive connection that the
+  upstream closed while idle made the next call fail (RemoteDisconnected). Now a pooled connection is checked before
+  reuse (closed, or idle over FORGE_UPSTREAM_POOL_IDLE_S = 4 s: dropped), and only initialize and tools/list are
+  sent again once on a fresh connection if the close races the send; tools/call is never re-sent (a gated call must
+  not run twice). Tested: airlock/tests/mcp_client_regress.py, 8 cases; 5 fail on the old code (got 1 of 8 parallel
+  calls ok; RemoteDisconnected after an idle close), 0 on the fix (3 runs); each call ran exactly once upstream.
+
 - New: fuzz tiers. `.forge/forge.json` may set `"fuzz": {"tiers": {"local" | "ci" | "nightly": {"inputs",
   "budget_ms", "steer"}}}`; defaults local 1,500 inputs / 1.5 s / blind (the end-of-turn run, unchanged), ci
   100,000 / 600 s / steered, nightly 1,000,000 / 3,600 s / steered. `diff --tier ci|nightly`; the Action's new

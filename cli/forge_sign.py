@@ -32,6 +32,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import unicodedata
 
 APPROVAL_NAMESPACE = 'forge-approval'
 CALL_NAMESPACE = 'forge-call-approval'
@@ -179,16 +180,34 @@ def desk(project, *args, data=None):
     return r.returncode, r.stdout.decode(errors='replace'), r.stderr.decode(errors='replace')
 
 
+def shown_json(value):
+    """JSON for a person to read: readable non-ASCII text, but every control, format (bidi override, zero width),
+    separator, private-use and surrogate character as a \\uXXXX escape. Such characters come from the agent
+    and can hide or reorder text in a terminal. The result is still JSON of the same value."""
+    text = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False)
+    hits = [0]
+
+    def one(ch):
+        if ch != '\n' and unicodedata.category(ch) in ('Cc', 'Cf', 'Zl', 'Zp', 'Co', 'Cs'):
+            hits[0] += 1
+            return json.dumps(ch)[1:-1]
+        return ch
+    return ''.join(one(ch) for ch in text), hits[0]
+
+
 def show_call(req):
     args = req.get('arguments')
     ok = hashlib.sha256(json.dumps(args, sort_keys=True, separators=(',', ':'), ensure_ascii=True,
                                    allow_nan=False).encode()).hexdigest() == req.get('args_sha256')
+    shown, hidden = shown_json(args)
     return '\n'.join([
         '=== held tool call %s (run %s) ===' % (req.get('call'), req.get('run')),
         'tool:      %s' % req.get('tool'),
         'step id:   %s' % req.get('step'),
         'arguments (exactly what the upstream receives):',
-        json.dumps(args, indent=2, sort_keys=True, ensure_ascii=False),
+        shown,
+    ] + (['note: %d control or invisible character(s) in the arguments are shown as \\u escapes' % hidden]
+         if hidden else []) + [
         'arguments sha256: %s (%s)' % (req.get('args_sha256'), 'matches the arguments above' if ok
                                        else 'DOES NOT MATCH the arguments above: do not sign'),
     ]), ok

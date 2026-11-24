@@ -390,7 +390,7 @@ def e2e(case, env):
     st, _, b = c.post({"jsonrpc": "2.0", "id": 9, "method": "tools/list"}, headers={"mcp-protocol-version": "1999-01-01"})
     case("http listen: an unsupported MCP-Protocol-Version is refused 400", st == 400, st)
     sk = socket.create_connection(("127.0.0.1", port), timeout=10)
-    sk.sendall(f"POST /mcp HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\nmcp-session-id: {c.sid}\r\n"
+    sk.sendall(f"POST /mcp HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\ncontent-type: application/json\r\nmcp-session-id: {c.sid}\r\n"
                f"content-length: {2 << 20}\r\n\r\n{{".encode())
     head = sk.recv(200)
     sk.close()
