@@ -70,10 +70,10 @@ def cases():
         strong, weak = _project(tmp, 'strong'), _project(tmp, 'weak', weak=True)
         buggy = _project(tmp, 'buggy', fixed=False)
         # ---- diff --coverage
-        _, plain = _run(strong, 'diff', '--seed', '7', '--no-write')
+        _, plain = _run(strong, 'diff', '--seed', '7', '--no-write', '--budget-ms', '60000')
         shutil.rmtree(os.path.join(strong, '.forge', 'regressions'), ignore_errors=True)  # same start for both runs
-        _, s = _run(strong, 'diff', '--seed', '7', '--no-write', '--coverage')
-        _, w = _run(weak, 'diff', '--seed', '7', '--no-write', '--coverage')
+        _, s = _run(strong, 'diff', '--seed', '7', '--no-write', '--coverage', '--budget-ms', '60000')
+        _, w = _run(weak, 'diff', '--seed', '7', '--no-write', '--coverage', '--budget-ms', '60000')
         sp, wp = _cov(s, 'wallet-cap:py', 'legacy_wallet.py'), _cov(w, 'wallet-cap:py', 'legacy_wallet.py')
         sj, wj = _cov(s, 'wallet-cap:js', 'legacy_wallet.ts'), _cov(w, 'wallet-cap:js', 'legacy_wallet.ts')
         strip = lambda r: {k: {kk: v.get(kk) for kk in ('verdict', 'disagreements', 'decisions', 'inputs')}
@@ -101,7 +101,7 @@ def cases():
         if have_cov:
             e = dict(os.environ)
             e.pop('FORGE_NO_COVERAGE_PY', None)
-            r = subprocess.run([sys.executable, CLI, 'diff', '--seed', '7', '--no-write', '--coverage', '--root', weak,
+            r = subprocess.run([sys.executable, CLI, 'diff', '--seed', '7', '--no-write', '--coverage', '--budget-ms', '60000', '--root', weak,
                                 '--json'], stdout=subprocess.PIPE, universal_newlines=True, env=e)
             cp = _cov(json.loads(r.stdout), 'wallet-cap:py', 'legacy_wallet.py')
             out.append(('coverage: coverage.py and the stdlib tracer give the same counts',

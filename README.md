@@ -212,10 +212,10 @@ Measured (one machine, Node 24.3.0, warm, median of 5 passes):
 | Case (one pass) | old loader (`new Function` / `Module._compile`) | generated module |
 | --- | --- | --- |
 | wallet-cap `Spend`, 2,000 entries x 10 calls, ints only | 6.34–6.42 ms | 6.48–6.73 ms |
-| a chronicle rule (strings, 10 consent limits), 2,000 calls | 62.6–81.9 ms | 26.7–41.3 ms |
+| a string-heavy rule from a real app (10 limits per call), 2,000 calls | 62.6–81.9 ms | 26.7–41.3 ms |
 | wallet variant with a bounded `newtype` instead of `int` (not the approved spec) | — | 0.40–0.46 ms |
 
-Ranges are the medians of 3 runs. Same answers on every call compared (20,000 wallet calls, 8,000 chronicle calls).
+Ranges are the medians of 3 runs. Same answers on every call compared (20,000 wallet calls, and every call of the app rule).
 The gain comes from the string cache; code that uses only `int` is not faster, because bignumber.js does the work
 (`tests/js_module/bench_wallet.mjs` reproduces the wallet row).
 
@@ -315,11 +315,11 @@ score is a FINITE TEST of the fuzz, not of the code.
 ## Bypass: code that goes around a proved rule
 
 A proof is only as strong as the guarantee that nothing goes around it. On a real app, a proved read rule decided that
-`body.for` counts only on Companion's rows, but two other functions still trusted `body.for` on any row. A person
+one field counts only on one kind of row, but two other functions still trusted that field on any row. A person
 found that by hand. `bypass` finds such places.
 
-Add `"watchedFields"` to a check: the texts that name what the rule decides on (field names such as `body.for` or
-`householdId`, a comparison, function names). A text between slashes is a regular expression
+Add `"watchedFields"` to a check: the texts that name what the rule decides on (field names such as `body.owner` or
+`groupId`, a comparison, function names). A text between slashes is a regular expression
 (`"/spent\\s*\\+\\s*amount[^;{]*<=?\\s*cap/"`); anything else is literal. `/forge:bypass` proposes them from the approved
 spec and decision record. Then:
 
@@ -342,7 +342,7 @@ but a line outside the rule matches and is not in its approved `allowedBypasses`
 proof (or any other verdict) still wins. A check without `watchedFields` behaves as before.
 
 **Specific terms.** Because it is a gate, a term must name the forms that decide, not every mention:
-`.body.for` (a property access), `/\\bhouseholdId\\s*(===|!==|==|!=)/` (a comparison), not a bare `householdId`.
+`.body.owner` (a property access), `/\\bgroupId\\s*(===|!==|==|!=)/` (a comparison), not a bare `groupId`.
 `bypass --count --rule NAME --set-terms TERM…` previews the number of lines per term and writes nothing.
 
 | Bypass verdict | Meaning | Exit |
@@ -353,18 +353,39 @@ proof (or any other verdict) still wins. A check without `watchedFields` behaves
 | `UNAPPROVED_BYPASS` (a `check` verdict) | The proof passed, but an unallowed line outside the rule matches | 1 |
 
 `check` runs the same search: the unreviewed places also go under `"outside"` in its JSON and on one line of its
-report (`3 places decide with body.for outside gate-mayread: gate.ts:83 mayRetract, …`).
+report (`3 places decide with body.owner outside policy-view: src/policy.ts:8 canCancel, …`).
 `/forge approve yes` prints the count; bare `/forge` offers `/forge:bypass` for a check without watched fields.
 
-Measured on that app (a copy, 205 files searched, about 0.3 s): the bare terms `body.for` and `householdId` match 290
-lines in 25 files (275 of them for `householdId`): too many for a gate. The specific terms `.body.for`,
-`/\\bhouseholdId\\s*(===|!==|==|!=)/` and `/(===|!==|==|!=)\\s*[\\w.]*\\bhouseholdId\\b/` match 19 lines in 10 files,
-and still name the three places found by hand (`gate.ts:83 mayRetract`, `companion.ts:186 retract`,
-`companion.ts:224 forget`).
+Measured on that app (a copy, 205 files searched, about 0.3 s): the two bare field names match 290 lines in 25
+files (275 of them for the id field): too many for a gate. The specific terms (the property access with its dot, and
+a comparison on the id field from each side, the forms shown above) match 19 lines in 10 files, and still name the
+three places found by hand.
 
-Limits: a text search per line, not a data-flow analysis (a FINITE TEST of the listed terms). It misses aliases
-(`const f = body.for`), dynamic access (`body[key]`), destructuring (`const { for: f } = body`), a term split over
-lines, and code that decides the same question under other names. The function name is a heuristic on indentation.
+**Decision reads only (AST), in TypeScript / JavaScript and Python.** In these files a line counts only where the
+watched field is READ in a decision. Each hit names its kind: `if-condition`, `early-return-guard`, `loop-condition`,
+`comparison` (`===`, `!==`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `instanceof`), `in`, `includes` (also `.has`,
+`.indexOf`, `.startsWith`, ...), `ternary`, `switch`, `case`, `logical-guard` (the left side of `&&` / `||`, not an
+`x || ''` default), `filter-predicate` / `find-predicate` / `predicate` (`filter`, `find`, `some`, `every`; Python
+comprehension `if`, `filter`, `any`, `all`), `assert`, `sql-where` (a parameter of a query whose SQL text has a
+`WHERE`), and `alias` (`const v = row.f` where `v` is read in a decision in the same function). Type and interface
+declarations, type annotations, imports, comments, string literals, plain assignment, object construction and
+logging are not hits. TS / JS files are parsed with the TypeScript compiler API (TypeScript 5.6.3, downloaded once
+into the cache and checked against its pinned SHA-256, as Dafny is; it only parses, it never runs the app); Python
+files with `ast`. Every other file (Go, Rust, Java, C#, data files) keeps the text search per line, labelled
+`text search, not AST`. A TS / JS / Python file that does not parse, or a machine without Node or without the
+TypeScript package (offline, `FORGE_NO_DOWNLOAD=1`), falls back to the text search for that file and the report
+says `FALLBACK to text search, not AST` with the reason: fail closed, never skipped. An approved `allowedBypasses`
+entry stays allowed by its line hash. `bypass --json` lists the text hits that are not decision reads under
+`"not_decisions"`.
+
+Measured on a copy of the same app with the bare terms (290 text lines): 76 hits remain, 46 decision reads found by
+the AST (all 46 checked by hand: each is a decision site) and 30 lines in data files (text search, not AST); the
+three places found by hand are still found. Of the 214 dropped lines, 85 were checked by hand: 81 are not decisions;
+4 feed a decision that the search cannot see (2 checks through a computed key, 2 inputs to a policy engine).
+
+Limits: a syntactic search, not a data-flow analysis (a FINITE TEST of the listed terms). It misses a value passed
+to another function or returned to a caller that decides, dynamic access (`body[key]`), and code that decides the
+same question under other names. The alias rule is name-based. The function name is a heuristic on indentation.
 
 ## Callers: does every caller go through the proved code?
 
@@ -562,7 +583,7 @@ python3 cli/forge_check.py mutate    # plant small bugs, count how many the proo
 
 The wrapper that turns your app's values (often JSON) into the proved code's values is not proved. Runtime JSON
 does not follow your types: a field can be `undefined`, `null`, a number where text was expected, or missing. On a
-real app, `householdId: undefined` reached such a wrapper and it threw instead of answering "forbid". The plain
+real app, an id field set to `undefined` reached such a wrapper and it threw instead of answering "forbid". The plain
 fuzz never sent that value, so it did not see it.
 
 If the adapter (any of the six languages) exports a raw-value wrapper, the fuzz also sends **messy variants**
@@ -575,8 +596,8 @@ text (`"5"` for `5`), or removed. Big integers in the other fields stay exact.
 export const wrapper = (i) => myRealWrapper(i)        // the app's REAL wrapper, raw values, no conversion here
 // or: export const wrappers = { name: fn, ... }
 export function failClosed(i) {                        // the spec's fail-closed answer for a value the
-  return typeof i.householdId === 'string' ? undefined // proved rule does not take; undefined: the rule
-    : { effect: 'forbid', rule: 'other_household' }    // takes it, so the proved rule's answer is expected
+  return typeof i.groupId === 'string' ? undefined     // proved rule does not take; undefined: the rule
+    : { effect: 'forbid', rule: 'other_group' }        // takes it, so the proved rule's answer is expected
 }
 ```
 
@@ -592,7 +613,7 @@ Rules: a throw from the wrapper on any messy input is always a disagreement of k
 Otherwise its answer must equal `failClosed(input)`, or the proved rule's answer where `failClosed` returns
 `undefined`. Messy disagreements are grouped, shrunk (the messy field and its kind stay; the rest of the input
 shrinks) and saved like the others. `"messy": false` on a diff entry turns them off; an inputs module can list
-fields to leave alone in `messy_skip = ['retracted', 'limits[].setBy']`. A messy input that has no fail-closed
+fields to leave alone in `messy_skip = ['archived', 'limits[].label']`. A messy input that has no fail-closed
 answer and that the proved rule cannot take is counted as "not judged" (only a throw is reported for it).
 
 ```
@@ -614,6 +635,54 @@ messy inputs share the budget, so fewer plain inputs run (584 instead of 1,500 f
 
 Labels: the messy values are a fixed list, not every possible value; the fail-closed answer is the adapter's (the
 person's) choice, not proved; a run is a FINITE TEST.
+
+### State machines: trace fuzz (many events per case)
+
+Some bugs need two or more events: a retry applied twice, a field lost when the state is saved and loaded again, an
+expiry check that moves after a pause. One call per input cannot find them. For a model of the form
+`Step(State, Event, now) -> Ok(State) | Err(Reject)`, add a `"trace"` block to a `js` or `py` diff entry:
+
+```json
+{ "name": "js", "lang": "js", "inputs": "diff/subscription_events.py", "adapter": "diff/subscription_trace.mjs",
+  "trace": { "count": 2000, "budget_ms": 10000, "max_len": 10,
+             "retry": 0.15, "replay": 0.08, "reorder": 0.08, "restart": 0.06 } }
+```
+
+- The events module (Python, shared by every language) defines `event(rng, ctx)` and optionally `advance(rng)`
+  (clock ticks before an event), `start_time(rng)`, `event_in_domain(e)` and `trace_in_domain(steps)`.
+- The adapter exports `trace = { reference, candidates: { name: machine } }`; a machine has `init()`,
+  `step(state, event, now)` returning `{ ok: state }` or `{ reject: reason }`, `view(state)` (the JSON compared after
+  each step) and optionally `save(state)` / `load(saved)` (what a restart goes through). A rejected step keeps the
+  state object it got, so code that changes the state before it rejects is found.
+- The core (`cli/forge_trace.py`) generates seeded traces with the clock moving forward and injects faults: `retry`
+  (the same event again), `replay` (an older event again), `reorder` (two events swapped) and `restart` (save, then
+  load). It runs the model and every candidate over the same trace, compares verdict and state after every step,
+  and shrinks a failing trace by delta debugging: it drops chunks of events, then makes times and event fields
+  simpler, then drops again. Each failure prints its minimal trace, the step where it differs and an `again:`
+  command (same seed, `--inputs` = trace index + 1) that finds it again. Failing traces are saved and replay first.
+- `--inputs` sets the number of traces and `--budget-ms` the time budget for a run.
+
+Example: `examples/subscription-machine` (a subscription with Start, Renew, Pause, Resume and Cancel, and expiry by
+time). Its Dafny model is proved against `spec/SubscriptionSpec.dfy` (clauses M1–M7). The correct shipped code is
+`app/subscription.ts` and `.py`. Four planted copies (`app/subscription_planted.*`) each have one bug that needs two or
+more events. Measured on one machine (seed 7, 2,000 traces), each bug is caught in JS and Python, and each shrinks to
+its minimal trace:
+
+| Planted bug | Shrunk trace (steps) |
+| --- | --- |
+| `replay-off-by-one`: duplicate check `<` instead of `<=` (an immediate retry applies again) | 2 |
+| `pause-expiry`: after a Resume the expiry check is `>` instead of `>=` | 4 (Start, Pause, Resume, Pause at the expiry tick) |
+| `restart-drops-id`: `save()` leaves out `lastId` | 2 (Start, restart) |
+| `reject-leaks`: Renew changes the state before it checks expiry; the rejected step keeps the change | 2 |
+
+The correct code had 0 disagreements over 50,000 traces (about 275,000 steps) in each language. Wall time for
+50,000 traces, correct code only, one machine: JS 11.6–21.4 s, Python 11.2–17.0 s (five runs, one in a clean clone; the highest JS time
+was measured while other heavy work ran on the machine). Negative controls in `tests/run_tests.py`: with `max_len: 1`, no
+planted bug is found; with `restart: 0`, the restart bug is not found.
+
+Covered: JavaScript/TypeScript and Python evaluators, and any `"cmd"` program that speaks the trace protocol (see
+the top of `cli/forge_trace.py`). Not covered yet: the built Go, Rust, Java and C# evaluators. Labels: the traces
+are random and bounded (`max_len`), so a run is a FINITE TEST, not a proof about every sequence.
 
 See `PLAN.md` for what is built and what is not.
 

@@ -36,8 +36,29 @@ import backends as B  # noqa: E402
 import sync  # noqa: E402
 from policy import Policy, PolicyError, env_refs  # noqa: E402
 
-IMAGE = os.environ.get("FORGE_AIRLOCK_IMAGE", "forge-airlock:local")
-CLAUDE_IMAGE = os.environ.get("FORGE_AIRLOCK_CLAUDE_IMAGE", "forge-airlock-claude:local")
+
+
+def source_tag(root=None):
+    """A tag from the content of the image's build context (this folder), so two plugin versions or
+    checkouts on one Docker host never replace each other's image while a box starts."""
+    import hashlib
+    root = root or os.path.dirname(os.path.abspath(__file__))
+    h = hashlib.sha256()
+    for d, dirs, files in os.walk(root):
+        dirs[:] = sorted(x for x in dirs if x not in ("__pycache__", ".forge", "tests", "proof", "node_modules"))
+        for f in sorted(files):
+            if f.endswith(".pyc"):
+                continue
+            p = os.path.join(d, f)
+            h.update(os.path.relpath(p, root).encode() + b"\0")
+            with open(p, "rb") as fh:
+                h.update(fh.read())
+    return h.hexdigest()[:12]
+
+
+_TAG = source_tag()
+IMAGE = os.environ.get("FORGE_AIRLOCK_IMAGE", f"forge-airlock:{_TAG}")
+CLAUDE_IMAGE = os.environ.get("FORGE_AIRLOCK_CLAUDE_IMAGE", f"forge-airlock-claude:{_TAG}")
 PREFIX = os.environ.get("FORGE_AIRLOCK_PREFIX", "forgeair")  # Docker project prefix (tests use their own)
 PORT = 8700
 LLM_PORT = 8701

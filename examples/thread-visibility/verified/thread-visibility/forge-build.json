@@ -1,0 +1,26 @@
+{
+  "check": "thread-visibility",
+  "labels": "Dafny model: PROVED. This emitted code: NATIVE CHECK (unverified compiler). Fuzz run: FINITE TEST.",
+  "sources": {
+    "impl/Thread.dfy": "b9811ddf0c06b15c84e1ddedb9f45f64f0aca1977e3aaab15d5abc56d85aa88f",
+    "spec/ThreadRules.dfy": "75615a0a068c6d13d9d9bb4d9e58dc2faab2ab6c76f4055a9ddebb3b3e53624c",
+    "spec/ThreadSpec.dfy": "aea86b64196fa6ff6d20b1471cb7406f63b3eb3a9bcaaa1f36bd9e0aa77cd6d3"
+  },
+  "targets": {
+    "py": {
+      "emit": "OK",
+      "files": {
+        "thread_visibility-py/System_/__init__.py": "96b6e33c036bc3aeab6d1810c7aef085184d09c407bdec032ea89d7a98843edf",
+        "thread_visibility-py/Thread.py": "8df9c7f1b9d6d1af782bf1980fa6e34e7051cd4d605af6eadb8cc59d47a95ada",
+        "thread_visibility-py/ThreadRules.py": "af5ec113d9b5ea89cb17778f2c9451e7bc47430e27c7ec90d3e91ce0a3553aff",
+        "thread_visibility-py/__main__.py": "9f57f6fd22bcacad2505caacb2c16e4da29a56933d3b0007bd0a4798d28c46b1",
+        "thread_visibility-py/_dafny/__init__.py": "18d39decdedad0e188456e15d17f1dcd5113c4abc258ad6cb718e39534555e7a",
+        "thread_visibility-py/module_.py": "70c98d505a1fc84dcc0840a35abc19f6ed0008cbd61e2903ff61521ac96b0762",
+        "thread_visibility-py/thread_visibility-py.dtr": "0c2b1795c53fd1b900a15ac30162490677168c5160fba1d61b3a265db6eb1b44"
+      },
+      "fuzz": "PASSED",
+      "fuzz_output_lines": 2000,
+      "fuzz_output_sha256": "32820a41db7c504ade335870de744121ed48f2b08ca4f9bdd58d549b35804fa3"
+    }
+  }
+}

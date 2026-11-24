@@ -24,7 +24,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.abspath(os.path.join(HERE, ".."))
 SIGN = os.path.join(PKG, "..", "cli", "forge_sign.py")
-os.environ.setdefault("FORGE_AIRLOCK_IMAGE", "forge-airlock-m3:local")
+os.environ.setdefault("FORGE_AIRLOCK_IMAGE", "forge-airlock-m3:" + __import__("secrets").token_hex(4))  # per run
 os.environ.setdefault("FORGE_AIRLOCK_PREFIX", "forgeha")
 RESULTS = []
 
