@@ -4,6 +4,7 @@ import type { Register } from 'claude-code'
 //   /forge          guided setup: shows the next step and asks Claude to walk you through it
 //   /forge check    proves every check in .forge/forge.json with Dafny; verdict in the status line
 //   /forge approve  you (not the agent) approve the current spec files
+//                   (/forge approve yes --hardware [--key KEY]: also sign the approval with a security key)
 //   /forge status   prints the last verdicts
 // Files in the project: .forge/forge.json (checks), .forge/approved.json (your approvals),
 // .forge/last-check.json (last verdicts).
@@ -43,6 +44,8 @@ type LastCheck = {
 const DIR = '.forge'
 const CONFIG = `${DIR}/forge.json`
 const APPROVED = `${DIR}/approved.json`
+const SIG = `${DIR}/approved.json.sig` // signed approvals: ssh-keygen -Y sign over approved.json
+const SIGNERS = `${DIR}/allowed_signers` // the keys that may sign (part of the signed approval)
 const LAST = `${DIR}/last-check.json`
 
 let isStale = false
@@ -207,10 +210,15 @@ async function showForApproval($: Api, lead: string, isFull = false): Promise<st
   const { text, isOk, hashes } = await showSpecs($, isFull)
   if (!isOk || !hashes) return text
   await writeJson($, root, PENDING, { shownAt: new Date().toISOString(), hashes })
-  return `${lead}\n\n${text}\n\nFor a plain-words explanation: /forge:explain\nTo approve exactly this: /forge approve yes`
+  // Signed approvals (forge.json "require_signed_approval"): the digest lists the files signed with the approval.
+  const isSigned = text.includes('=== signed with the approval:')
+  const how = isSigned
+    ? '/forge approve yes --hardware (signs with FORGE_APPROVAL_KEY or --key KEY; touch your security key when it blinks)'
+    : '/forge approve yes'
+  return `${lead}\n\n${text}\n\nFor a plain-words explanation: /forge:explain\nTo approve exactly this: ${how}`
 }
 
-async function approve($: Api, isConfirmed: boolean, isFull = false): Promise<string> {
+async function approve($: Api, isConfirmed: boolean, isFull = false, hardware: string[] = []): Promise<string> {
   const root: string = await $.session.root()
   if (!isConfirmed) return showForApproval($, 'You are about to approve this:', isFull)
   const pending = await readJson<{ shownAt: string; hashes: Record<string, string> }>($, join(root, PENDING))
@@ -219,8 +227,8 @@ async function approve($: Api, isConfirmed: boolean, isFull = false): Promise<st
     // "yes" before anything was shown: show it now, approve nothing yet.
     return showForApproval($, 'Nothing was shown for approval yet (or it was shown more than a day ago). This is what you would approve:')
   const r = await $.process.run(
-    ['python3', `${$.plugin.root}/cli/forge_check.py`, 'approve', '--root', root, '--hashes', JSON.stringify(pending.hashes)],
-    { cwd: root, timeoutMs: 60_000 },
+    ['python3', `${$.plugin.root}/cli/forge_check.py`, 'approve', '--root', root, '--hashes', JSON.stringify(pending.hashes), ...hardware],
+    { cwd: root, timeoutMs: hardware.length ? 180_000 : 60_000 }, // a person may need time to touch the key
   )
   if (r.exitCode === 0) await $.process.run(['rm', '-f', join(root, PENDING)], { timeoutMs: 5_000 })
   await refreshStatus($)
@@ -336,8 +344,8 @@ async function guard($: Api, path: string | undefined): Promise<string | undefin
   if (!path) return undefined
   const root: string = await $.session.root()
   const abs = join(root, path.startsWith(root) ? path.slice(root.length + 1) : path)
-  if (abs === join(root, APPROVED) || abs === join(root, PENDING))
-    return 'forge: only you approve specs (type /forge approve).'
+  if ([APPROVED, PENDING, SIG, SIGNERS].some(f => abs === join(root, f)))
+    return 'forge: only you approve specs and keep the signing keys (type /forge approve).'
   const approved = (await readJson<Record<string, string>>($, join(root, APPROVED))) ?? {}
   for (const spec of Object.keys(approved))
     if (abs === join(root, spec))
@@ -363,7 +371,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'forge',
       description: 'Forge proof gate: next step, or check / approve / build / spec / status (conversations: /forge:scan, /forge:add, /forge:bypass)',
-      argumentHint: '[check|approve|approve yes|build|diff|invariants|mutate|spec|status]',
+      argumentHint: '[check|approve|approve yes [--hardware]|build|diff|invariants|mutate|mutate app|spec|status]',
     })
     const r = await next(e)
     void refreshStatus($).catch(() => undefined)
@@ -394,14 +402,19 @@ export const register: Register = on => {
     }
     if (arg === 'mutate') {
       const root: string = await $.session.root()
-      const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'mutate', '--root', root, '--max', '30'], {
+      // `/forge mutate app`: mutants of the shipped code, scored by the diff (cli/forge_mutate_app.py)
+      const app = /^mutate\s+(--)?app\b/.test(e.args.trim()) ? ['--app'] : []
+      const r = await $.process.run(['python3', `${$.plugin.root}/cli/forge_check.py`, 'mutate', ...app, '--root', root, '--max', '30'], {
         cwd: root,
         timeoutMs: 600_000,
       })
       return { text: (r.stdout || r.stderr).trim().slice(0, 6000) || `The checker did not run (exit ${r.exitCode}).` }
     }
-    if (arg === 'approve')
-      return { text: await approve($, /^approve\s+yes\b/.test(e.args.trim()), /--full\b/.test(e.args)) }
+    if (arg === 'approve') {
+      const key = /--key\s+(\S+)/.exec(e.args)?.[1]
+      const hardware = /--hardware\b/.test(e.args) ? ['--hardware', ...(key ? ['--key', key] : [])] : []
+      return { text: await approve($, /^approve\s+yes\b/.test(e.args.trim()), /--full\b/.test(e.args), hardware) }
+    }
     if (arg === 'spec') {
       const { text } = await showSpecs($, /--full\b/.test(e.args))
       return { text: `${text}\n\nFor a plain-words explanation: /forge:explain` }

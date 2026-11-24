@@ -7,7 +7,14 @@
 // JSON numbers arrive exactly: integers as java.math.BigInteger, others as java.math.BigDecimal. Helpers:
 // ForgeMain.big(v) (BigInteger), ForgeMain.lng(v) (long; throws when the value does not fit, as a real caller
 // would fail). Return Map / List / String / Boolean / numbers. An exception is reported as
-// {"__throws__": "<ExceptionClass>"}. Test code: NOT proved.
+// {"__throws__": "<ExceptionClass>"}.
+//
+// Messy inputs (the unproved wrapper that turns raw JSON into Dafny values): ForgeAdapter may also define
+//   public static Map<String, Function<Object, Object>> wrappers()   (or public static Object wrapper(Object raw))
+//   public static Object failClosed(Object raw)  // the spec's fail-closed answer; null when the proved rule takes it
+// Each wrapper gets the RAW JSON value as this file parses it (Map, List, String, Boolean, BigInteger, BigDecimal,
+// null) and calls the app's real wrapper with it. They are found by reflection, so both are optional.
+// Test code: NOT proved.
 import java.io.*;
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -73,9 +80,16 @@ public class ForgeMain {
         else { String s = v.toString(); b.append('"');
             for (char c : s.toCharArray()) {
                 if (c == '"' || c == '\\') b.append('\\').append(c);
-                else if (c < 0x20) b.append(String.format("\\u%04x", (int) c));
+                else if (c < 0x20 || Character.isSurrogate(c)) b.append(String.format("\\u%04x", (int) c));
                 else b.append(c); }
             b.append('"'); }
+    }
+
+    static Map<String, Object> thrown(Throwable t) {
+        while (t instanceof java.lang.reflect.InvocationTargetException && t.getCause() != null) t = t.getCause();
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("__throws__", t.getClass().getSimpleName());
+        return m;
     }
 
     @SuppressWarnings("unchecked")
@@ -83,18 +97,69 @@ public class ForgeMain {
         try {
             return f.apply((Map<String, Object>) new Reader(inputJson).value()); // a fresh copy per call
         } catch (Throwable t) {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("__throws__", t.getClass().getSimpleName());
-            return m;
+            return thrown(t);
+        }
+    }
+
+    static Object callRaw(Function<Object, Object> f, String inputJson) {
+        try {
+            return f.apply(new Reader(inputJson).value()); // a fresh copy per call
+        } catch (Throwable t) {
+            return thrown(t);
+        }
+    }
+
+    static final Object NOT_GIVEN = new Object();
+
+    @SuppressWarnings("unchecked")
+    static Map<String, Function<Object, Object>> wrappers() {
+        Map<String, Function<Object, Object>> w = new TreeMap<>();
+        try {
+            w.putAll((Map<String, Function<Object, Object>>) ForgeAdapter.class.getMethod("wrappers").invoke(null));
+        } catch (NoSuchMethodException e) {
+            try {
+                java.lang.reflect.Method m = ForgeAdapter.class.getMethod("wrapper", Object.class);
+                w.put("wrapper", raw -> { try { return m.invoke(null, raw); }
+                    catch (java.lang.reflect.InvocationTargetException x) { throw sneaky(x.getCause()); }
+                    catch (IllegalAccessException x) { throw new IllegalStateException(x); } });
+            } catch (NoSuchMethodException e2) { /* no wrapper: no messy inputs */ }
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("ForgeAdapter.wrappers() failed", e);
+        }
+        return w;
+    }
+
+    static RuntimeException sneaky(Throwable t) {
+        ForgeMain.<RuntimeException>sneakyThrow(t);
+        return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    static <T extends Throwable> void sneakyThrow(Throwable t) throws T { throw (T) t; }
+
+    static Function<Object, Object> failClosed() {
+        try {
+            java.lang.reflect.Method m = ForgeAdapter.class.getMethod("failClosed", Object.class);
+            return raw -> { try { return m.invoke(null, raw); }
+                catch (java.lang.reflect.InvocationTargetException x) { throw sneaky(x.getCause()); }
+                catch (IllegalAccessException x) { throw new IllegalStateException(x); } };
+        } catch (NoSuchMethodException e) {
+            return raw -> null;
         }
     }
 
     public static void main(String[] args) throws IOException {
         Map<String, Function<Map<String, Object>, Object>> cands = new TreeMap<>(ForgeAdapter.candidates());
+        Map<String, Function<Object, Object>> wraps = wrappers();
+        Function<Object, Object> failClosed = failClosed();
         PrintStream out = new PrintStream(new FileOutputStream(FileDescriptor.out), false, "UTF-8");
-        StringBuilder hello = new StringBuilder("{\"candidates\":");
-        write(hello, new ArrayList<>(cands.keySet()));
-        out.println(hello.append('}'));
+        List<String> all = new ArrayList<>(cands.keySet());
+        all.addAll(wraps.keySet());
+        Map<String, Object> hello = new LinkedHashMap<>();
+        hello.put("candidates", all);
+        hello.put("messy", new ArrayList<>(wraps.keySet()));
+        StringBuilder hb = new StringBuilder(); write(hb, hello);
+        out.println(hb);
         out.flush();
         BufferedReader in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
         String line;
@@ -102,10 +167,24 @@ public class ForgeMain {
             if (line.trim().isEmpty()) continue;
             Reader r = new Reader(line); r.ws(); r.i++; r.ws(); r.str(); r.ws(); r.i++; // {"input":
             int start = r.i; r.value(); String inputJson = line.substring(start, r.i);
+            boolean messy = line.substring(r.i).matches("(?s)\\s*,\\s*\"messy\"\\s*:\\s*true\\s*}\\s*");
             Map<String, Object> answers = new LinkedHashMap<>();
+            Map<String, Object> msg = new LinkedHashMap<>();
+            if (messy) {
+                Object ref = callRaw(failClosed, inputJson);
+                msg.put("reference", ref != null ? ref : call(ForgeAdapter::reference, inputJson));
+                for (Map.Entry<String, Function<Object, Object>> e : wraps.entrySet())
+                    answers.put(e.getKey(), callRaw(e.getValue(), inputJson));
+                msg.put("candidates", answers);
+                StringBuilder b = new StringBuilder(); write(b, msg);
+                out.println(b);
+                out.flush();
+                continue;
+            }
             for (Map.Entry<String, Function<Map<String, Object>, Object>> e : cands.entrySet())
                 answers.put(e.getKey(), call(e.getValue(), inputJson));
-            Map<String, Object> msg = new LinkedHashMap<>();
+            for (Map.Entry<String, Function<Object, Object>> e : wraps.entrySet())
+                answers.put(e.getKey(), callRaw(e.getValue(), inputJson));
             msg.put("reference", call(ForgeAdapter::reference, inputJson));
             msg.put("candidates", answers);
             StringBuilder b = new StringBuilder(); write(b, msg);

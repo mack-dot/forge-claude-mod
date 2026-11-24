@@ -492,49 +492,49 @@ def bypass_cases():
         cases.append(('bypass: git list: an untracked new file is found; ignored and node_modules files are not',
                       code == 1 and [h['file'] for h in hits(out)] == ['new_spender.py']))
 
-    # chronicle-shaped: a decision says body.for counts only on Companion's rows; a second gate function trusts it
+    # app-shaped: a decision says body.owner counts only on agent rows; a second policy function trusts it
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, 'c')
         for rel, text in {
             'spec/GateSpec.dfy': 'abstract module GateSpec { }\n', 'impl/Gate.dfy': 'module Gate { }\n',
-            'src/gate.ts': ('import { mayReadProved } from "./gate-mayread.ts"\n\n'
-                            'export function mayRead(actor: string, row: Row): boolean {\n'
-                            '  return mayReadProved(actor, row)\n}\n\n'
-                            'export const mayRetract = (actorId: string, target: Row): boolean =>\n'
-                            '  target.authorId === actorId || target.body.for === actorId\n\n'
-                            'class Store {\n  forget(input: Input) {\n    for (const e of this.rows) {\n'
-                            '      if (e.authorId !== input.parentId && e.body.for !== input.parentId) continue\n'
+            'src/policy.ts': ('import { canViewProved } from "./policy-proved.ts"\n\n'
+                            'export function canView(actor: string, row: Row): boolean {\n'
+                            '  return canViewProved(actor, row)\n}\n\n'
+                            'export const canCancel = (actorId: string, target: Row): boolean =>\n'
+                            '  target.authorId === actorId || target.body.owner === actorId\n\n'
+                            'class Store {\n  archive(input: Input) {\n    for (const e of this.rows) {\n'
+                            '      if (e.authorId !== input.ownerId && e.body.owner !== input.ownerId) continue\n'
                             '    }\n  }\n}\n'),
-            'src/Svc.java': ('class Svc {\n    public static boolean retract(Row target, String by)\n    {\n'
-                             '        return target.body.for.equals(by);\n    }\n}\n'),
-            'src/svc.go': 'package svc\n\nfunc (s *S) Retract(t Row, by string) bool {\n\treturn t.body.for == by\n}\n',
-            'src/svc.rs': 'pub fn retract(t: &Row, by: &str) -> bool {\n    t.body.for == by\n}\n',
-            'docs/decisions.md': 'D9: body.for counts only on Companion rows.\n',
+            'src/Svc.java': ('class Svc {\n    public static boolean cancel(Row target, String by)\n    {\n'
+                             '        return target.body.owner.equals(by);\n    }\n}\n'),
+            'src/svc.go': 'package svc\n\nfunc (s *S) Cancel(t Row, by string) bool {\n\treturn t.body.owner == by\n}\n',
+            'src/svc.rs': 'pub fn cancel(t: &Row, by: &str) -> bool {\n    t.body.owner == by\n}\n',
+            'docs/decisions.md': 'D4: body.owner counts only on agent rows.\n',
         }.items():
             os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
             open(os.path.join(root, rel), 'w').write(text)
         os.makedirs(os.path.join(root, '.forge'))
-        json.dump({'version': 1, 'checks': [{'name': 'gate-mayread', 'spec': 'spec/GateSpec.dfy', 'files': ['impl/Gate.dfy'],
-                                             'watchedFields': ['body.for']}]}, open(os.path.join(root, CONFIG), 'w'))
+        json.dump({'version': 1, 'checks': [{'name': 'policy-view', 'spec': 'spec/GateSpec.dfy', 'files': ['impl/Gate.dfy'],
+                                             'watchedFields': ['body.owner']}]}, open(os.path.join(root, CONFIG), 'w'))
         code, out = run(root, '--json')
         got = sorted((h['file'], h['function']) for h in hits(out))
-        cases.append(('bypass: chronicle-shaped: mayRetract and forget (TS), retract in Java/Go/Rust named; docs skipped',
-                      code == 1 and got == [('src/Svc.java', 'retract'), ('src/gate.ts', 'forget'), ('src/gate.ts', 'mayRetract'),
-                                            ('src/svc.go', 'Retract'), ('src/svc.rs', 'retract')]))
+        cases.append(('bypass: app-shaped: canCancel and archive (TS), cancel in Java/Go/Rust named; docs skipped',
+                      code == 1 and got == [('src/Svc.java', 'cancel'), ('src/policy.ts', 'archive'), ('src/policy.ts', 'canCancel'),
+                                            ('src/svc.go', 'Cancel'), ('src/svc.rs', 'cancel')]))
         before = open(os.path.join(root, CONFIG)).read()
-        rc = subprocess.run([sys.executable, CLI, 'bypass', '--root', root, '--count', '--json', '--rule', 'gate-mayread',
-                             '--set-terms', '.body.for', 'not_in_this_project'], stdout=subprocess.PIPE, universal_newlines=True)
+        rc = subprocess.run([sys.executable, CLI, 'bypass', '--root', root, '--count', '--json', '--rule', 'policy-view',
+                             '--set-terms', '.body.owner', 'not_in_this_project'], stdout=subprocess.PIPE, universal_newlines=True)
         try:
-            pv = json.loads(rc.stdout).get('gate-mayread', {})
+            pv = json.loads(rc.stdout).get('policy-view', {})
         except ValueError:
             pv = {}
         cases.append(('bypass: --count previews other terms (lines per term) and writes nothing',
-                      rc.returncode == 0 and pv.get('per_term') == {'.body.for': 5, 'not_in_this_project': 0}
+                      rc.returncode == 0 and pv.get('per_term') == {'.body.owner': 5, 'not_in_this_project': 0}
                       and open(os.path.join(root, CONFIG)).read() == before))
         txt = subprocess.run([sys.executable, CLI, 'check', '--root', root, '--no-write'], stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, universal_newlines=True).stdout
-        cases.append(('bypass: check text names the places ("N places decide with body.for outside gate-mayread")',
-                      '5 places decide with body.for outside gate-mayread: ' in txt and 'src/gate.ts:8 mayRetract' in txt))
+        cases.append(('bypass: check text names the places ("N places decide with body.owner outside policy-view")',
+                      '5 places decide with body.owner outside policy-view: ' in txt and 'src/policy.ts:8 canCancel' in txt))
     return cases
 
 
@@ -895,7 +895,9 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, 'p')
         shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
-        code, res = diff(root)
+        # a fixed input count, not the 1.5 s budget: under load the JVM got through too few inputs to
+        # reach the long wraparound (failed twice on a loaded machine, passed on rerun)
+        code, res = diff(root, '--budget-ms', '60000')
         py, js = res.get('wallet-cap:py', {}), res.get('wallet-cap:js', {})
         kinds_py = sorted({json.dumps(d['reference']['ok']) + '>' + json.dumps(d['got']['ok']) for d in py.get('disagreements', [])})
         failing_py = sorted(f['id'][:2] for f in (py.get('decisions') or {}).get('failing', []))
@@ -904,8 +906,8 @@ def main():
             ('diff: shipped Python bugs found (exact cap, zero, negative)', code == 1 and py.get('verdict') == 'DISAGREE'
              and failing_py == ['D1', 'D3', 'D4']),
             ('diff: the wrapper agrees with the proved rule', (py.get('per_candidate') or {}).get('app-wrapper') == 0),
-            ('diff: shipped TypeScript bugs found (zero, negative)', js.get('verdict') == 'DISAGREE'
-             and failing_js == ['D3', 'D4']),
+            ('diff: shipped TypeScript bugs found (exact cap, zero, negative)', js.get('verdict') == 'DISAGREE'
+             and failing_js == ['D1', 'D3', 'D4']),
             ('diff: each run under 2 seconds', py.get('ms', 9999) < 2000 and js.get('ms', 9999) < 2000),
             ('diff: at most 3 differently shaped examples per kind of wrong answer, never a decision input again',
              all(n <= 3 for n in __import__('collections').Counter((d['candidate'], d.get('group')) for d in py.get('disagreements', [])).values())
@@ -935,13 +937,13 @@ def main():
         go_res, rs_res = res.get('wallet-cap:go', {}), res.get('wallet-cap:rs', {})
         cases.append(('diff: Go evaluator finds the shipped Go bugs (exact cap, zero, negative)',
                       sorted(f['id'][:2] for f in (go_res.get('decisions') or {}).get('failing', [])) == ['D1', 'D3', 'D4']))
-        cases.append(('diff: Rust evaluator finds zero accepted and the overflow panic',
-                      [f['id'][:2] for f in (rs_res.get('decisions') or {}).get('failing', [])] == ['D3']
+        cases.append(('diff: Rust evaluator finds exact cap, zero accepted and the overflow panic',
+                      sorted(f['id'][:2] for f in (rs_res.get('decisions') or {}).get('failing', [])) == ['D1', 'D3']
                       and any('overflow' in json.dumps(d['got']) for d in rs_res.get('disagreements', []))))
         cases.append(('diff: Go and Rust runs under 2 seconds once built', go_res.get('ms', 9999) < 2000 and rs_res.get('ms', 9999) < 2000))
         java_res = res.get('wallet-cap:java', {})
-        cases.append(('diff: Java evaluator finds the exact-cap bug and the long wraparound',
-                      [f['id'][:2] for f in (java_res.get('decisions') or {}).get('failing', [])] == ['D1']
+        cases.append(('diff: Java evaluator finds exact cap, zero accepted and the long wraparound',
+                      sorted(f['id'][:2] for f in (java_res.get('decisions') or {}).get('failing', [])) == ['D1', 'D3']
                       and any(isinstance(d.get('got'), dict) and d['got'].get('ok') is True
                               and isinstance(d['got'].get('spent'), int) and d['got']['spent'] < 0
                               for d in java_res.get('disagreements', []))))
@@ -1013,7 +1015,7 @@ def main():
         extra += 1
         print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
     # Messy inputs: the unproved wrapper that turns raw app/JSON values into Dafny values must fail closed, never throw
-    # (owner feedback: a real app's wrapper threw on `householdId: undefined`, and the plain fuzz never sent one).
+    # (owner feedback: a real app's wrapper threw on an `undefined` id field, and the plain fuzz never sent one).
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, 'p')
         shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
@@ -1072,6 +1074,63 @@ def main():
                 print('      ' + json.dumps({k: {kk: v.get(kk) for kk in ('verdict', 'per_candidate', 'messy', 'error')}
                                              for k, v in on.items()}, ensure_ascii=True)[:700])
 
+    # Messy inputs in the compiled languages (Go, Rust, Java; C# in tests/run_cs_diff.py): each adapter names wrappers
+    # that take the RAW JSON value (json.RawMessage, serde_json::Value, the evaluator's parsed value) and a fail-closed
+    # answer. Planted per language: one wrapper that panics/throws on a null or wrong-typed amount, one that coerces "5".
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, 'p')
+        shutil.copytree(EXAMPLE, root, ignore=shutil.ignore_patterns('cache', 'regressions', '__pycache__'))
+        cfg = json.load(open(os.path.join(root, CONFIG)))
+        crash = {'go': 'wrapper-panics', 'rs': 'wrapper-panics', 'java': 'wrapper-throws'}
+
+        def compiled_cfg(flag):
+            cfg['checks'][0]['diff'] = [
+                dict({'name': 'messy-go', 'lang': 'go', 'inputs': 'diff/wallet_inputs.py', 'adapter': 'diff/wallet_messy.go'}, **flag),
+                dict({'name': 'messy-rs', 'lang': 'rs', 'inputs': 'diff/wallet_inputs.py', 'adapter': 'diff/wallet_messy.rs'}, **flag),
+                dict({'name': 'messy-java', 'lang': 'java', 'inputs': 'diff/wallet_inputs.py', 'adapter': 'diff/wallet_messy.java',
+                      'java_sources': ['messyjava']}, **flag)]
+            json.dump(cfg, open(os.path.join(root, CONFIG), 'w'))
+
+        compiled_cfg({'messy': False})  # negative control first: without the messy step, nothing is found
+        code_off, off = diff(root)
+        compiled_cfg({})
+        code_on, on = diff(root)
+        code_again, again = diff(root)
+        no_undef = [k for k in forge_diff.MESSY_KINDS if k != 'undefined']
+        cases_cm = [('messy (Go, Rust, Java): negative control, messy off: the planted wrappers agree on well-typed inputs',
+                     code_off == 0 and len(off) == 3 and all(r.get('verdict') == 'DIFF_OK' and 'messy' not in r for r in off.values()))]
+        for lang, label in (('go', 'Go'), ('rs', 'Rust'), ('java', 'Java')):
+            r = on.get('wallet-cap:messy-' + lang, {})
+            m = r.get('messy') or {}
+            t = got(r, crash[lang], 'THROWS_ON_MESSY_INPUT')
+            c = got(r, 'wrapper-coerces', 'MESSY_ANSWER')
+            kinds = [k for k in no_undef if k != 'lone-surrogate'] if lang == 'rs' else no_undef
+            cases_cm += [
+                ('messy %s: the wrapper that crashes on a null, missing or wrong-typed amount is THROWS_ON_MESSY_INPUT, '
+                 'only on amount, shrunk to cap 0, spent 0' % label,
+                 code_on == 1 and len(t) > 0 and {d['messy']['as'] for d in t} & {'null', 'removed'}
+                 and all(d['messy']['field'] == 'amount' for d in got(r, crash[lang]))
+                 and any({k: v for k, v in d['input'].items() if k != 'amount'} == {'cap': 0, 'spent': 0} for d in t)),
+                ('messy %s: the wrapper that coerces "5" to 5 is a MESSY_ANSWER disagreement' % label,
+                 any(d['messy']['as'] == 'number-as-text' and isinstance(d['input']['amount'], str) for d in c)),
+                ('messy %s: negative control, the fail-closed wrapper has 0 messy disagreements (%d messy inputs)'
+                 % (label, m.get('inputs', 0)),
+                 r.get('per_candidate', {}).get('wrapper-safe') == 0 and m.get('inputs', 0) > 100),
+                ('messy %s: every kind but undefined%s is tried and judged' % (label, ' and lone-surrogate (serde_json rejects it)'
+                                                                              if lang == 'rs' else ''),
+                 m.get('kinds') == kinds and m.get('not_judged') == 0 and m.get('pairs_tried', 0) >= 3 * len(kinds)
+                 and m.get('skipped_kinds', []) == (['lone-surrogate'] if lang == 'rs' else [])),
+                ('messy %s: saved messy cases replay first next run' % label,
+                 again.get('wallet-cap:messy-' + lang, {}).get('replayed', 0) >= len(got(r, crash[lang])) > 0 and code_again == 1),
+            ]
+        for name, ok in cases_cm:
+            failed += not ok
+            extra += 1
+            print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
+            if not ok:
+                print('      ' + json.dumps({k: {kk: v.get(kk) for kk in ('verdict', 'per_candidate', 'messy', 'error')}
+                                             for k, v in on.items()}, ensure_ascii=True)[:1500])
+
     # INVARIANTS.md: generated from the approved rules; CI catches a stale copy
     with tempfile.TemporaryDirectory() as tmp:
         root = os.path.join(tmp, 'p')
@@ -1102,6 +1161,24 @@ def main():
         failed += not ok
         extra += 1
         print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
+    sys.path.insert(0, HERE)
+    import coverage_mutate_cases  # diff --coverage and mutate --app (M1.2)
+    for name, ok in coverage_mutate_cases.cases():
+        failed += not ok
+        extra += 1
+        print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
+    # signed approvals (S1): the rogue-agent exit gate, software ed25519 keys made at test time
+    sig = subprocess.run([sys.executable, os.path.join(HERE, 'run_signed_approval.py')], stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, universal_newlines=True)
+    for line in sig.stdout.splitlines():
+        if line.startswith(('ok  ', 'FAIL')):
+            failed += line.startswith('FAIL')
+            extra += 1
+            print(line)
+    if sig.returncode and 'FAIL' not in sig.stdout:
+        failed += 1
+        extra += 1
+        print('FAIL  signed approvals: run_signed_approval.py exit %d: %s' % (sig.returncode, sig.stdout[-400:]))
     print('%d cases, %d failed' % (len(CASES) + len(BUILD_CASES) + extra, failed))
     return 1 if failed else 0
 

@@ -1,0 +1,152 @@
+name: isolation
+# The airlock Docker battery (airlock/proof/validate.sh = prove_release G2-G4) and the `forge up`
+# end-to-end test with the agent under each isolation backend (airlock/backends), on a Linux runner:
+#   docker   runc (the baseline; also the negative controls: gvisor and microvm are refused here)
+#   gvisor   gVisor runsc from the official apt repository, pinned release, registered with Docker
+#   microvm  Kata Containers (pinned static release, QEMU) registered with Docker; needs /dev/kvm
+# plus a minimal Firecracker boot (pinned release) on the same runner. Startup overhead per runtime
+# is measured on the runner (airlock/proof/startup_bench.py) and printed in the log.
+on:
+  push:
+    branches: ["feat/M4-**"]
+    paths: ["airlock/**", ".github/workflows/isolation.yml"]
+  pull_request:
+    paths: ["airlock/**", ".github/workflows/isolation.yml"]
+permissions:
+  contents: read
+env:
+  GVISOR_RELEASE: "20261102"          # apt dist of that release; package runsc=20261102.0
+  KATA_VERSION: "4.3.1"
+  KATA_SHA256: "66b35b06f6b41b56f8606ddf3ed3e5660b0971d1e309d903457c4056a0b9eff0"   # kata-go-static-4.3.1-amd64.tar.zst
+  FIRECRACKER_VERSION: "v1.17.0"
+  FIRECRACKER_SHA256: "06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558"   # firecracker-v1.17.0-x86_64.tgz
+jobs:
+  battery:
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [docker, gvisor, microvm]
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - name: host facts
+        run: |
+          uname -a; nproc; free -m; docker version --format 'docker {{.Server.Version}}'
+          ls -l /dev/kvm 2>&1 || true
+          grep -cE 'vmx|svm' /proc/cpuinfo || true
+      - name: install gVisor (official apt repository, pinned release)
+        if: matrix.backend == 'gvisor'
+        run: |
+          set -eux
+          curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases ${GVISOR_RELEASE} main" \
+            | sudo tee /etc/apt/sources.list.d/gvisor.list
+          sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/gvisor.list -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0
+          sudo apt-get install -y "runsc=${GVISOR_RELEASE}.0"
+          runsc --version
+          # Plain registration. The agent's names are pinned in its /etc/hosts by `up` and validate.sh
+          # (Docker's embedded DNS is a NAT rule that gVisor's netstack does not see).
+          sudo runsc install
+          sudo systemctl restart docker
+          cat /etc/docker/daemon.json
+      - name: install Kata Containers (pinned static release) and register it with Docker
+        if: matrix.backend == 'microvm'
+        run: |
+          set -eux
+          [ -e /dev/kvm ] || { echo "BLOCKED_NEEDS_HUMAN: this runner has no /dev/kvm (microvm needs KVM)"; exit 1; }
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+          f=kata-go-static-${KATA_VERSION}-amd64.tar.zst
+          curl -fsSL -o "$RUNNER_TEMP/$f" "https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/$f"
+          echo "${KATA_SHA256}  $RUNNER_TEMP/$f" | sha256sum -c -
+          sudo tar --zstd -xf "$RUNNER_TEMP/$f" -C /
+          rm -f "$RUNNER_TEMP/$f"
+          sudo ln -sf /opt/kata/bin/containerd-shim-kata-v2 /usr/local/bin/containerd-shim-kata-v2
+          sudo ln -sf /opt/kata/bin/kata-runtime /usr/local/bin/kata-runtime
+          ls /opt/kata/share/defaults/kata-containers/ || true
+          sudo kata-runtime check --no-network-checks || true
+          sudo python3 - <<'PY'
+          import json, os
+          p = "/etc/docker/daemon.json"
+          d = json.load(open(p)) if os.path.exists(p) else {}
+          d.setdefault("runtimes", {})["kata"] = {"runtimeType": "io.containerd.kata.v2"}
+          json.dump(d, open(p, "w"), indent=1)
+          PY
+          sudo systemctl restart docker
+          cat /etc/docker/daemon.json
+      - name: registered runtimes
+        run: docker info --format '{{json .Runtimes}}' | python3 -c 'import json,sys; print(sorted(json.load(sys.stdin)))'
+      - name: startup overhead (cold and warm container start, this runner)
+        timeout-minutes: 15
+        run: |
+          timeout 600 docker compose -p forgeair-build -f airlock/proof/docker-compose.yml build -q
+          rts=runc
+          [ "${{ matrix.backend }}" = gvisor ] && rts=runc,runsc
+          [ "${{ matrix.backend }}" = microvm ] && rts=runc,kata
+          # cold = the first start after a Docker restart and a page-cache drop, for EACH runtime separately
+          for rt in ${rts//,/ }; do
+            echo "restart docker for a cold $rt start"
+            sudo timeout 180 systemctl restart docker && sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+            timeout 120 sh -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
+            timeout 300 python3 airlock/proof/startup_bench.py forge-airlock-proof:local "$rt" 10 > "$RUNNER_TEMP/startup-$rt.json"
+          done
+          cat "$RUNNER_TEMP"/startup-*.json
+      - name: Docker battery (validate.sh = G2-G4) with the agent under ${{ matrix.backend }}
+        run: |
+          s=$SECONDS
+          set -o pipefail
+          FORGE_ISOLATION=${{ matrix.backend }} timeout 1800 airlock/proof/validate.sh "$RUNNER_TEMP/validate" \
+            </dev/null 2>&1 | tee "$RUNNER_TEMP/validate-console.txt" | grep --line-buffered -E "^(ok  |FAIL|info|==)" && v=0 || v=$?
+          [ "$v" = 124 ] && { echo "validate.sh TIMED OUT after 1800 s"; docker ps -a; }
+          cat "$RUNNER_TEMP/validate/summary.txt"
+          echo "battery ${{ matrix.backend }}: exit=$v checks_ok=$(grep -c '^ok  ' "$RUNNER_TEMP/validate/summary.txt") checks_fail=$(grep -c '^FAIL' "$RUNNER_TEMP/validate/summary.txt") wall=$((SECONDS-s))s"
+          [ "$v" = 0 ] || { tail -60 "$RUNNER_TEMP/validate-console.txt"; exit 1; }
+      - name: forge up end-to-end with --isolation ${{ matrix.backend }}
+        if: always()
+        run: |
+          [ "${{ matrix.backend }}" = docker ] || export FORGE_E2E_ISOLATION=${{ matrix.backend }}
+          timeout 900 python3 airlock/tests/run_up_e2e.py
+      - name: minimal Firecracker boot (pinned release; Kata's guest kernel; busybox initramfs)
+        if: always() && matrix.backend == 'microvm'
+        run: |
+          set -eux
+          [ -e /dev/kvm ] || { echo "BLOCKED_NEEDS_HUMAN: no /dev/kvm"; exit 1; }
+          d=$RUNNER_TEMP/fc; mkdir -p "$d/root/bin" "$d/root/proc" "$d/root/dev"
+          curl -fsSL -o "$d/fc.tgz" "https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/firecracker-${FIRECRACKER_VERSION}-x86_64.tgz"
+          echo "${FIRECRACKER_SHA256}  $d/fc.tgz" | sha256sum -c -
+          tar -xzf "$d/fc.tgz" -C "$d"
+          FC=$(find "$d" -type f -name "firecracker-${FIRECRACKER_VERSION}-x86_64")
+          "$FC" --version
+          K=$(readlink -f /opt/kata/share/kata-containers/vmlinux.container)
+          file "$K" || true
+          sudo apt-get install -y busybox-static cpio
+          cp /bin/busybox "$d/root/bin/busybox"
+          printf '#!/bin/busybox sh\n/bin/busybox mount -t proc proc /proc\necho FC-GUEST: $(/bin/busybox cat /proc/version)\necho FC-BOOT-OK\n/bin/busybox reboot -f\n' > "$d/root/init"
+          chmod +x "$d/root/init"
+          (cd "$d/root" && find . | cpio -o -H newc 2>/dev/null | gzip > "$d/initrd.gz")
+          cat > "$d/vm.json" <<EOF
+          {"boot-source": {"kernel_image_path": "$K", "initrd_path": "$d/initrd.gz",
+                           "boot_args": "console=ttyS0 reboot=k panic=1 pci=off rdinit=/init"},
+           "drives": [], "machine-config": {"vcpu_count": 1, "mem_size_mib": 256}}
+          EOF
+          for i in 1 2 3 4 5 6; do
+            s=$(date +%s%N)
+            timeout 60 "$FC" --no-api --config-file "$d/vm.json" > "$d/boot$i.log" 2>&1 || true
+            e=$(date +%s%N)
+            grep -q FC-BOOT-OK "$d/boot$i.log" || { tail -40 "$d/boot$i.log"; exit 1; }
+            echo "firecracker boot $i: $(( (e-s)/1000000 )) ms (process start to guest reboot exit)"
+          done
+          grep -E "FC-GUEST" "$d/boot1.log"
+          echo "host kernel: $(cat /proc/version)"
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: isolation-${{ matrix.backend }}
+          path: |
+            ${{ runner.temp }}/validate
+            ${{ runner.temp }}/validate-console.txt
+            ${{ runner.temp }}/startup-*.json
+          if-no-files-found: warn
