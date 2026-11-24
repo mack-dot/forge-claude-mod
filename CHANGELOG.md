@@ -4,6 +4,20 @@ Each entry says what was tested and how. "Not tested" items are listed, not hidd
 
 ## Unreleased
 
+- **Bypass gate: decision reads only (AST) in TS/JS and Python.** A text hit of a watched field counts only where the
+  field is read in a decision (if/while condition, comparison, `in`, `.includes`, ternary, switch/case, `&&`/`||`
+  guard, filter/find/some/every predicate, comprehension `if`, assert, SQL `WHERE` parameter, alias). Each hit names
+  its kind. TS/JS: TypeScript 5.6.3 compiler API (downloaded once, SHA-256 pinned); Python: `ast`. Other languages
+  keep the text search ("text search, not AST"); a file that does not parse, or no parser on the machine, falls back
+  to the text search for that file and says so. `allowedBypasses` entries stay valid by line hash. Code:
+  `cli/forge_ast.py`, `cli/eval/ts_decisions.cjs`, a small hook in `run_bypass`.
+  Tested: 15 new cases in `tests/run_tests.py` (a planted read in a ternary, a switch, an `.includes`/`in` and a
+  filter predicate, in TS and in Python, each `BYPASS_FOUND`; the gate gives `UNAPPROVED_BYPASS` on a real proof; a
+  file of only types/comments/imports gives 0 hits; parse errors and a missing parser fall back to text; Go stays
+  text; old approvals stay allowed). Measured on a private app copy: 290 text lines to 76 hits (46 AST decision
+  reads, all checked by hand; 30 data-file lines by text); the three known places still found.
+  Not tested: Windows; Python older than 3.10 (`match` does not parse there and falls back to text); TS/JS syntax
+  newer than TypeScript 5.6.
 - New (diff, M1.1b): messy-input fuzz in the Go, Rust, Java and C# evaluators, as in JavaScript/TypeScript and
   Python. An adapter may name raw-value `wrappers` (or one `wrapper`) and a fail-closed answer: Go
   `json.RawMessage` (`failClosed`), Rust `serde_json::Value` (`fail_closed`), Java the evaluator's parsed value

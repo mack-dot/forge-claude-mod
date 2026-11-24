@@ -361,9 +361,31 @@ files (275 of them for the id field): too many for a gate. The specific terms (t
 a comparison on the id field from each side, the forms shown above) match 19 lines in 10 files, and still name the
 three places found by hand.
 
-Limits: a text search per line, not a data-flow analysis (a FINITE TEST of the listed terms). It misses aliases
-(`const f = body.owner`), dynamic access (`body[key]`), destructuring (`const { owner: f } = body`), a term split over
-lines, and code that decides the same question under other names. The function name is a heuristic on indentation.
+**Decision reads only (AST), in TypeScript / JavaScript and Python.** In these files a line counts only where the
+watched field is READ in a decision. Each hit names its kind: `if-condition`, `early-return-guard`, `loop-condition`,
+`comparison` (`===`, `!==`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `instanceof`), `in`, `includes` (also `.has`,
+`.indexOf`, `.startsWith`, ...), `ternary`, `switch`, `case`, `logical-guard` (the left side of `&&` / `||`, not an
+`x || ''` default), `filter-predicate` / `find-predicate` / `predicate` (`filter`, `find`, `some`, `every`; Python
+comprehension `if`, `filter`, `any`, `all`), `assert`, `sql-where` (a parameter of a query whose SQL text has a
+`WHERE`), and `alias` (`const v = row.f` where `v` is read in a decision in the same function). Type and interface
+declarations, type annotations, imports, comments, string literals, plain assignment, object construction and
+logging are not hits. TS / JS files are parsed with the TypeScript compiler API (TypeScript 5.6.3, downloaded once
+into the cache and checked against its pinned SHA-256, as Dafny is; it only parses, it never runs the app); Python
+files with `ast`. Every other file (Go, Rust, Java, C#, data files) keeps the text search per line, labelled
+`text search, not AST`. A TS / JS / Python file that does not parse, or a machine without Node or without the
+TypeScript package (offline, `FORGE_NO_DOWNLOAD=1`), falls back to the text search for that file and the report
+says `FALLBACK to text search, not AST` with the reason: fail closed, never skipped. An approved `allowedBypasses`
+entry stays allowed by its line hash. `bypass --json` lists the text hits that are not decision reads under
+`"not_decisions"`.
+
+Measured on a copy of the same app with the bare terms (290 text lines): 76 hits remain, 46 decision reads found by
+the AST (all 46 checked by hand: each is a decision site) and 30 lines in data files (text search, not AST); the
+three places found by hand are still found. Of the 214 dropped lines, 85 were checked by hand: 81 are not decisions;
+4 feed a decision that the search cannot see (2 checks through a computed key, 2 inputs to a policy engine).
+
+Limits: a syntactic search, not a data-flow analysis (a FINITE TEST of the listed terms). It misses a value passed
+to another function or returned to a caller that decides, dynamic access (`body[key]`), and code that decides the
+same question under other names. The alias rule is name-based. The function name is a heuristic on indentation.
 
 ## INVARIANTS.md: every approved rule in one place
 
