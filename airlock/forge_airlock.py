@@ -170,7 +170,12 @@ def stage_repo(repo, dest):
 
 # ---------------------------------------------------------------- compose generation
 def compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, pass_env, readonly_dirs,
-                own_agent_image=False, llm_session="default", egress_token=None, agent_runtime=None):
+                own_agent_image=False, llm_session="default", egress_token=None, agent_runtime=None,
+                host_binds=True):
+    """host_binds=False (forge up): the agent container gets NO bind mount of a host folder. Its
+    /forge-run (and /forge/agent for --agent-image) come from the project volume `agentrun`, filled
+    by seed_agent_volume() before the start. M2.3: a bind mount shows its HOST path in the agent's
+    /proc/self/mountinfo (the run folder, the plugin folder under your home directory)."""
     agent_env = {"FORGE_AIRLOCK": f"http://airlock:{PORT}", "HOME": "/tmp"}
     if pol.egress_allow:
         agent_env.update(HTTPS_PROXY="http://egress:3128", HTTP_PROXY="http://egress:3128",
@@ -208,8 +213,11 @@ def compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, pass
         "agent": dict(harden, **{
             "image": agent_image, "user": "1000:1000", "tmpfs": ["/tmp:exec,mode=1777"],
             "environment": agent_env_list, "working_dir": pol.agent_root,
-            "volumes": [f"ws:{pol.agent_root}"] + ro_mounts + [f"{run_dir}/agent:/forge-run:ro"]
-            + ([f"{HERE}/agent:/forge/agent:ro"] if own_agent_image else []),
+            "volumes": [f"ws:{pol.agent_root}"] + ro_mounts + (
+                [f"{run_dir}/agent:/forge-run:ro"] + ([f"{HERE}/agent:/forge/agent:ro"] if own_agent_image else [])
+                if host_binds else
+                [_sub("agentrun", "run", "/forge-run")] + ([_sub("agentrun", "agent", "/forge/agent")]
+                                                          if own_agent_image else [])),
             "networks": ["agentnet"], "stdin_open": True, "tty": True,
             "depends_on": {"airlock": {"condition": "service_healthy"}},
         }),
@@ -222,6 +230,9 @@ def compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, pass
                         "/state/filtered.git", "/out"],
         },
     }
+    if not host_binds:  # fills the agentrun volume from a tar stream on stdin (no host folder mounted)
+        svc["seeder"] = {"image": IMAGE, "profiles": ["seed"], "network_mode": "none", "stdin_open": True,
+                         "volumes": ["agentrun:/dst"], "command": ["sh", "-c", "umask 022 && tar -x -o -C /dst"]}
     if pol.egress_allow or pol.llm:
         private = ["--private", f"{pol.llm['host']}:{pol.llm['port']}"] if pol.llm else []
         svc["egress"] = dict(harden, **{
@@ -236,7 +247,36 @@ def compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, pass
     B.apply({"services": svc}, agent_runtime)
     return {"services": svc,
             "networks": {"agentnet": {"internal": True}, "outnet": {}},
-            "volumes": {"ws": {}, "state": {}, "logs": {"external": True, "name": logs_volume}}}
+            "volumes": dict({"ws": {}, "state": {}, "logs": {"external": True, "name": logs_volume}},
+                            **({} if host_binds else {"agentrun": {}}))}
+
+
+def _sub(volume, subpath, target):
+    return {"type": "volume", "source": volume, "target": target, "read_only": True, "volume": {"subpath": subpath}}
+
+
+def seed_agent_volume(dc, run_dir, own_agent_image):
+    """Fill the agentrun volume: run/ = <run_dir>/agent (mcp.json), agent/ = this plugin's agent
+    scripts (only with --agent-image). Owner root, modes 0644/0755; the agent mounts it read-only."""
+    import io
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for top, src in [("run", os.path.join(run_dir, "agent"))] + (
+                [("agent", os.path.join(HERE, "agent"))] if own_agent_image else []):
+            def clean(ti):
+                if "__pycache__" in ti.name.split("/"):
+                    return None
+                ti.uid = ti.gid = 0
+                ti.uname = ti.gname = ""
+                ti.mode = 0o755 if ti.isdir() else 0o644
+                return ti
+            tar.add(src, arcname=top, filter=clean)
+    r = subprocess.run(dc + ["--profile", "seed", "run", "--rm", "-T", "seeder"], input=buf.getvalue(),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if r.returncode:
+        raise SystemExit("forge-airlock: could not fill the agent's run volume: "
+                         + r.stderr.decode(errors="replace")[-300:])
 
 
 def readonly_dirs(pol, stage=None):
@@ -361,7 +401,7 @@ def cmd_up(a):
             json.dump({"mcpServers": {"forge-airlock": {"type": "http", "url": f"http://airlock:{PORT}/mcp"}}}, f)
         doc = compose_doc(pol, policy_path, stage, run_dir, logs_volume, agent_image, a.pass_env,
                           readonly_dirs(pol, stage), own_agent_image=bool(a.agent_image), llm_session=project,
-                          agent_runtime=agent_runtime)
+                          agent_runtime=agent_runtime, host_binds=False)
         if pol.llm:
             c = pol.llm
             say(f"model access through the airlock: {c['scheme']}://{c['host']}:{c['port']} with the key from "
@@ -370,6 +410,7 @@ def cmd_up(a):
         with open(os.path.join(run_dir, "compose.json"), "w") as f:
             json.dump(doc, f, indent=1)
         run(["docker", "volume", "create", logs_volume], stdout=subprocess.DEVNULL)
+        seed_agent_volume(dc, run_dir, bool(a.agent_image))
         say("starting the airlock (filtered workspace, upstream servers) ...")
         services = ["airlock"] + (["egress"] if pol.egress_allow or pol.llm else [])
         if run(dc + ["up", "-d", "--wait"] + services, stdout=subprocess.DEVNULL,
