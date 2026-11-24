@@ -1,5 +1,5 @@
 ---
-description: Forge · CRASH-CHECK (no spec): call your HTTP/webhook handlers, parsers and exported entry points with messy JSON and list every crash
+description: Forge (more) · CRASH-CHECK (no spec): call your HTTP/webhook handlers, parsers and exported entry points with messy JSON and list every crash
 argument-hint: "[file:function ...] (default: the boundary functions Forge finds)"
 ---
 Forge rule: this is a CRASH-CHECK. It needs no spec and proves nothing. Never call its result PROVED, verified or safe; say "a finite test with messy inputs". The tool is `python3 "${CLAUDE_PLUGIN_ROOT}/cli/forge_crash.py"`. Functions the person named, if any: "$ARGUMENTS".

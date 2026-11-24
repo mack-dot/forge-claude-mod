@@ -119,6 +119,7 @@ DAFNY_RELEASES = {
     ('Windows', 'AMD64'): ('dafny-4.11.0-x64-windows-2022.zip',
                            '3653f05a111ca21e234709ea7b25ce96083fd6c6f10484256ba54110dbc0654d'),
 }
+DAFNY_INSTALL_DOC = 'https://github.com/dafny-lang/dafny/releases/tag/v4.11.0'
 TARGETS = {  # target: (tools that must be on PATH, extra Dafny options)
     'py': (['python3'], []),
     'js': (['node', 'npm'], []),
@@ -328,8 +329,9 @@ def download_dafny(log=sys.stderr):
     cache. Returns the path of the dafny program, or raises ConfigError."""
     key = (platform.system(), platform.machine())
     if key not in DAFNY_RELEASES:
-        raise ConfigError('no pinned Dafny %s download for %s %s; install Dafny yourself and put it '
-                          'on PATH' % (DAFNY_VERSION, key[0], key[1]))
+        raise ConfigError('no pinned Dafny %s download for %s %s. Install Dafny %s yourself (%s), then put dafny '
+                          'on PATH or set FORGE_DAFNY=/path/to/dafny' % (DAFNY_VERSION, key[0], key[1], DAFNY_VERSION,
+                                                                     DAFNY_INSTALL_DOC))
     name, want = DAFNY_RELEASES[key]
     url = 'https://github.com/dafny-lang/dafny/releases/download/v%s/%s' % (DAFNY_VERSION, name)
     os.makedirs(cache_dir(), exist_ok=True)
@@ -337,13 +339,18 @@ def download_dafny(log=sys.stderr):
     fd, part = tempfile.mkstemp(prefix='dafny-', suffix='.zip.part', dir=cache_dir())
     try:
         digest = hashlib.sha256()
-        with os.fdopen(fd, 'wb') as out, urllib.request.urlopen(url, timeout=120) as resp:
-            while True:
-                chunk = resp.read(1 << 20)
-                if not chunk:
-                    break
-                digest.update(chunk)
-                out.write(chunk)
+        try:
+            with os.fdopen(fd, 'wb') as out, urllib.request.urlopen(url, timeout=120) as resp:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    out.write(chunk)
+        except (OSError, ValueError) as e:  # no network, DNS, proxy, timeout (urllib's errors are OSErrors)
+            raise ConfigError('could not download Dafny %s (%s). Connect to the internet and run /forge again, or '
+                              'install Dafny %s yourself (%s) and set FORGE_DAFNY=/path/to/dafny'
+                              % (DAFNY_VERSION, getattr(e, 'reason', None) or e, DAFNY_VERSION, DAFNY_INSTALL_DOC)) from None
         if digest.hexdigest() != want:
             raise ConfigError('the Dafny download has SHA-256 %s, not the pinned %s; nothing was '
                               'installed' % (digest.hexdigest(), want))
@@ -624,8 +631,9 @@ def run_checks(root, base=None, signers_arg=None, signed=True, callers=True):
                 'specs must review this change.' % (base, ', '.join(approval_changed)))
             continue
         if not config_ok:
-            put('CONFIG_CHANGED', '%s is not approved as it is now (a check, spec path, file list '
-                'or binding changed). Read it and approve it.' % CONFIG)
+            put('CONFIG_CHANGED', ('%s was never approved. Read it and approve it.' % CONFIG) if CONFIG not in approved
+                else ('%s is not approved as it is now (a check, spec path, file list or binding changed). Read it and '
+                      'approve it.' % CONFIG))
             continue
         spec_path = inside(root, spec)
         if not os.path.isfile(spec_path):
@@ -724,6 +732,112 @@ def run_checks(root, base=None, signers_arg=None, signed=True, callers=True):
     return out
 
 
+# Each verdict code in one plain sentence, and the one thing to do next. Shown under every verdict that is not a pass
+# (the CLI report, the Claude Code mod and the JSON "help" field), so a code never stands alone.
+VERDICT_HELP = {
+    'NOT_APPROVED': ('This rule has not been approved yet, so it is not checked.',
+                     'Read it and approve it: /forge approve (in Claude Code) or forge_check.py approve.'),
+    'CONFIG_CHANGED': ('The list of what Forge checks (.forge/forge.json) is not approved as it is now (it is new, '
+                       'or it changed after your approval).', 'Read it and approve it: /forge approve.'),
+    'SPEC_CHANGED': ('The approved rule, your answers or the decision record changed after your approval.',
+                     'Read the new version and approve it again: /forge approve.'),
+    'APPROVAL_CHANGED': ('This change touches an approved rule, so a person who may approve rules must review it.',
+                         'Review the rule change in this pull request, then approve it.'),
+    'APPROVAL_UNSIGNED': ('Signed approvals are required, and this approval has no valid signature from a trusted key.',
+                          'Approve again with your security key: forge_check.py approve --hardware (in a terminal).'),
+    'FAILED': ('The proof failed: the code does not do what the approved rule says.',
+               'Ask Claude to explain and fix the code: /forge:fix.'),
+    'EXAMPLES_FAILED': ('The rule disagrees with one of your recorded answers, or leaves it open.',
+                        'Ask Claude which answer and how to fix the rule: /forge:fix.'),
+    'BINDING_BROKEN': ('The proved code no longer points at the approved rule, so it could be checked against a weaker one.',
+                       'Ask Claude to restore its first lines: /forge:fix.'),
+    'UNSOUND_CONSTRUCT': ('The proof uses a shortcut (assume, axiom, {:verify false} or extern) that skips the proof.',
+                          'Ask Claude to remove the shortcut: /forge:fix.'),
+    'UNAPPROVED_BYPASS': ('The proof passed, but other code decides the same thing without the proved rule.',
+                          'Review each place: /forge:bypass.'),
+    'ERROR': ('The check could not run (a tool or a file problem; details below).',
+              'Ask Claude to find the cause: /forge:doctor.'),
+    'TOOLCHAIN_MISSING': ('A tool that this language needs is not installed.',
+                          'Install the missing tool (its install line is shown here), or remove that language from the check.'),
+    'NO_FUZZ': ('No fuzz harness: the compiled code would be untested.', 'Ask Claude to set it up: /forge:build-setup.'),
+    'FUZZ_NOT_VERIFIED': ('The proof checker did not accept the fuzz harness.', 'Ask Claude to fix it: /forge:build-setup.'),
+    'FUZZ_FAILED': ('The compiled proved code failed its own test in one language.',
+                    'Read the detail below; this can be a compiler bug. Ask Claude: /forge:fix.'),
+    'TARGETS_DIFFER': ('Two languages gave different answers for the same proved code.',
+                       'Read the detail below; this can be a compiler bug. Ask Claude: /forge:fix.'),
+    'EMIT_FAILED': ('The proved code could not be compiled to one language.', 'Ask Claude to find the cause: /forge:doctor.'),
+    'STALE_BUILD': ('The compiled proved code on disk differs from a fresh build (someone edited it, or it is old).',
+                    'Build it again: /forge build.'),
+    'NOT_WIRED': ('Your app does not import the compiled proved code (a usedBy text is missing).',
+                  'Ask Claude to switch your app to the proved rule, or remove the usedBy entry.'),
+    'SERVICE_TEST_FAILED': ('The service test of this check failed.', 'Fix the test or the app, then: /forge build.'),
+    'NOT_CALLED': ('The service test passed, but no process called the proved code.',
+                   'Make the app call the proved code (ask Claude), then: /forge build.'),
+    'APP_SYNTAX_ERROR': ('An app file that this check touches does not parse.', 'Fix the file, then run /forge again.'),
+    'TYPECHECK_FAILED': ('The type check of the app failed.', 'Fix the type errors, then run /forge again.'),
+    'NO_BUILD': ('The fuzz needs the compiled proved code, and this check has no build yet.',
+                 'Ask Claude to set it up: /forge:build-setup.'),
+    'BUILD_STALE': ('The compiled proved code is older than the rule.', 'Build it again: /forge build.'),
+    'DIFF_ERROR': ('The fuzz could not run (details below).', 'Ask Claude to find the cause: /forge:doctor.'),
+    'DISAGREE': ('Your shipped code gives a different answer than the proved rule on the inputs below.',
+                 'Each one is a bug in your code or a gap in the rule. Ask Claude to explain them.'),
+    'THROWS_ON_MESSY_INPUT': ('Your wrapper crashes on a messy value instead of refusing it.',
+                              'Make the wrapper return the refusing answer for that value (ask Claude).'),
+    'INVARIANTS_STALE': ('INVARIANTS.md is out of date with the approved rules.', 'Write it again: /forge invariants.'),
+    'BYPASS_FOUND': ('Code outside the rule decides on its watched fields.', 'Review each place: /forge:bypass.'),
+    'UNVERIFIED_CALLER': ('The proof passed, but some code calls around the proved rule (an old copy of the logic, or '
+                          'a caller that no longer reaches it).',
+                          'Route that call through the proved rule, or record why it is fine: ask Claude, then '
+                          '/forge approve.'),
+    'CALLERS_ERROR': ('The caller analysis could not run (details below).', 'Ask Claude to find the cause: /forge:doctor.'),
+    'NOT_CHECKED': ('Callers were not checked: the decision is in a language the caller analysis does not read. '
+                    'This is not a pass.', 'Nothing to fix; review those callers by hand.'),
+    'BUILD_FAILED': ('The proof checker could not compile the fuzz harness for one language.',
+                     'Ask Claude to find the cause: /forge:doctor.'),
+    'FUZZ_BUILD_FAILED': ('The fuzz harness could not be compiled for one language (often a toolchain problem, not '
+                          'your rule).', 'Read the detail below, then ask Claude: /forge:doctor.'),
+    'WRAPPER_CHANGED': ('The wrapper around the proved rule changed since the last approval or clean fuzz run.',
+                        'Run the fuzz again: /forge diff.'),
+    'DECISION_NOTE_STALE': ('The code that a decision record describes changed after approval; the proof still holds.',
+                            'Read the record and update it if needed (ask Claude), then /forge approve.'),
+    'TRACE_DISAGREE': ('Over a sequence of events, your code ends in a different state than the proved model.',
+                       'Ask Claude to explain the shrunk trace and propose a fix.'),
+    'TRACE_THROWS': ('Over a sequence of events, your code crashes where the proved model answers.',
+                     'Ask Claude to explain the shrunk trace and propose a fix.'),
+    'CRASH': ('CRASH-CHECK: a boundary function crashed on a messy input (a finite test, not a proof).',
+              'Ask Claude to explain each crash and propose a check that refuses that input: /forge:crash-fuzz.'),
+}
+
+
+def verdict_help(code):
+    """'what it means. Next: what to do' for a verdict code, or '' for a pass or an unknown code."""
+    h = VERDICT_HELP.get(code)
+    return '%s Next: %s' % h if h else ''
+
+
+# One exact install line per missing tool (TOOLCHAIN_MISSING), so the message says what to run.
+TOOL_HINTS = {
+    'node': 'install Node.js 22.18 or newer: https://nodejs.org/en/download',
+    'npm': 'npm comes with Node.js: https://nodejs.org/en/download',
+    'go': 'install Go: https://go.dev/dl/',
+    'goimports': 'go install golang.org/x/tools/cmd/goimports@latest (and put ~/go/bin on PATH)',
+    'javac': 'install a JDK (17 or newer), for example: brew install openjdk / apt-get install default-jdk',
+    'java': 'install a JDK (17 or newer), for example: brew install openjdk / apt-get install default-jdk',
+    'dotnet': 'install the .NET 8 SDK: https://dotnet.microsoft.com/download',
+    'cargo': 'install Rust: https://rustup.rs',
+}
+
+
+def tool_hint(missing):
+    seen, out = set(), []
+    for t in missing:
+        h = TOOL_HINTS.get(t)
+        if h and h not in seen:
+            seen.add(h)
+            out.append(h)
+    return '; '.join(out)
+
+
 def summary(result):
     v = result['verdicts']
     ok = sum(1 for x in v.values() if x == 'VERIFIED')
@@ -740,12 +854,14 @@ def report(result):
     for name, verdict in result['verdicts'].items():
         if verdict != 'VERIFIED':
             lines.append('\n--- %s ---\n%s' % (name, result['detail'][name]))
+            if verdict_help(verdict):
+                lines.append('%s: %s' % (verdict, verdict_help(verdict)))
     lines += ['! ' + w for w in result.get('warnings', [])]
     lines += callers_lines(result)
     for name, n in (result.get('next_rule') or {}).items():
         if n.get('item'):
-            lines.append('next rule for %s: "%s" (%s) is assumed by this rule but not proved. /forge:add it to close '
-                         'the gap.' % (name, n['item'], ', '.join(n['code'])))
+            lines.append('next rule for %s: this rule assumes "%s" (%s), which is not proved. To prove it too: '
+                         '/forge:add' % (name, n['item'], ', '.join(n['code'])))
         if n.get('feeder'):
             lines.append('next rule for %s (call graph): prove %s. Unproved code that feeds the proved decision; '
                          'leverage %d.' % (name, n['feeder']['text'], n['feeder']['score']))
@@ -809,7 +925,7 @@ def fuzz_target(dafny, work, harness_rel, target, log):
     """Compile and run the harness in one target. Returns (status, normalized output or reason)."""
     missing = missing_tools(target)
     if missing:
-        return 'TOOLCHAIN_MISSING', 'not on PATH: ' + ', '.join(missing)
+        return 'TOOLCHAIN_MISSING', 'not on PATH: %s. To fix: %s' % (', '.join(missing), tool_hint(missing))
     extra = TARGETS[target][1]
     if target == 'js':
         modules = js_node_path()
@@ -1050,6 +1166,13 @@ def build_one(root, cfg, c, dafny, check_only):
             entry = res['targets'].setdefault(t, {})
             err = emit_target(dafny, work, c['files'], t, os.path.join(fresh, t), name,
                               os.path.join(tmp, 'emit-%s.log' % t), c['name'])
+            if err and missing_tools(t):
+                entry['emit'] = 'SKIPPED'
+                entry['emit_detail'] = err
+                if entry.get('fuzz') != 'TOOLCHAIN_MISSING':  # else already said, with the install line
+                    fail('TOOLCHAIN_MISSING', '%s: not on PATH: %s. To fix: %s'
+                         % (t, ', '.join(missing_tools(t)), tool_hint(missing_tools(t))))
+                continue
             if err:
                 entry['emit'] = 'FAILED'
                 entry['emit_detail'] = err
@@ -1077,7 +1200,8 @@ def build_one(root, cfg, c, dafny, check_only):
             fail('NOT_WIRED', '%s does not contain %r, so the app may not call the built code'
                  % (u['file'], u['contains']))
     if not bd.get('usedBy'):
-        res['notes'].append('no "usedBy": nothing checks that the app calls the built code')
+        res['notes'].append('no "usedBy": nothing checks that your app calls the compiled rule (your app still runs '
+                            'its own code; the fuzz compares the two)')
     # 4. does a service test of the app call the built code? (a live trace, js target)
     if bd.get('serviceTest'):
         service_test(root, c, res, fail)
@@ -1151,6 +1275,8 @@ def build_report(result):
         lines.append('%s build %s: %s\n  %s' % ('✓' if b['verdict'] == 'BUILT' else '✗', name,
                                                 b['verdict'], '\n  '.join(parts)))
         lines += ['  note: ' + n for n in b['notes']]
+        if b['verdict'] != 'BUILT' and verdict_help(b['verdict']):
+            lines.append('  %s: %s' % (b['verdict'], verdict_help(b['verdict'])))
     if not result.get('build') and all(v == 'VERIFIED' for v in result['verdicts'].values()):
         lines.append('no check has a "build" entry')
     return '\n'.join(lines)
@@ -1321,7 +1447,7 @@ def _diff_job(root, c, df, key, res, tset, inputs, budget_ms, seed, coverage, st
     env = dict(os.environ)
     if df['lang'] == 'js':
         if not shutil.which('node'):
-            res['verdict'], res['detail'] = 'TOOLCHAIN_MISSING', 'node is not on PATH'
+            res['verdict'], res['detail'] = 'TOOLCHAIN_MISSING', 'node is not on PATH. To fix: ' + TOOL_HINTS['node']
             return
         modules = js_node_path()
         if not modules:
@@ -1353,9 +1479,11 @@ def _diff_job(root, c, df, key, res, tset, inputs, budget_ms, seed, coverage, st
             else:
                 cmd = eval_build.build_rust(root, emitted, inside(root, df['adapter']), work, df.get('rust_deps'))
         except eval_build.BuildError as e:
-            missing = 'is not on PATH' in str(e)
+            missing = 'not on PATH' in str(e)  # "javac and java are not on PATH" too (was DIFF_ERROR)
             res['verdict'] = 'TOOLCHAIN_MISSING' if missing else 'DIFF_ERROR'
-            res['detail' if missing else 'error'] = str(e)
+            hint = tool_hint(missing_tools(target) or {'go': ['go'], 'rs': ['cargo'], 'java': ['javac'],
+                                                       'cs': ['dotnet']}[target])
+            res['detail' if missing else 'error'] = str(e) + ('. To fix: ' + hint if missing and hint else '')
             return
     else:
         cmd = list(df['run'])
@@ -1459,7 +1587,8 @@ def messy_summary(m):
 
 def diff_report(out):
     if not out['checks']:
-        return 'forge diff: no check has a "diff" entry yet (/forge fuzz sets one up; /forge add does it for code that already exists)'
+        return ('forge diff: nothing is fuzzed yet: no rule is connected to your shipped code. To connect one, ask Claude: '
+                '/forge:fuzz')
     lines = []
     for name, r in out['checks'].items():
         v = r['verdict']
@@ -1469,13 +1598,14 @@ def diff_report(out):
             lines += forge_trace.report_lines(name, r, lambda k: '%s --inputs %d' % (base, k))
             continue
         dec = r.get('decisions') or {}
-        dec_line = ('  your recorded decisions: %d of %d agree%s' % (
+        dec_line = ('  your recorded answers: %d of %d agree%s' % (
             dec['agree'], dec['total'], '; failing: ' + ', '.join('%s (%s)' % (f['id'], ', '.join(f['candidates']))
                                                              for f in dec['failing']) if dec['failing'] else '')
-                    if dec.get('total') else '  your recorded decisions: none listed in the adapter (add "decisions")')
+                    if dec.get('total') else '  your recorded answers: none listed in the inputs file (add "decisions")')
         st = r.get('stats')
-        st_line = ('  searched so far: %s inputs in %d runs; nothing new for %d runs (%s inputs)%s' % (
-            format(st['inputs'], ','), st['runs'], st['runs_since_new'], format(st['inputs_since_new'], ','),
+        st_line = None if not st or st['runs'] < 2 else ('  searched so far: %s inputs in %d run%s; nothing new for %d run%s (%s inputs)%s' % (
+            format(st['inputs'], ','), st['runs'], '' if st['runs'] == 1 else 's', st['runs_since_new'],
+            '' if st['runs_since_new'] == 1 else 's', format(st['inputs_since_new'], ','),
             '' if st['last_new_failure'] is None else ', last new failure ' + st['last_new_failure'])
                    if st else None)
         if v == 'DIFF_OK':
@@ -1488,10 +1618,12 @@ def diff_report(out):
             if st_line:
                 lines.append(st_line)
         elif v == 'DISAGREE':
-            lines.append('✗ %s: %d failing decision(s), %d other disagreement(s) in %d random inputs (%d ms, seed %s); '
-                         'per candidate: %s'
-                         % (name, len(dec.get('failing', [])), len(r['disagreements']), r['inputs'], r['ms'], r['seed'],
-                            ', '.join('%s %d' % kv for kv in (r.get('per_candidate') or {}).items())))
+            per = r.get('per_candidate') or {}
+            lines.append('✗ %s: your code disagrees with the proved rule on %d of your %d answers and %d other input(s) '
+                         '(%d random inputs, %d ms, seed %s)%s'
+                         % (name, len(dec.get('failing', [])), dec.get('total') or 0, len(r['disagreements']), r['inputs'],
+                            r['ms'], r['seed'], '; other inputs per function: ' + ', '.join('%s %d' % kv for kv in per.items())
+                            if len(per) > 1 else ''))
             groups = {}
             for d in r['disagreements']:
                 groups.setdefault((d['candidate'], d.get('group', '')), []).append(d)
@@ -1510,10 +1642,12 @@ def diff_report(out):
                 lines.append(messy_summary(r['messy']))
             if st_line:
                 lines.append(st_line)
-            lines.append('  Each one is a bug in that code, or a place where the spec says something other than '
+            lines.append('  Each one is a bug in that code, or a place where the rule says something other than '
                          'what you meant. Saved cases under %s/%s/ run first next time.' % (REGRESSIONS, name.replace(':', '-')))
         else:
             lines.append('✗ %s: %s: %s' % (name, v, (r.get('detail') or r.get('error') or '')[:600]))
+            if verdict_help(v):
+                lines.append('  %s' % verdict_help(v))
         if r.get('coverage'):
             import forge_coverage
             lines.extend(forge_coverage.report_lines(r['coverage']))
@@ -1673,8 +1807,8 @@ def spec_digest(text):
 def config_digest(cfg):
     lines = []
     for c in cfg['checks']:
-        lines.append('- %s: proves %s against spec %s%s' % (c['name'], ', '.join(c['files']), c['spec'],
-                     '; bound by the first lines of %s' % c['binding']['file'] if c.get('binding') else ''))
+        lines.append('- %s: proves %s against the rule in %s%s' % (c['name'], ', '.join(c['files']), c['spec'],
+                     ' (its first lines must name that rule)' if c.get('binding') else ''))
         if c.get('watchedFields'):
             lines.append('  watched fields (code outside the rule that decides on them is listed): %s'
                          % ', '.join(map(str, c['watchedFields'])))
@@ -1685,10 +1819,10 @@ def config_digest(cfg):
                             len(c.get('allowedCallers') or [])))
         bd = c.get('build') or {}
         if bd:
-            lines.append('  build: %s into %s/; app callers: %s' % (', '.join(bd.get('targets', [])), bd.get('out'),
-                         ', '.join(u['file'] for u in bd.get('usedBy', [])) or 'none listed'))
+            lines.append('  compiled to: %s, into %s/; app files that use it: %s' % (', '.join(bd.get('targets', [])),
+                         bd.get('out'), ', '.join(u['file'] for u in bd.get('usedBy', [])) or 'none yet'))
         for d in diff_entries(c):
-            lines.append('  fuzz: %s (%s) against the proved model' % (', '.join(d.get('watch') or [d.get('adapter', '?')]), d['lang']))
+            lines.append('  fuzz: your shipped %s (%s) against the proved rule' % (', '.join(d.get('watch') or [d.get('adapter', '?')]), d['lang']))
     return '\n'.join(lines)
 
 
@@ -1710,10 +1844,15 @@ def show_specs(root, full=False):
             return 'approved'
         return 'CHANGED since it was approved' if key in approved else 'not approved yet'
 
-    parts = ['=== which code is checked against which spec: %s (%s) ===\n%s'
-             % (CONFIG, state(CONFIG), json.dumps(cfg, indent=2) if full else config_digest(cfg))]
+    # Plain words first (the decision record: your rule and answers), then the exact rule the proof uses, then the
+    # list of what Forge checks. Only the order of reading changes; the approval covers all of it by hash.
+    parts = []
+    kinds = {'spec': 'the exact rule the proof checks', 'your answers': 'your answers, as proof checks',
+             'decision record': 'your rule and answers in plain words',
+             'file the spec includes': 'a file the rule includes'}
     for c in cfg['checks']:
-        for rel in contract_files(c, root):
+        files = contract_files(c, root)
+        for rel in [f for f in files if f == c.get('decisions')] + [f for f in files if f != c.get('decisions')]:
             if rel in hashes:
                 continue
             hashes[rel] = contract_hash(inside(root, rel))
@@ -1722,19 +1861,21 @@ def show_specs(root, full=False):
             body = read_text(inside(root, rel)).rstrip()
             if not full and state(rel) == 'approved':
                 # Already approved and unchanged: one line, so the screen shows only what is new.
-                parts.append('=== %s %s: %s (approved, unchanged, sha256 %s…) ===' % (
-                    c['name'], contract_kind(c, rel), rel, hashes[rel][:12]))
+                parts.append('=== %s · %s: %s (approved, unchanged, sha256 %s…) ===' % (
+                    c['name'], kinds[contract_kind(c, rel)], rel, hashes[rel][:12]))
                 continue
             if not full and rel == c['spec']:
                 body = spec_digest(body)
             elif not full and rel == c.get('examples'):
                 ids = re.findall(r'//\s*(D\d+[a-z]?)\b[^\n]*', body)
-                body = ('%d answers written as Dafny asserts (%s); each must follow from the spec, or check fails with '
-                        'EXAMPLES_FAILED.' % (len(set(ids)), ', '.join(sorted(set(ids), key=lambda x: (len(x), x))))
+                body = ('%d answers (%s), each written as a check that the rule above must force; if the rule says '
+                        'otherwise, the check fails with EXAMPLES_FAILED.'
+                        % (len(set(ids)), ', '.join(sorted(set(ids), key=lambda x: (len(x), x))))
                         if ids else body)
-            kind = contract_kind(c, rel)
-            parts.append('=== %s %s: %s (%s, sha256 %s…) ===\n%s'
-                         % (c['name'], kind, rel, state(rel), hashes[rel][:12], body))
+            parts.append('=== %s · %s: %s (%s, sha256 %s…) ===\n%s'
+                         % (c['name'], kinds[contract_kind(c, rel)], rel, state(rel), hashes[rel][:12], body))
+    parts.append('=== what Forge checks and fuzzes: %s (%s) ===\n%s'
+                 % (CONFIG, state(CONFIG), json.dumps(cfg, indent=2) if full else config_digest(cfg)))
     if cfg.get('require_signed_approval'):
         inv = os.path.relpath(invariants_path(root, cfg), root)
         for rel in signed_extras(cfg):
@@ -2437,7 +2578,8 @@ def status(root):
     diff = read_json(os.path.join(root, LAST_DIFF)) or {}
     rows = list((diff.get('checks') or {}).values())
     if rows:
-        bad = sum(len(r.get('disagreements') or []) for r in rows)
+        bad = sum(len(r.get('disagreements') or []) + len((r.get('decisions') or {}).get('failing') or [])
+                  for r in rows)  # a failing recorded answer is a disagreement too (as cli/forge_ci.py counts)
         broken = [r['verdict'] for r in rows if r.get('verdict') not in ('DIFF_OK', 'DISAGREE')]
         n = sum(r.get('inputs') or 0 for r in rows)
         if broken or bad:
@@ -2573,7 +2715,8 @@ def main(argv=None):
                 return 0
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(text)
-            print('wrote %s (%d rules)' % (os.path.relpath(path, root), len(load_config(root)['checks'])))
+            n = len(load_config(root)['checks'])
+            print('wrote %s (%d rule%s in plain words)' % (os.path.relpath(path, root), n, '' if n == 1 else 's'))
             return 0
         if a.command == 'diff':
             if hasattr(sys.stdout, 'reconfigure'):
@@ -2605,8 +2748,17 @@ def main(argv=None):
             r = subprocess.run([path, '--version'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                universal_newlines=True) if path else None
             version = r.stdout.strip().split('\n')[-1] if r and r.returncode == 0 else None
+            # One line that says exactly what to do when Dafny is not there (no traceback, no "None").
+            error = None if version else (
+                'Dafny (the proof checker) is not installed and FORGE_NO_DOWNLOAD forbids the download. Unset '
+                'FORGE_NO_DOWNLOAD and run setup again, or install Dafny %s (%s) and set FORGE_DAFNY=/path/to/dafny'
+                % (DAFNY_VERSION, DAFNY_INSTALL_DOC) if not path else
+                '%s does not run (%s). Remove it, or set FORGE_DAFNY to a working Dafny %s'
+                % (path, ((r.stdout if r else '') or 'no output').strip().split('\n')[-1][:200], DAFNY_VERSION))
             if a.json:
-                print(json.dumps({'dafny': path, 'version': version, 'pinned': DAFNY_VERSION}))
+                print(json.dumps({'dafny': path, 'version': version, 'pinned': DAFNY_VERSION, 'error': error}))
+            elif error:
+                print('forge: ' + error, file=sys.stderr)
             else:
                 print('dafny: %s\nversion: %s (pinned download: %s)' % (path, version, DAFNY_VERSION))
             return 0 if version else 1
@@ -2659,6 +2811,7 @@ def main(argv=None):
                     result['verdicts'][c['name']] = 'ERROR'
                     result['detail'][c['name']] = 'the bypass search did not run: ' + outside_error
         gate_bypass(result, result['outside'], outside_error)
+        result['help'] = {n: verdict_help(v) for n, v in result['verdicts'].items() if verdict_help(v)}
         gate_callers(result, load_config(root))
         if not a.no_write:
             write_json(root, LAST, result)

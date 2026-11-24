@@ -424,6 +424,13 @@ def static_checks():
     if '$.prompt.submit(' in code:
         problems.append('register.ts calls $.prompt.submit: the host refuses it inside command.run; '
                         'use a Markdown command in commands/ instead')
+    # Day-1 surface: the /forge argument hint names the basic steps only; advanced tools are under `/forge more`.
+    hint = re.search(r"argumentHint:\s*'([^']*)'", code)
+    advanced = [w for w in ('mutate', 'hardware', 'invariants', 'airlock', 'diff', 'build', 'spec')
+                if hint and re.search(r'\b%s\b' % w, hint.group(1))]
+    if not hint or advanced or 'more' not in hint.group(1):
+        problems.append('register.ts: the /forge argument hint must list only the basic steps and "more" (found: %s)'
+                        % (', '.join(advanced) if hint else 'no argumentHint'))
     for name in os.listdir(os.path.join(HERE, '..', 'commands')):
         text = open(os.path.join(HERE, '..', 'commands', name), encoding='utf-8').read()
         if not text.startswith('---\ndescription:'):
@@ -433,6 +440,62 @@ def static_checks():
         if name[:-3] in ('approve', 'check', 'build', 'status', 'spec', 'diff', 'mutate'):
             problems.append('commands/%s shadows the fixed step "/forge %s"' % (name, name[:-3]))
     return problems
+
+
+def first_time_cases():
+    """A newcomer never meets a bare verdict code or a traceback: every code the checker can give has one plain sentence
+    and one next action, and a missing Dafny (downloads forbidden, or no network) is one line that says what to do."""
+    out = []
+    cli_dir = os.path.join(HERE, '..', 'cli')
+    src = ''.join(open(os.path.join(cli_dir, f), encoding='utf-8').read() for f in sorted(os.listdir(cli_dir))
+                  if f.endswith('.py'))
+    # Every code a person can see: check/build/diff/callers verdicts, status-line reasons, trace kinds, CRASH-CHECK.
+    codes = set(re.findall(r"(?:put|fail)\('([A-Z][A-Z_]+)'", src))
+    codes |= set(re.findall(r"\['verdict'\](?:, res\['(?:detail|error)'\])? = '([A-Z][A-Z_]+)'", src))
+    codes |= set(re.findall(r"'(?:verdict|kind)': '([A-Z][A-Z_]+)'", src))
+    codes |= set(re.findall(r"return '([A-Z][A-Z_]+)', ", src))
+    codes |= set(re.findall(r"'([A-Z][A-Z_]+)' if |else '([A-Z][A-Z_]+)'", src) and
+                 [c for pair in re.findall(r"'([A-Z][A-Z_]+)' if |else '([A-Z][A-Z_]+)'", src) for c in pair if c])
+    codes |= set(re.findall(r"'[A-Z_]+': '([A-Z]+_[A-Z_]+)'", src))  # mapped verdicts ({'BUILD_FAILED': 'FUZZ_BUILD_FAILED'})
+    # Codes have an underscore, except these one-word verdicts; single words like PASS or STALE are summary words.
+    codes = {c for c in codes if not c.startswith(('FORGE_', 'NODE_', 'XDG_', 'DOTNET_'))
+             and ('_' in c or c in ('ERROR', 'FAILED', 'DISAGREE', 'CRASH'))}
+    codes |= set(re.findall(r"'(UNAPPROVED_BYPASS|DISAGREE|THROWS_ON_MESSY_INPUT|INVARIANTS_STALE|BYPASS_FOUND|CRASH)'", src))
+    passes = {'VERIFIED', 'BUILT', 'DIFF_OK', 'BYPASS_CLEAR', 'NO_SCOPE_TERMS', 'PASSED', 'OK', 'CALLERS_OK'}
+    sys.path.insert(0, os.path.join(HERE, '..', 'cli'))
+    import forge_check
+    missing = sorted(c for c in codes - passes if not forge_check.verdict_help(c))
+    out.append(('first time: every verdict code has a plain sentence and a next action (%d codes)%s'
+                % (len(codes - passes), '; missing: ' + ', '.join(missing) if missing else ''),
+                len(codes - passes) >= 35 and not missing))
+    saved = forge_check.VERDICT_HELP.pop('SPEC_CHANGED')  # negative control: a code without help is found
+    found = 'SPEC_CHANGED' in [c for c in codes - passes if not forge_check.verdict_help(c)]
+    forge_check.VERDICT_HELP['SPEC_CHANGED'] = saved
+    out.append(('first time: a verdict code with its help removed is found (negative control); an unknown code gets '
+                'no invented help', found and forge_check.verdict_help('NO_SUCH_VERDICT') == ''))
+    with tempfile.TemporaryDirectory() as tmp:
+        env = {k: v for k, v in os.environ.items() if k not in ('FORGE_DAFNY',)}
+        env.update(XDG_CACHE_HOME=tmp, PATH=os.path.dirname(sys.executable) + os.pathsep + '/usr/bin' + os.pathsep + '/bin')
+        if shutil.which('dafny', path=env['PATH']):
+            out.append(('first time: setup without Dafny (skipped: dafny is on the system PATH)', True))
+            return out
+        r = subprocess.run([sys.executable, CLI, 'setup', '--root', tmp], env=dict(env, FORGE_NO_DOWNLOAD='1'),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        out.append(('first time: no Dafny and downloads forbidden: exit 1, one line with the fix, no traceback',
+                    r.returncode == 1 and 'Traceback' not in r.stderr and 'FORGE_DAFNY=' in r.stderr
+                    and len(r.stderr.strip().split('\n')) == 1 and 'None' not in r.stdout))
+        # No network: a proxy on a closed local port makes the download fail at once.
+        r = subprocess.run([sys.executable, CLI, 'setup', '--root', tmp, '--json'],
+                           env=dict(env, HTTPS_PROXY='http://127.0.0.1:9', https_proxy='http://127.0.0.1:9'),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
+        try:
+            err = json.loads(r.stdout).get('error') or ''
+        except ValueError:
+            err = ''
+        out.append(('first time: Dafny download fails (no network): exit 2, one line that says what to do, no traceback',
+                    r.returncode == 2 and 'Traceback' not in r.stderr and 'could not download Dafny' in err
+                    and 'FORGE_DAFNY=' in err))
+    return out
 
 
 def bypass_cases():
@@ -1128,8 +1191,11 @@ def main():
         fix_legacy(root)
         code2, res2 = diff(root, '--inputs', '0')
         js2 = res2.get('wallet-cap:js', {})
+        for k, r in res2.items():  # an entry that did not run says why (seen once under heavy machine load)
+            if not r.get('decisions'):
+                print('      %s: %s %s' % (k, r.get('verdict'), (r.get('error') or r.get('detail') or '')[:300]))
         cases.append(('diff: after the shipped code is fixed, every decision agrees',
-                      all(r['decisions']['agree'] == 4 for r in res2.values())
+                      all((r.get('decisions') or {}).get('agree') == 4 for r in res2.values())
                       and res2.get('wallet-cap:py', {}).get('verdict') == 'DIFF_OK'))
         # The "fixed" TypeScript still uses plain numbers: above 2^53 it loses precision, and the fuzz keeps saying so.
         code_big, res_big = diff(root, '--inputs', '3000')
@@ -1377,6 +1443,10 @@ def main():
             failed += not ok
             extra += 1
             print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
+    for name, ok in first_time_cases():
+        failed += not ok
+        extra += 1
+        print('%s  %s' % ('ok  ' if ok else 'FAIL', name))
     for name, ok in bypass_cases() + ast_bypass_cases():
         failed += not ok
         extra += 1
